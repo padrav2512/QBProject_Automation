@@ -44,10 +44,6 @@ with st.sidebar:
     default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
     default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
 
-    st.header("Document structure")
-    bold_first_column = st.checkbox("Treat first table column as a header", value=False)
-    convert_romans = st.checkbox("Convert top-level (i), (ii)… to (a), (b)…", value=True)
-
     if processing_mode == "images_only":
         st.info("Existing CMS text, tags, question IDs and snippet IDs will be preserved. The project ID in existing Question id tags takes priority over the fallback Project ID above.")
 
@@ -75,8 +71,6 @@ if uploaded is not None:
             default_difficulty=default_difficulty,
             default_objective=default_objective,
             replace_existing_ids=replace_ids,
-            bold_first_table_column=bold_first_column,
-            convert_top_level_roman_subparts=convert_romans,
             processing_mode=processing_mode,
         )
         try:
@@ -167,7 +161,7 @@ with st.expander("What the app checks"):
 8. Places labelled answers on separate lines when they are combined in one paragraph.
 9. Normalises top-level subpart labels where the structure is unambiguous.
 10. Checks and normalises Assertion–Reason wording and choice structure without guessing the correct answer.
-11. Bolds table header rows and, optionally, the first column.
+11. Bolds table header rows and the first column, following the fixed table convention.
 
 The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. Metadata and section tag paragraphs are bold, matching the approved CMS document convention; choice markers, `@correct answer@` and `@e@` remain ordinary text. It validates the generated structure afterwards.
 """

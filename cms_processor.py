@@ -87,8 +87,6 @@ class ProcessorOptions:
     default_difficulty: str = "Average"
     default_objective: str = "Application"
     replace_existing_ids: bool = True
-    bold_first_table_column: bool = False
-    convert_top_level_roman_subparts: bool = True
     processing_mode: str = "full"
 
 
@@ -862,10 +860,7 @@ def _split_answers(doc: _Document, findings: list[Finding]) -> None:
         findings.append(Finding(8, "passed", "No combined labelled answer lines required splitting."))
 
 
-def _normalise_subparts(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> None:
-    if not options.convert_top_level_roman_subparts:
-        findings.append(Finding(9, "manual_review", "Automatic top-level subpart conversion was disabled."))
-        return
+def _normalise_subparts(doc: _Document, findings: list[Finding]) -> None:
     context = _section_for_paragraphs(doc)
     candidates: list[tuple[Paragraph, re.Match[str], int | None]] = []
     alpha_exists = False
@@ -940,14 +935,13 @@ def _audit_assertion_reason(doc: _Document, findings: list[Finding]) -> None:
         findings.append(Finding(10, "passed", "No Assertion–Reason items were detected."))
 
 
-def _bold_table_headers(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> None:
+def _bold_table_headers(doc: _Document, findings: list[Finding]) -> None:
     cells_changed = 0
     for table in doc.tables:
         if not table.rows:
             continue
         header_cells = list(table.rows[0].cells)
-        if options.bold_first_table_column:
-            header_cells.extend(row.cells[0] for row in table.rows[1:] if row.cells)
+        header_cells.extend(row.cells[0] for row in table.rows[1:] if row.cells)
         seen: set[int] = set()
         for cell in header_cells:
             if id(cell._tc) in seen:
@@ -1027,12 +1021,12 @@ def process_docx(
         _repair_spacing(doc, findings)
         _repair_italics(doc, findings)
         _split_answers(doc, findings)
-        _normalise_subparts(doc, options, findings)
+        _normalise_subparts(doc, findings)
         _convert_inline_slash_fractions(doc, findings)
         _convert_simple_math_paragraphs(doc, findings)
         _equation_and_fraction_audit(doc, findings)
         _audit_assertion_reason(doc, findings)
-        _bold_table_headers(doc, options, findings)
+        _bold_table_headers(doc, findings)
         _bold_cms_tags(doc, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
