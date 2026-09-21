@@ -119,6 +119,7 @@ if uploaded is not None:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
+            effective_project_id = report_data.get("effective_project_id") or project_id.strip() or "project"
             output_suffix = "Images_Alt_Text_Ready" if processing_mode == "images_only" else "CMS_Verification_Ready"
             output_download_name = f"{Path(uploaded.name).stem}_{output_suffix}.docx"
             col_doc, col_images, col_report = st.columns(3)
@@ -136,7 +137,7 @@ if uploaded is not None:
             col_images.download_button(
                 "Download images ZIP",
                 data=result.images_zip_path.read_bytes(),
-                file_name=f"{project_id.strip()}_images.zip",
+                file_name=f"{effective_project_id}_images.zip",
                 mime="application/zip",
                 use_container_width=True,
                 on_click="ignore",
