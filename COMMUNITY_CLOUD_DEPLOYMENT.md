@@ -1,5 +1,14 @@
 # Deploy on Streamlit Community Cloud
 
+## Current deployment
+
+- Live app: <https://qbproject-automation.streamlit.app>
+- GitHub repository: <https://github.com/padrav2512/QBProject_Automation>
+- Branch: `main`
+- Entry point: `app.py`
+
+The current Community Cloud deployment is public. Anyone who has the URL can open the processor. Add application authentication before using it for documents that require restricted access.
+
 ## One-time deployment
 
 1. Create a private GitHub repository for this application.
