@@ -159,7 +159,7 @@ with st.expander("What the app checks"):
         """
 1. Removes bold only when an entire Question or Solution block is bold; selective bold emphasis is preserved.
 2. Detects native Word equations and flags possible equation images or ordinary-text equations.
-3. Removes italics from non-variable runs and flags mixed runs needing a human check.
+3. Keeps only mathematical variables in italics across Questions, Answers, Choices and Solutions, including ordinary text and native equations.
 4. Removes completely blank equation objects, blank exponent/subscript templates and repeated spaces.
 5. Normalises spaces around `=`, `+`, `−`, `×` and `÷`.
 6. Adds a space after commas.
@@ -169,6 +169,6 @@ with st.expander("What the app checks"):
 10. Checks and normalises Assertion–Reason wording and choice structure without guessing the correct answer.
 11. Bolds table header rows and, optionally, the first column.
 
-The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. It validates the generated structure afterwards.
+The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. Metadata and section tag paragraphs are bold, matching the approved CMS document convention; choice markers, `@correct answer@` and `@e@` remain ordinary text. It validates the generated structure afterwards.
 """
     )

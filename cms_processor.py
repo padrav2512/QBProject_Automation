@@ -61,6 +61,7 @@ SECTION_ALIASES = {
 }
 SECTION_MARKERS = {"@Question:@", "@Answers:@", "@Choices:@", "@Solution:@"}
 VARIABLE_ONLY_RE = re.compile(r"^[A-Za-z]$")
+STANDALONE_VARIABLE_RE = re.compile(r"(?<![A-Za-z])([A-Za-z])(?![A-Za-z])")
 SIMPLE_FRACTION_RE = re.compile(r"(?<![\w/])(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])(?![\w/])")
 INLINE_EQUATION_RE = re.compile(r"(?:\b\d+\b|\b[A-Za-z]\b)\s*=\s*(?:\b\d+\b|\b[A-Za-z]\b)")
 ROMAN_RE = re.compile(r"^\s*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)\s*", re.I)
@@ -168,6 +169,41 @@ def body_paragraphs(doc: _Document) -> list[Paragraph]:
 def _set_text(paragraph: Paragraph, text: str) -> None:
     paragraph.clear()
     paragraph.add_run(text)
+
+
+def _is_bold_cms_tag(text: str) -> bool:
+    """Match the standalone metadata and section tags that are bold in the CMS template."""
+    stripped = text.strip()
+    return bool(
+        QUESTION_START_RE.fullmatch(stripped)
+        or KNOWN_METADATA_RE.fullmatch(stripped)
+        or stripped in SECTION_MARKERS
+    )
+
+
+def _bold_cms_tags(doc: _Document, findings: list[Finding]) -> None:
+    changed_paragraphs = 0
+    for paragraph in iter_paragraphs(doc):
+        if not _is_bold_cms_tag(paragraph.text):
+            continue
+        changed = False
+        for run in paragraph.runs:
+            if run.text and run.bold is not True:
+                run.bold = True
+                changed = True
+        if changed:
+            changed_paragraphs += 1
+    findings.append(
+        Finding(
+            0,
+            "fixed" if changed_paragraphs else "passed",
+            (
+                f"Applied bold formatting to {changed_paragraphs} CMS metadata or section tag paragraph(s)."
+                if changed_paragraphs
+                else "All CMS metadata and section tags were already bold."
+            ),
+        )
+    )
 
 
 def _insert_after(paragraph: Paragraph, text: str = "") -> Paragraph:
@@ -539,13 +575,83 @@ def _repair_spacing(doc: _Document, findings: list[Finding]) -> None:
     findings.append(Finding(6, "passed", "Comma spacing was checked and normalised."))
 
 
+def _variable_spans(text: str) -> list[tuple[int, int]]:
+    """Return conservative variable spans in an ordinary-text run."""
+    if not text:
+        return []
+    tag_ranges = [(m.start(), m.end()) for m in re.finditer(r"@[^@]*@", text)]
+    tokens = list(STANDALONE_VARIABLE_RE.finditer(text))
+    uppercase_count = sum(1 for token in tokens if token.group(1).isupper())
+    has_math_signal = bool(re.search(r"[=+×÷−<>≤≥/]", text) or re.search(r"\d", text))
+    cue_positions: set[tuple[int, int]] = set()
+    for cue in re.finditer(r"\b(?:let|value\s+of|solve\s+for|find)\s+([A-Za-z])\b", text, re.I):
+        cue_positions.add(cue.span(1))
+
+    spans: list[tuple[int, int]] = []
+    for token in tokens:
+        start, end = token.span(1)
+        if any(left <= start < right for left, right in tag_ranges):
+            continue
+        letter = token.group(1)
+        left = text[:start].rstrip()[-1:] or ""
+        right = text[end:].lstrip()[:1] or ""
+        local_math = left in "=+×÷−<>≤≥/(" or right in "=+×÷−<>≤≥/)" or left.isdigit() or right.isdigit()
+        explicit_cue = (start, end) in cue_positions
+        paired_capital = letter.isupper() and uppercase_count >= 2
+        likely_symbol = has_math_signal and letter.lower() not in {"a", "i"}
+        if local_math or explicit_cue or paired_capital or likely_symbol or text.strip() == letter:
+            spans.append((start, end))
+    return spans
+
+
+def _copy_run_with_italic(paragraph: Paragraph, source_run, text: str, italic: bool) -> None:
+    new_run = paragraph.add_run(text)
+    source_properties = source_run._r.find(qn("w:rPr"))
+    if source_properties is not None:
+        existing = new_run._r.find(qn("w:rPr"))
+        if existing is not None:
+            new_run._r.remove(existing)
+        new_run._r.insert(0, deepcopy(source_properties))
+    new_run.italic = italic
+    source_run._r.addprevious(new_run._r)
+
+
+def _apply_variable_italics(paragraph: Paragraph) -> int:
+    changed = 0
+    for run in list(paragraph.runs):
+        spans = _variable_spans(run.text)
+        if not spans:
+            continue
+        if len(spans) == 1 and spans[0] == (0, len(run.text)):
+            if run.italic is not True:
+                run.italic = True
+                changed += 1
+            continue
+
+        cursor = 0
+        segments: list[tuple[str, bool]] = []
+        for start, end in spans:
+            if start > cursor:
+                segments.append((run.text[cursor:start], False))
+            segments.append((run.text[start:end], True))
+            cursor = end
+        if cursor < len(run.text):
+            segments.append((run.text[cursor:], False))
+        for segment, italic in segments:
+            if segment:
+                _copy_run_with_italic(paragraph, run, segment, italic)
+        run._r.getparent().remove(run._r)
+        changed += len(spans)
+    return changed
+
+
 def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
     removed = 0
-    manual = 0
+    added = 0
     context = _section_for_paragraphs(doc)
     for paragraph in body_paragraphs(doc):
-        section, question = context.get(paragraph._p, (None, None))
-        if section not in {"@Question:@", "@Solution:@"}:
+        section, _question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Answers:@", "@Choices:@", "@Solution:@"}:
             continue
         for run in paragraph.runs:
             if not run.italic:
@@ -555,22 +661,31 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
                 continue
             run.italic = False
             removed += 1
-            if re.search(r"\b[A-Za-z]\b", text):
-                manual += 1
-                findings.append(Finding(3, "manual_review", f"Removed italics from a mixed text run containing a possible variable: {text!r}. Re-italicise only the variable if required.", question))
+        added += _apply_variable_italics(paragraph)
 
-    # Explicit equation italics on non-variable content are changed to plain.
+    # Explicitly keep variables italic and non-variable equation content plain.
     for math_run in doc.element.xpath(".//m:r"):
         text = "".join(math_run.itertext()).strip()
         style = math_run.find("m:rPr/m:sty", namespaces=NS)
-        if style is not None and style.get(qn("m:val")) == "i" and not VARIABLE_ONLY_RE.fullmatch(text):
+        if VARIABLE_ONLY_RE.fullmatch(text):
+            if style is None:
+                properties = math_run.find(qn("m:rPr"))
+                if properties is None:
+                    properties = OxmlElement("m:rPr")
+                    math_run.insert(0, properties)
+                style = OxmlElement("m:sty")
+                properties.append(style)
+            if style.get(qn("m:val")) != "i":
+                style.set(qn("m:val"), "i")
+                added += 1
+        elif style is not None and style.get(qn("m:val")) == "i":
             style.set(qn("m:val"), "p")
             removed += 1
 
-    if removed:
-        findings.append(Finding(3, "fixed", f"Removed italics from {removed} non-variable run(s)."))
-    elif not manual:
-        findings.append(Finding(3, "passed", "No non-variable italic formatting was detected."))
+    if removed or added:
+        findings.append(Finding(3, "fixed", f"Corrected italics in student-facing content: removed italics from {removed} non-variable run(s) and italicised {added} variable occurrence(s), including variables in choices."))
+    else:
+        findings.append(Finding(3, "passed", "Only variables are italic in questions, answers, choices and solutions."))
 
 
 def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> None:
@@ -918,6 +1033,7 @@ def process_docx(
         _equation_and_fraction_audit(doc, findings)
         _audit_assertion_reason(doc, findings)
         _bold_table_headers(doc, options, findings)
+        _bold_cms_tags(doc, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
     if options.processing_mode == "images_only":

@@ -102,6 +102,56 @@ def test_selective_bold_emphasis_is_preserved(tmp_path: Path):
     assert next(r for r in solution_out.runs if r.text == "factor").bold is True
 
 
+def test_cms_tags_are_bold_and_choice_variables_are_italic(tmp_path: Path):
+    source = tmp_path / "choice_variables.docx"
+    doc = Document()
+    for text in [
+        "Question 1",
+        "Type: MCQ",
+        "Question:",
+        "Choose the correct value.",
+        "Choices:",
+        "a) x = 4",
+        "b) x = 5",
+        "c) x = 6",
+        "d) x = 7 @correct answer@",
+        "Solution:",
+        "The value of x is 7.",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    output = Document(result.output_path)
+
+    bold_tags = {
+        "@Question: 1@",
+        "@Type: MCQ@",
+        "@Question id: project10436_q1 @",
+        "@New snippet id: 218989 @",
+        "@Difficulty level: Average @",
+        "@Objective: Application @",
+        "@Question:@",
+        "@Choices:@",
+        "@Solution:@",
+    }
+    for paragraph in output.paragraphs:
+        if paragraph.text in bold_tags:
+            assert paragraph.runs
+            assert all(run.bold is True for run in paragraph.runs if run.text)
+
+    choice = next(p for p in output.paragraphs if p.text == "@1@ x = 4")
+    assert next(run for run in choice.runs if run.text == "x").italic is True
+    assert all(run.italic is not True for run in choice.runs if run.text != "x")
+
+    solution = next(p for p in output.paragraphs if p.text == "The value of x is 7.")
+    assert next(run for run in solution.runs if run.text == "x").italic is True
+
+    end_tags = [p for p in output.paragraphs if p.text == "@e@"]
+    assert end_tags
+    assert all(all(run.bold is not True for run in p.runs) for p in end_tags)
+
+
 def test_heading_with_difficulty_and_untagged_mcq_are_structured(tmp_path: Path):
     source = tmp_path / "untagged_mcq.docx"
     doc = Document()
