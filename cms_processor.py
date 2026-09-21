@@ -910,7 +910,9 @@ def process_docx(
     for warning in image_result.warnings:
         findings.append(Finding(0, "manual_review", warning))
     if image_result.artifacts:
-        findings.append(Finding(0, "fixed", f"Extracted {len(image_result.artifacts)} image occurrence(s), applied CMS filenames and wrote resolved filenames into Word Alt Text."))
+        duplicate_count = sum(bool(item.duplicate_of) for item in image_result.artifacts)
+        duplicate_note = f" Reused canonical filenames for {duplicate_count} exact duplicate occurrence(s)." if duplicate_count else ""
+        findings.append(Finding(0, "fixed", f"Extracted {len(image_result.artifacts)} image occurrence(s), applied CMS filenames and wrote resolved filenames into Word Alt Text.{duplicate_note}"))
     else:
         findings.append(Finding(0, "passed", "No embedded images were detected."))
 

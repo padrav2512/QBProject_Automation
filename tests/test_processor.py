@@ -179,3 +179,31 @@ def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
     xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
     alt_texts = xml.xpath(".//wp:docPr/@descr", namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"})
     assert "project10436_q7_1.gif" in alt_texts
+
+
+def test_exact_duplicate_question_images_reuse_first_filename(tmp_path: Path):
+    source = tmp_path / "duplicate_images.docx"
+    picture = tmp_path / "fraction_wall.png"
+    Image.new("RGB", (60, 40), "white").save(picture)
+    doc = Document()
+    for question in (2, 5):
+        for text in [f"@Question: {question}@", "@Type: FIB@", "@Question:@", "Use the fraction wall."]:
+            doc.add_paragraph(text)
+        doc.add_picture(str(picture))
+        for text in ["@e@", "@Answers:@", "1/2", "@e@", "@Solution:@", "Use the wall.", "@e@"]:
+            doc.add_paragraph(text)
+    doc.save(source)
+
+    options = ProcessorOptions(processing_mode="images_only", project_question_prefix="project1000_q")
+    result = process_docx(source, source.name, options, tmp_path / "storage")
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    alt_texts = xml.xpath(".//wp:docPr/@descr", namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"})
+
+    assert alt_texts == ["project1000_q2_1.gif", "project1000_q2_1.gif"]
+    assert result.image_count == 2
+    with ZipFile(result.images_zip_path) as archive:
+        gif_names = [name for name in archive.namelist() if name.lower().endswith(".gif")]
+    assert gif_names == ["project1000_q2_1.gif"]
+    duplicate_artifacts = [item for item in __import__('json').loads(result.image_manifest_path.read_text(encoding="utf-8"))["images"] if item["duplicate_of"]]
+    assert len(duplicate_artifacts) == 1
+    assert duplicate_artifacts[0]["duplicate_of"] == "project1000_q2_1.gif"

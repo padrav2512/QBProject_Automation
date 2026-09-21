@@ -31,6 +31,8 @@ class ImageArtifact:
     width_px: int | None
     height_px: int | None
     sha256: str
+    visual_sha256: str
+    duplicate_of: str | None
     alt_text_written: bool
 
 
@@ -83,6 +85,31 @@ def _save_gif(blob: bytes, output: Path) -> tuple[int, int]:
     size = image.size
     image.save(output, format="GIF", optimize=True)
     return size
+
+
+def _normalised_visual_signature(blob: bytes) -> tuple[str, int, int]:
+    """Hash normalized visible pixels so harmless file metadata/encoding changes are ignored."""
+    image = Image.open(io.BytesIO(blob))
+    image.load()
+    image = _remove_outer_white_space(image.copy())
+    if "A" in image.getbands():
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba)
+        image = background.convert("RGB")
+    else:
+        image = image.convert("RGB")
+    width, height = image.size
+    digest = hashlib.sha256(f"{width}x{height}:RGB:".encode("ascii") + image.tobytes()).hexdigest()
+    return digest, width, height
+
+
+def _deduplication_bucket(occurrence: _Occurrence) -> str | None:
+    if occurrence.section in {"question", "choices"} and occurrence.question is not None:
+        return "question_gifs"
+    if occurrence.section == "solution" and occurrence.question is not None:
+        return "solution_gifs"
+    return None
 
 
 def _relationship_blob(doc: _Document, relationship_id: str) -> tuple[bytes, str] | None:
@@ -185,17 +212,41 @@ def process_document_images(doc: _Document, project_id: str, output_dir: Path, z
     warnings = _assign_names(occurrences, project_id)
     artifacts: list[ImageArtifact] = []
 
+    canonical_by_visual: dict[tuple[str, str], _Occurrence] = {}
+    saved_files: dict[str, tuple[int | None, int | None, str]] = {}
+
     for occurrence in occurrences:
+        visual_sha = ""
+        duplicate_of: str | None = None
+        try:
+            visual_sha, _, _ = _normalised_visual_signature(occurrence.blob)
+        except Exception as exc:
+            warnings.append(f"Could not calculate a visual fingerprint for {occurrence.original_part}: {exc}")
+
+        bucket = _deduplication_bucket(occurrence)
+        dedupe_key = (bucket, visual_sha) if bucket and visual_sha else None
+        if dedupe_key and dedupe_key in canonical_by_visual:
+            canonical = canonical_by_visual[dedupe_key]
+            occurrence.filename = canonical.filename
+            duplicate_of = canonical.filename
+        elif dedupe_key:
+            canonical_by_visual[dedupe_key] = occurrence
+
         alt_written = not occurrence.filename.startswith("REVIEW_") and occurrence.alt_node is not None
         if alt_written:
             occurrence.alt_node.set(occurrence.alt_attribute, occurrence.filename)
         output = output_dir / occurrence.filename
-        width = height = None
-        try:
-            width, height = _save_gif(occurrence.blob, output)
-        except Exception as exc:
-            warnings.append(f"Could not convert {occurrence.original_part} to GIF: {exc}")
-            output.write_bytes(occurrence.blob)
+        if occurrence.filename in saved_files:
+            width, height, file_sha = saved_files[occurrence.filename]
+        else:
+            width = height = None
+            try:
+                width, height = _save_gif(occurrence.blob, output)
+            except Exception as exc:
+                warnings.append(f"Could not convert {occurrence.original_part} to GIF: {exc}")
+                output.write_bytes(occurrence.blob)
+            file_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+            saved_files[occurrence.filename] = (width, height, file_sha)
         artifacts.append(
             ImageArtifact(
                 question=occurrence.question,
@@ -206,7 +257,9 @@ def process_document_images(doc: _Document, project_id: str, output_dir: Path, z
                 original_part=occurrence.original_part,
                 width_px=width,
                 height_px=height,
-                sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+                sha256=file_sha,
+                visual_sha256=visual_sha,
+                duplicate_of=duplicate_of,
                 alt_text_written=alt_written,
             )
         )

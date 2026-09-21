@@ -83,7 +83,7 @@ if uploaded is not None:
             col1.metric("Questions detected", result.question_count)
             col2.metric("Automatic fixes", result.fixed_count)
             col3.metric("Manual checks", result.manual_review_count)
-            col4.metric("Images extracted", result.image_count)
+            col4.metric("Image occurrences", result.image_count)
 
             if result.manual_review_count:
                 st.warning("Complete the listed manual checks before final CMS upload. The app does not guess when a change could alter mathematical meaning.")
