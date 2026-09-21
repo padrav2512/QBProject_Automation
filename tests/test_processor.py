@@ -178,7 +178,7 @@ def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
     assert [p.text for p in output.paragraphs] == original_texts
     xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
     alt_texts = xml.xpath(".//wp:docPr/@descr", namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"})
-    assert "project10436_q7_1.gif" in alt_texts
+    assert "existing_q7_1.gif" in alt_texts
 
 
 def test_exact_duplicate_question_images_reuse_first_filename(tmp_path: Path):
@@ -207,3 +207,34 @@ def test_exact_duplicate_question_images_reuse_first_filename(tmp_path: Path):
     duplicate_artifacts = [item for item in __import__('json').loads(result.image_manifest_path.read_text(encoding="utf-8"))["images"] if item["duplicate_of"]]
     assert len(duplicate_artifacts) == 1
     assert duplicate_artifacts[0]["duplicate_of"] == "project1000_q2_1.gif"
+
+
+def test_images_only_mode_uses_project_id_from_existing_question_ids(tmp_path: Path):
+    source = tmp_path / "existing_project_id.docx"
+    picture = tmp_path / "diagram.png"
+    Image.new("RGB", (40, 30), "white").save(picture)
+    doc = Document()
+    for text in [
+        "@Question: 3@",
+        "@Type: FIB@",
+        "@Question id: project777_q3 @",
+        "@New snippet id: 445566 @",
+        "@Question:@",
+        "Use the diagram.",
+    ]:
+        doc.add_paragraph(text)
+    doc.add_picture(str(picture))
+    for text in ["@e@", "@Answers:@", "3", "@e@", "@Solution:@", "Three.", "@e@"]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    options = ProcessorOptions(processing_mode="images_only", project_question_prefix="fallbackproject_q", start_snippet_id=1)
+    result = process_docx(source, source.name, options, tmp_path / "storage")
+    output = Document(result.output_path)
+    output_texts = [p.text for p in output.paragraphs]
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    alt_texts = xml.xpath(".//wp:docPr/@descr", namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"})
+
+    assert "@Question id: project777_q3 @" in output_texts
+    assert "@New snippet id: 445566 @" in output_texts
+    assert alt_texts == ["project777_q3_1.gif"]

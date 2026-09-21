@@ -25,10 +25,19 @@ with st.sidebar:
     processing_mode = "images_only" if processing_mode_label == "Images and Alt Text only" else "full"
 
     st.header("CMS numbering")
-    project_id = st.text_input("Project ID", value="project10436", help="The app generates question IDs such as project10436_q1 and CMS image names from this value.")
-    start_question = st.number_input("First question number", min_value=1, value=1, step=1)
-    start_snippet = st.number_input("First snippet ID", min_value=1, value=218989, step=1)
-    replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True, disabled=processing_mode == "images_only")
+    project_id = st.text_input(
+        "Project ID",
+        value="project",
+        help="In Full CMS preparation this is used for generated question IDs. In Images and Alt Text only it is only a fallback when no project ID can be read from existing Question id tags.",
+    )
+    if processing_mode == "full":
+        start_question = st.number_input("First question number", min_value=1, value=1, step=1)
+        start_snippet_text = st.text_input("First snippet ID", value="", placeholder="Enter the first snippet ID")
+        replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
+    else:
+        start_question = 1
+        start_snippet_text = ""
+        replace_ids = False
 
     st.header("Defaults for missing metadata")
     default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
@@ -40,7 +49,7 @@ with st.sidebar:
     convert_romans = st.checkbox("Convert top-level (i), (ii)… to (a), (b)…", value=True)
 
     if processing_mode == "images_only":
-        st.info("Existing CMS text and tags will be preserved. The app will extract images, assign CMS filenames and write those filenames into image Alt Text.")
+        st.info("Existing CMS text, tags, question IDs and snippet IDs will be preserved. The project ID in existing Question id tags takes priority over the fallback Project ID above.")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
 st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")
@@ -54,10 +63,14 @@ if uploaded is not None:
     if size_mb > max_mb:
         st.error(f"The file exceeds the configured {max_mb} MB upload limit.")
     elif st.button("Process document", type="primary", use_container_width=True):
+        start_snippet = int(start_snippet_text.strip()) if start_snippet_text.strip().isdigit() and int(start_snippet_text.strip()) > 0 else None
+        if processing_mode == "full" and start_snippet is None:
+            st.error("Enter a valid positive First snippet ID before processing the document.")
+            st.stop()
         options = ProcessorOptions(
             project_question_prefix=f"{project_id.strip().removesuffix('_q')}_q",
             start_question_number=int(start_question),
-            start_snippet_id=int(start_snippet),
+            start_snippet_id=start_snippet or 1,
             default_type=default_type,
             default_difficulty=default_difficulty,
             default_objective=default_objective,
@@ -116,6 +129,7 @@ if uploaded is not None:
                     file_name=output_download_name,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     use_container_width=True,
+                    on_click="ignore",
                 )
             else:
                 col_doc.caption("Processed DOCX unavailable because no questions were detected.")
@@ -125,6 +139,7 @@ if uploaded is not None:
                 file_name=f"{project_id.strip()}_images.zip",
                 mime="application/zip",
                 use_container_width=True,
+                on_click="ignore",
             )
             col_report.download_button(
                 "Download JSON audit report",
@@ -132,6 +147,7 @@ if uploaded is not None:
                 file_name=f"{Path(uploaded.name).stem}_CMS_audit.json",
                 mime="application/json",
                 use_container_width=True,
+                on_click="ignore",
             )
 
             st.caption(f"Processing reference: {result.run_id}")

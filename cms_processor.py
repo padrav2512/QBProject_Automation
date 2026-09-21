@@ -28,6 +28,7 @@ DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDra
 NS = {"m": MATH_NS, "w": WORD_NS, "wp": DRAWING_NS}
 
 QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)@$", re.I)
+QUESTION_ID_RE = re.compile(r"^@Question id:\s*(.*?)\s*@$", re.I)
 PLAIN_QUESTION_START_RE = re.compile(
     r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s*(Easy|Medium|Average|Challenging|Hard)?\s*$",
     re.I,
@@ -131,6 +132,21 @@ def _storage_root(explicit: str | Path | None = None) -> Path:
     if explicit:
         return Path(explicit)
     return Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data"))
+
+
+def _existing_project_id(doc: _Document) -> tuple[str | None, set[str]]:
+    project_ids: set[str] = set()
+    for paragraph in iter_paragraphs(doc):
+        match = QUESTION_ID_RE.fullmatch(paragraph.text.strip())
+        if not match:
+            continue
+        question_id = match.group(1).strip()
+        project_match = re.fullmatch(r"(.+)_q\d+", question_id, re.I)
+        if project_match:
+            project_ids.add(project_match.group(1))
+    if len(project_ids) == 1:
+        return next(iter(project_ids)), project_ids
+    return None, project_ids
 
 
 def iter_paragraphs(parent: _Document | _Cell) -> Iterator[Paragraph]:
@@ -904,6 +920,15 @@ def process_docx(
         _bold_table_headers(doc, options, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
+    if options.processing_mode == "images_only":
+        document_project_id, document_project_ids = _existing_project_id(doc)
+        if document_project_id:
+            project_id = document_project_id
+            findings.append(Finding(0, "passed", f"Used project ID {project_id} from the document's existing Question id tags."))
+        elif len(document_project_ids) > 1:
+            findings.append(Finding(0, "manual_review", f"Existing Question id tags contain multiple project IDs: {', '.join(sorted(document_project_ids))}. The app used the fallback Project ID {project_id}."))
+        else:
+            findings.append(Finding(0, "passed", f"No project ID could be derived from existing Question id tags; used fallback Project ID {project_id}."))
     run_images_dir = images_root / run_id
     images_zip_path = packages / f"{run_id}_{project_id}_images.zip"
     image_result = process_document_images(doc, project_id, run_images_dir, images_zip_path)
@@ -940,6 +965,7 @@ def process_docx(
         "manual_review_count": manual_review_count,
         "verification_status": verification_status,
         "options": asdict(options),
+        "effective_project_id": project_id,
         "findings": [asdict(f) for f in findings],
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
