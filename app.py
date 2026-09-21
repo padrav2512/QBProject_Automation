@@ -16,11 +16,19 @@ st.title("CMS DOCX Verification Processor")
 st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
 
 with st.sidebar:
+    st.header("Processing mode")
+    processing_mode_label = st.radio(
+        "Choose what the app should change",
+        ["Full CMS preparation", "Images and Alt Text only"],
+        help="Use Images and Alt Text only when the document already contains correct CMS tags and you want its text, tags, IDs and formatting preserved.",
+    )
+    processing_mode = "images_only" if processing_mode_label == "Images and Alt Text only" else "full"
+
     st.header("CMS numbering")
     project_id = st.text_input("Project ID", value="project10436", help="The app generates question IDs such as project10436_q1 and CMS image names from this value.")
     start_question = st.number_input("First question number", min_value=1, value=1, step=1)
     start_snippet = st.number_input("First snippet ID", min_value=1, value=218989, step=1)
-    replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
+    replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True, disabled=processing_mode == "images_only")
 
     st.header("Defaults for missing metadata")
     default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
@@ -30,6 +38,9 @@ with st.sidebar:
     st.header("Document structure")
     bold_first_column = st.checkbox("Treat first table column as a header", value=False)
     convert_romans = st.checkbox("Convert top-level (i), (ii)… to (a), (b)…", value=True)
+
+    if processing_mode == "images_only":
+        st.info("Existing CMS text and tags will be preserved. The app will extract images, assign CMS filenames and write those filenames into image Alt Text.")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
 st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")
@@ -53,6 +64,7 @@ if uploaded is not None:
             replace_existing_ids=replace_ids,
             bold_first_table_column=bold_first_column,
             convert_top_level_roman_subparts=convert_romans,
+            processing_mode=processing_mode,
         )
         try:
             with st.spinner("Processing the Word document…"):
@@ -61,7 +73,10 @@ if uploaded is not None:
             st.exception(exc)
         else:
             if result.question_count:
-                st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
+                if processing_mode == "images_only":
+                    st.success("Image filenames and Alt Text are ready. Download the updated DOCX, images ZIP and audit report below.")
+                else:
+                    st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
             else:
                 st.error("No question headings were detected, so CMS records and tags were not created. Review the verification report and correct the question-heading format before downloading a CMS-ready document.")
             col1, col2, col3, col4 = st.columns(4)
@@ -91,7 +106,8 @@ if uploaded is not None:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
-            output_download_name = f"{Path(uploaded.name).stem}_CMS_Verification_Ready.docx"
+            output_suffix = "Images_Alt_Text_Ready" if processing_mode == "images_only" else "CMS_Verification_Ready"
+            output_download_name = f"{Path(uploaded.name).stem}_{output_suffix}.docx"
             col_doc, col_images, col_report = st.columns(3)
             if result.question_count:
                 col_doc.download_button(

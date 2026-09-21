@@ -66,6 +66,7 @@ ROMAN_RE = re.compile(r"^\s*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)\s*", re.I)
 ALPHA_RE = re.compile(r"^\s*\(([a-z])\)\s*", re.I)
 OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
 LETTER_ANSWER_RE = re.compile(r"^\s*Answer\s*:?\s*([A-Da-d])\s*$", re.I)
+ANSWER_VALUE_RE = re.compile(r"^\s*Answer\s*:?\s*(.+?)\s*$", re.I)
 DIFFICULTY_ALIASES = {
     "easy": "Easy",
     "medium": "Average",
@@ -86,6 +87,7 @@ class ProcessorOptions:
     replace_existing_ids: bool = True
     bold_first_table_column: bool = False
     convert_top_level_roman_subparts: bool = True
+    processing_mode: str = "full"
 
 
 @dataclass
@@ -282,9 +284,37 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         findings.append(Finding(0, "fixed", "Identified an untagged MCQ, created its Choices and Solution sections, and marked the keyed answer.", detected_number))
 
 
+def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> None:
+    """Structure an untagged FIB when a single non-letter Answer value is explicit."""
+    starts = _question_starts(doc)
+    for ordinal, (start, detected_number) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        block = _block_paragraphs(start, next_start)
+        if any(p.text.strip() in SECTION_MARKERS for p in block):
+            continue
+        candidates: list[tuple[Paragraph, re.Match[str]]] = []
+        for paragraph in block:
+            match = ANSWER_VALUE_RE.fullmatch(paragraph.text.strip())
+            if match and not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()):
+                candidates.append((paragraph, match))
+        if len(candidates) != 1:
+            continue
+        answer_paragraph, answer_match = candidates[0]
+        answer_value = answer_match.group(1).strip()
+        if not answer_value or len(answer_value) > 100 or "\n" in answer_value:
+            findings.append(Finding(0, "manual_review", "An FIB-style answer was found but is too complex to structure automatically.", detected_number))
+            continue
+        answer_paragraph.insert_paragraph_before("@Answers:@")
+        _set_text(answer_paragraph, answer_value)
+        solution_marker = _insert_after(answer_paragraph, "@Solution:@")
+        _insert_after(solution_marker, f"The answer is {answer_value}.")
+        findings.append(Finding(0, "fixed", "Identified an untagged FIB and created its Answers and Solution sections.", detected_number))
+
+
 def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> int:
     _canonicalise_section_labels(doc, findings)
     _infer_untagged_mcq_sections(doc, findings)
+    _infer_untagged_fib_sections(doc, findings)
     starts = _question_starts(doc)
     if not starts:
         findings.append(Finding(0, "manual_review", "No question headings were detected. Use @Question: n@ or a standalone heading such as Question 1."))
@@ -852,19 +882,26 @@ def process_docx(
 
     doc = Document(original_path)
     findings: list[Finding] = []
-    question_count = _ensure_cms_records(doc, options, findings)
-    _normalise_choices(doc, findings)
-    _remove_bold_from_questions_and_solutions(doc, findings)
-    _remove_empty_scripts(doc, findings)
-    _repair_spacing(doc, findings)
-    _repair_italics(doc, findings)
-    _split_answers(doc, findings)
-    _normalise_subparts(doc, options, findings)
-    _convert_inline_slash_fractions(doc, findings)
-    _convert_simple_math_paragraphs(doc, findings)
-    _equation_and_fraction_audit(doc, findings)
-    _audit_assertion_reason(doc, findings)
-    _bold_table_headers(doc, options, findings)
+    if options.processing_mode == "images_only":
+        question_count = len(_question_starts(doc))
+        if question_count:
+            findings.append(Finding(0, "passed", "Images-only mode preserved the existing document text, CMS tags, metadata and formatting."))
+        else:
+            findings.append(Finding(0, "manual_review", "No @Question: n@ records were detected. Images cannot be assigned reliable CMS filenames without existing question tags."))
+    else:
+        question_count = _ensure_cms_records(doc, options, findings)
+        _normalise_choices(doc, findings)
+        _remove_bold_from_questions_and_solutions(doc, findings)
+        _remove_empty_scripts(doc, findings)
+        _repair_spacing(doc, findings)
+        _repair_italics(doc, findings)
+        _split_answers(doc, findings)
+        _normalise_subparts(doc, options, findings)
+        _convert_inline_slash_fractions(doc, findings)
+        _convert_simple_math_paragraphs(doc, findings)
+        _equation_and_fraction_audit(doc, findings)
+        _audit_assertion_reason(doc, findings)
+        _bold_table_headers(doc, options, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
     run_images_dir = images_root / run_id
@@ -877,7 +914,8 @@ def process_docx(
     else:
         findings.append(Finding(0, "passed", "No embedded images were detected."))
 
-    output_name = f"{Path(safe_name).stem}_CMS_Verification_Ready.docx"
+    suffix = "Images_Alt_Text_Ready" if options.processing_mode == "images_only" else "CMS_Verification_Ready"
+    output_name = f"{Path(safe_name).stem}_{suffix}.docx"
     output_path = processed / f"{run_id}_{output_name}"
     doc.core_properties.title = f"{Path(safe_name).stem} - CMS Verification Ready"
     doc.core_properties.subject = "Processed and audited for HeyMath CMS verification"

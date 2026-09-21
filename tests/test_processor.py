@@ -126,3 +126,56 @@ def test_heading_with_difficulty_and_untagged_mcq_are_structured(tmp_path: Path)
     assert "@2@ 35 and 20 @correct answer@" in texts
     assert "@Solution:@" in texts
     assert "The correct answer is option (b)." in texts
+
+
+def test_untagged_fib_answer_is_structured(tmp_path: Path):
+    source = tmp_path / "untagged_fib.docx"
+    doc = Document()
+    doc.add_paragraph("Q6) Medium")
+    doc.add_paragraph("A coin finishes at position P. Find P.")
+    doc.add_paragraph("Answer 50")
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    texts = [p.text for p in Document(result.output_path).paragraphs]
+
+    assert result.question_count == 1
+    assert "@Type: FIB@" in texts
+    assert "@Difficulty level: Average @" in texts
+    assert "@Answers:@" in texts
+    assert "50" in texts
+    assert "@Solution:@" in texts
+    assert "The answer is 50." in texts
+
+
+def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
+    source = tmp_path / "already_tagged.docx"
+    picture = tmp_path / "tagged_image.png"
+    Image.new("RGB", (40, 30), "white").save(picture)
+    doc = Document()
+    for text in [
+        "@Question: 7@",
+        "@Type: MCQ@",
+        "@Question id: existing_q7 @",
+        "@New snippet id: 900 @",
+        "@Difficulty level: Easy @",
+        "@Objective: Application @",
+        "@Question:@",
+        "Choose the diagram.",
+    ]:
+        doc.add_paragraph(text)
+    doc.add_picture(str(picture))
+    for text in ["@e@", "@Choices:@", "@1@ One @correct answer@", "@2@ Two", "@3@ Three", "@4@ Four", "@e@", "@Solution:@", "One is correct.", "@e@"]:
+        doc.add_paragraph(text)
+    doc.save(source)
+    original_texts = [p.text for p in doc.paragraphs]
+
+    options = ProcessorOptions(processing_mode="images_only", project_question_prefix="project10436_q")
+    result = process_docx(source, source.name, options, tmp_path / "storage")
+    output = Document(result.output_path)
+
+    assert result.question_count == 1
+    assert [p.text for p in output.paragraphs] == original_texts
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    alt_texts = xml.xpath(".//wp:docPr/@descr", namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"})
+    assert "project10436_q7_1.gif" in alt_texts
