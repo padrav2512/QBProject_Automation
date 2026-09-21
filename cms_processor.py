@@ -1,0 +1,850 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import shutil
+import uuid
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator
+
+from docx import Document
+from docx.document import Document as _Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.table import _Cell, Table
+from docx.text.paragraph import Paragraph
+
+from image_pipeline import process_document_images
+
+
+MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+NS = {"m": MATH_NS, "w": WORD_NS, "wp": DRAWING_NS}
+
+QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)@$", re.I)
+PLAIN_QUESTION_START_RE = re.compile(r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*$", re.I)
+KNOWN_METADATA_RE = re.compile(
+    r"^@(Type|Question id|New snippet id|Difficulty level|Objective):\s*(.*?)\s*@$",
+    re.I,
+)
+PLAIN_METADATA_RE = re.compile(
+    r"^(Type|Question id|New snippet id|Difficulty(?: level)?|Objective):\s*(.*?)\s*$",
+    re.I,
+)
+SECTION_ALIASES = {
+    "question": "@Question:@",
+    "question:": "@Question:@",
+    "@question:@": "@Question:@",
+    "answers": "@Answers:@",
+    "answer": "@Answers:@",
+    "answers:": "@Answers:@",
+    "answer:": "@Answers:@",
+    "@answers:@": "@Answers:@",
+    "choices": "@Choices:@",
+    "options": "@Choices:@",
+    "choices:": "@Choices:@",
+    "options:": "@Choices:@",
+    "@choices:@": "@Choices:@",
+    "solution": "@Solution:@",
+    "solution:": "@Solution:@",
+    "@solution:@": "@Solution:@",
+}
+SECTION_MARKERS = {"@Question:@", "@Answers:@", "@Choices:@", "@Solution:@"}
+VARIABLE_ONLY_RE = re.compile(r"^[A-Za-z]$")
+SIMPLE_FRACTION_RE = re.compile(r"(?<![\w/])(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])(?![\w/])")
+INLINE_EQUATION_RE = re.compile(r"(?:\b\d+\b|\b[A-Za-z]\b)\s*=\s*(?:\b\d+\b|\b[A-Za-z]\b)")
+ROMAN_RE = re.compile(r"^\s*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)\s*", re.I)
+ALPHA_RE = re.compile(r"^\s*\(([a-z])\)\s*", re.I)
+OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
+
+
+@dataclass
+class ProcessorOptions:
+    project_question_prefix: str = "project10436_q"
+    start_question_number: int = 1
+    start_snippet_id: int = 218989
+    default_type: str = "FIB"
+    default_difficulty: str = "Average"
+    default_objective: str = "Application"
+    replace_existing_ids: bool = True
+    bold_first_table_column: bool = False
+    convert_top_level_roman_subparts: bool = True
+
+
+@dataclass
+class Finding:
+    rule: int
+    status: str
+    message: str
+    question: int | None = None
+    paragraph: int | None = None
+
+
+@dataclass
+class ProcessResult:
+    output_path: Path
+    report_path: Path
+    manifest_path: Path
+    image_manifest_path: Path
+    images_zip_path: Path
+    original_path: Path
+    run_id: str
+    question_count: int
+    image_count: int
+    findings: list[Finding]
+
+    @property
+    def manual_review_count(self) -> int:
+        return sum(f.status == "manual_review" for f in self.findings)
+
+    @property
+    def fixed_count(self) -> int:
+        return sum(f.status == "fixed" for f in self.findings)
+
+
+def _safe_filename(name: str) -> str:
+    base = Path(name).name
+    stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")
+    return stem or "uploaded.docx"
+
+
+def _storage_root(explicit: str | Path | None = None) -> Path:
+    if explicit:
+        return Path(explicit)
+    return Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data"))
+
+
+def iter_paragraphs(parent: _Document | _Cell) -> Iterator[Paragraph]:
+    """Yield body and table-cell paragraphs in document order."""
+    for child in parent.element.body.iterchildren() if isinstance(parent, _Document) else parent._tc.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, parent)
+        elif child.tag == qn("w:tbl"):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from iter_paragraphs(cell)
+
+
+def body_paragraphs(doc: _Document) -> list[Paragraph]:
+    return [Paragraph(p, doc) for p in doc.element.body.findall(qn("w:p"))]
+
+
+def _set_text(paragraph: Paragraph, text: str) -> None:
+    paragraph.clear()
+    paragraph.add_run(text)
+
+
+def _insert_after(paragraph: Paragraph, text: str = "") -> Paragraph:
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_paragraph = Paragraph(new_p, paragraph._parent)
+    if text:
+        new_paragraph.add_run(text)
+    return new_paragraph
+
+
+def _remove_paragraph(paragraph: Paragraph) -> None:
+    parent = paragraph._p.getparent()
+    if parent is not None:
+        parent.remove(paragraph._p)
+
+
+def _question_starts(doc: _Document) -> list[tuple[Paragraph, int]]:
+    starts: list[tuple[Paragraph, int]] = []
+    for paragraph in body_paragraphs(doc):
+        text = paragraph.text.strip()
+        match = QUESTION_START_RE.fullmatch(text) or PLAIN_QUESTION_START_RE.fullmatch(text)
+        if match:
+            starts.append((paragraph, int(match.group(1))))
+    return starts
+
+
+def _canonicalise_section_labels(doc: _Document, findings: list[Finding]) -> None:
+    for index, paragraph in enumerate(iter_paragraphs(doc), 1):
+        raw = paragraph.text.strip()
+        key = raw.casefold()
+        if key in SECTION_ALIASES and raw != SECTION_ALIASES[key]:
+            _set_text(paragraph, SECTION_ALIASES[key])
+            findings.append(Finding(0, "fixed", f"Converted section label to {SECTION_ALIASES[key]}", paragraph=index))
+
+
+def _block_paragraphs(start: Paragraph, next_start: Paragraph | None) -> list[Paragraph]:
+    result: list[Paragraph] = []
+    node = start._p
+    stop = next_start._p if next_start else None
+    while node is not None and node is not stop:
+        if node.tag == qn("w:p"):
+            result.append(Paragraph(node, start._parent))
+        node = node.getnext()
+    return result
+
+
+def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
+    for p in block:
+        match = KNOWN_METADATA_RE.fullmatch(p.text.strip()) or PLAIN_METADATA_RE.fullmatch(p.text.strip())
+        field_name = match.group(1).casefold() if match else ""
+        if field_name == "difficulty":
+            field_name = "difficulty level"
+        if match and field_name == name.casefold():
+            return match.group(2).strip()
+    return None
+
+
+def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> int:
+    _canonicalise_section_labels(doc, findings)
+    starts = _question_starts(doc)
+    if not starts:
+        findings.append(Finding(0, "manual_review", "No question headings were detected. Use @Question: n@ or a standalone heading such as Question 1."))
+        return 0
+
+    # Work backwards so insertions do not disturb unprocessed record boundaries.
+    for ordinal in range(len(starts) - 1, -1, -1):
+        start, detected_number = starts[ordinal]
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        block = _block_paragraphs(start, next_start)
+        assigned_number = options.start_question_number + ordinal
+        _set_text(start, f"@Question: {assigned_number}@")
+
+        existing_type = (_metadata_value(block, "Type") or "").upper()
+        has_choices = any(p.text.strip() == "@Choices:@" for p in block)
+        question_type = existing_type if existing_type in {"FIB", "MCQ"} else ("MCQ" if has_choices else options.default_type)
+        difficulty = _metadata_value(block, "Difficulty level") or options.default_difficulty
+        objective = _metadata_value(block, "Objective") or options.default_objective
+        existing_qid = _metadata_value(block, "Question id")
+        existing_snippet = _metadata_value(block, "New snippet id")
+        qid = f"{options.project_question_prefix}{assigned_number}" if options.replace_existing_ids or not existing_qid else existing_qid
+        snippet = str(options.start_snippet_id + ordinal) if options.replace_existing_ids or not existing_snippet else existing_snippet
+
+        for paragraph in list(block[1:]):
+            if KNOWN_METADATA_RE.fullmatch(paragraph.text.strip()) or PLAIN_METADATA_RE.fullmatch(paragraph.text.strip()):
+                _remove_paragraph(paragraph)
+
+        cursor = start
+        metadata = [
+            f"@Type: {question_type}@",
+            f"@Question id: {qid} @",
+            f"@New snippet id: {snippet} @",
+            f"@Difficulty level: {difficulty} @",
+            f"@Objective: {objective} @",
+        ]
+        for line in metadata:
+            cursor = _insert_after(cursor, line)
+
+        refreshed = _block_paragraphs(start, next_start)
+        q_marker = next((p for p in refreshed if p.text.strip() == "@Question:@"), None)
+        if q_marker is None:
+            q_marker = _insert_after(cursor, "@Question:@")
+            findings.append(Finding(0, "fixed", "Inserted the missing @Question:@ marker.", assigned_number))
+
+        findings.append(Finding(0, "fixed", f"Normalised CMS metadata and assigned question ID {qid} and snippet ID {snippet}.", assigned_number))
+
+    # Recompute and close each content block immediately before the next section.
+    starts = _question_starts(doc)
+    for ordinal, (start, _) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        assigned_number = options.start_question_number + ordinal
+        block = _block_paragraphs(start, next_start)
+        section_positions = [i for i, p in enumerate(block) if p.text.strip() in SECTION_MARKERS]
+        if not any(block[i].text.strip() in {"@Answers:@", "@Choices:@"} for i in section_positions):
+            findings.append(Finding(8, "manual_review", "The record has no @Answers:@ or @Choices:@ block.", assigned_number))
+        if not any(block[i].text.strip() == "@Solution:@" for i in section_positions):
+            findings.append(Finding(1, "manual_review", "The record has no @Solution:@ block.", assigned_number))
+
+        for pos_index in range(len(section_positions) - 1, -1, -1):
+            pos = section_positions[pos_index]
+            end = section_positions[pos_index + 1] if pos_index + 1 < len(section_positions) else len(block)
+            content = block[pos + 1 : end]
+            last_nonblank = next(
+                (
+                    p
+                    for p in reversed(content)
+                    if p.text.strip() or p._p.xpath(".//w:drawing | .//w:pict | .//m:oMath")
+                ),
+                None,
+            )
+            if last_nonblank is None:
+                continue
+            if last_nonblank.text.strip() != "@e@":
+                _insert_after(last_nonblank, "@e@")
+                findings.append(Finding(0, "fixed", f"Inserted a missing @e@ after {block[pos].text.strip()}.", assigned_number))
+
+    return len(starts)
+
+
+def _section_for_paragraphs(doc: _Document) -> dict[object, tuple[str | None, int | None]]:
+    state: dict[object, tuple[str | None, int | None]] = {}
+    section: str | None = None
+    question: int | None = None
+    for paragraph in body_paragraphs(doc):
+        text = paragraph.text.strip()
+        start = QUESTION_START_RE.fullmatch(text)
+        if start:
+            question = int(start.group(1))
+            section = None
+        elif text in SECTION_MARKERS:
+            section = text
+        elif text == "@e@":
+            section = None
+        state[paragraph._p] = (section, question)
+    return state
+
+
+def _remove_bold_from_questions_and_solutions(doc: _Document, findings: list[Finding]) -> None:
+    context = _section_for_paragraphs(doc)
+    sections: dict[tuple[int | None, str], list[Paragraph]] = {}
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Solution:@"}:
+            continue
+        if paragraph.text.strip() in SECTION_MARKERS or paragraph.text.strip() == "@e@":
+            continue
+        sections.setdefault((question, section), []).append(paragraph)
+
+    changed_sections = 0
+    emphasis_sections = 0
+    for (question, section), paragraphs in sections.items():
+        substantive_runs: list[tuple[Paragraph, object]] = []
+        for paragraph in paragraphs:
+            for run in paragraph.runs:
+                if run.text.strip():
+                    substantive_runs.append((paragraph, run))
+        if not substantive_runs:
+            continue
+
+        def effectively_bold(paragraph: Paragraph, run) -> bool:
+            if run.bold is not None:
+                return bool(run.bold)
+            if run.style is not None and run.style.font.bold is not None:
+                return bool(run.style.font.bold)
+            if paragraph.style is not None and paragraph.style.font.bold is not None:
+                return bool(paragraph.style.font.bold)
+            return False
+
+        bold_flags = [effectively_bold(paragraph, run) for paragraph, run in substantive_runs]
+        if all(bold_flags):
+            for _, run in substantive_runs:
+                run.bold = False
+            changed_sections += 1
+            label = "Question" if section == "@Question:@" else "Solution"
+            findings.append(Finding(1, "fixed", f"Removed whole-block bold formatting from the {label.lower()} while preserving the text.", question))
+        elif any(bold_flags):
+            emphasis_sections += 1
+            label = "question" if section == "@Question:@" else "solution"
+            findings.append(Finding(1, "passed", f"Preserved selective bold emphasis within the {label}; the entire block was not bold.", question))
+
+    if not changed_sections and not emphasis_sections:
+        findings.append(Finding(1, "passed", "No whole-question or whole-solution bold formatting was found."))
+    else:
+        findings.append(Finding(1, "passed", f"Bold-format review completed: {changed_sections} whole block(s) corrected and {emphasis_sections} selectively emphasised block(s) preserved."))
+
+
+def _remove_empty_scripts(doc: _Document, findings: list[Finding]) -> None:
+    root = doc.element
+    removed = 0
+    for tag, child_tag in (("sSup", "sup"), ("sSub", "sub")):
+        scripts = list(root.xpath(f".//m:{tag}"))
+        for script in reversed(scripts):
+            slot = script.find(qn(f"m:{child_tag}"))
+            if slot is not None and "".join(slot.itertext()).strip():
+                continue
+            base = script.find(qn("m:e"))
+            parent = script.getparent()
+            if base is None or parent is None:
+                continue
+            position = parent.index(script)
+            parent.remove(script)
+            for child in list(base):
+                base.remove(child)
+                parent.insert(position, child)
+                position += 1
+            removed += 1
+    blank_equations = 0
+    for equation in reversed(list(root.xpath(".//m:oMath"))):
+        visible_text = "".join(node.text or "" for node in equation.iter(qn("m:t"))).strip()
+        if visible_text:
+            continue
+        parent = equation.getparent()
+        if parent is not None:
+            parent.remove(equation)
+            blank_equations += 1
+    total = removed + blank_equations
+    if total:
+        findings.append(Finding(4, "fixed", f"Removed {removed} blank exponent/subscript template(s) and {blank_equations} completely blank equation object(s)."))
+    else:
+        findings.append(Finding(4, "passed", "No blank equation, exponent or subscript templates were found."))
+
+
+def _normalise_spacing(text: str) -> str:
+    if not text:
+        return text
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"\s*([=+×÷−])\s*", r" \1 ", text)
+    text = re.sub(r" +([.;:?!])", r"\1", text)
+    return text.strip() if text.strip().startswith("@") and text.strip().endswith("@") else text
+
+
+def _repair_spacing(doc: _Document, findings: list[Finding]) -> None:
+    changes = 0
+    for node in doc.element.xpath(".//w:t | .//m:t"):
+        original = node.text or ""
+        updated = _normalise_spacing(original)
+        if updated != original:
+            node.text = updated
+            changes += 1
+    findings.append(Finding(4, "fixed" if changes else "passed", f"Normalised spacing in {changes} text run(s)." if changes else "No repeated or operator-spacing defects were found."))
+    findings.append(Finding(5, "passed", "Operator and equals-sign spacing was checked and normalised."))
+    findings.append(Finding(6, "passed", "Comma spacing was checked and normalised."))
+
+
+def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
+    removed = 0
+    manual = 0
+    context = _section_for_paragraphs(doc)
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Solution:@"}:
+            continue
+        for run in paragraph.runs:
+            if not run.italic:
+                continue
+            text = run.text.strip()
+            if VARIABLE_ONLY_RE.fullmatch(text):
+                continue
+            run.italic = False
+            removed += 1
+            if re.search(r"\b[A-Za-z]\b", text):
+                manual += 1
+                findings.append(Finding(3, "manual_review", f"Removed italics from a mixed text run containing a possible variable: {text!r}. Re-italicise only the variable if required.", question))
+
+    # Explicit equation italics on non-variable content are changed to plain.
+    for math_run in doc.element.xpath(".//m:r"):
+        text = "".join(math_run.itertext()).strip()
+        style = math_run.find("m:rPr/m:sty", namespaces=NS)
+        if style is not None and style.get(qn("m:val")) == "i" and not VARIABLE_ONLY_RE.fullmatch(text):
+            style.set(qn("m:val"), "p")
+            removed += 1
+
+    if removed:
+        findings.append(Finding(3, "fixed", f"Removed italics from {removed} non-variable run(s)."))
+    elif not manual:
+        findings.append(Finding(3, "passed", "No non-variable italic formatting was detected."))
+
+
+def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> None:
+    native_count = len(doc.element.xpath(".//m:oMath"))
+    findings.append(Finding(2, "passed", f"Detected {native_count} native Word equation object(s)."))
+    context = _section_for_paragraphs(doc)
+    fraction_hits = 0
+    image_hits = 0
+    math_text_hits = 0
+    for index, paragraph in enumerate(body_paragraphs(doc), 1):
+        section, question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
+            continue
+        text = paragraph.text
+        if SIMPLE_FRACTION_RE.search(text):
+            fraction_hits += 1
+            findings.append(Finding(7, "manual_review", f"Slash-style fraction requires conversion to a stacked Word equation: {text.strip()!r}", question, index))
+        if paragraph._p.xpath(".//w:drawing | .//w:pict"):
+            image_hits += 1
+            findings.append(Finding(2, "manual_review", "An embedded image occurs in mathematical content. Verify that it is a diagram, not an equation screenshot.", question, index))
+        if not paragraph._p.xpath(".//m:oMath") and (
+            re.fullmatch(r"\s*[A-Za-z0-9().,]+(?:\s*[=+×÷−]\s*[A-Za-z0-9().,]+)+\s*", text)
+            or INLINE_EQUATION_RE.search(text)
+        ):
+            math_text_hits += 1
+            findings.append(Finding(2, "manual_review", f"A math-like expression is ordinary text and should be recreated with Insert → Equation: {text.strip()!r}", question, index))
+    if not fraction_hits:
+        findings.append(Finding(7, "passed", "No slash-style fractions were detected in student-facing content."))
+    if not image_hits and not math_text_hits:
+        findings.append(Finding(2, "passed", "No likely equation screenshots or ordinary-text equations were detected."))
+
+
+def _math_run(text: str) -> OxmlElement:
+    run = OxmlElement("m:r")
+    value = OxmlElement("m:t")
+    value.text = text
+    run.append(value)
+    return run
+
+
+def _math_fraction(numerator: str, denominator: str) -> OxmlElement:
+    fraction = OxmlElement("m:f")
+    num = OxmlElement("m:num")
+    den = OxmlElement("m:den")
+    num.append(_math_run(numerator))
+    den.append(_math_run(denominator))
+    fraction.append(num)
+    fraction.append(den)
+    return fraction
+
+
+def _word_text_run(text: str, run_properties) -> OxmlElement:
+    run = OxmlElement("w:r")
+    if run_properties is not None:
+        run.append(deepcopy(run_properties))
+    value = OxmlElement("w:t")
+    if text[:1].isspace() or text[-1:].isspace():
+        value.set(qn("xml:space"), "preserve")
+    value.text = text
+    run.append(value)
+    return run
+
+
+def _convert_inline_slash_fractions(doc: _Document, findings: list[Finding]) -> None:
+    """Replace simple fractions inside ordinary runs with native stacked fractions."""
+    context = _section_for_paragraphs(doc)
+    converted = 0
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
+            continue
+        for run in list(paragraph.runs):
+            text = run.text
+            matches = list(SIMPLE_FRACTION_RE.finditer(text))
+            if not matches:
+                continue
+            # Runs containing tabs, line breaks or drawings need a human-safe edit.
+            if any(child.tag not in {qn("w:rPr"), qn("w:t")} for child in run._r):
+                findings.append(Finding(7, "manual_review", f"A slash fraction occurs in a complex Word run and could not be converted safely: {text!r}", question))
+                continue
+            parent = run._r.getparent()
+            if parent is None:
+                continue
+            position = parent.index(run._r)
+            run_properties = run._r.rPr
+            cursor = 0
+            replacement_nodes: list[object] = []
+            for match in matches:
+                if match.start() > cursor:
+                    replacement_nodes.append(_word_text_run(text[cursor : match.start()], run_properties))
+                equation = OxmlElement("m:oMath")
+                equation.append(_math_fraction(match.group(1), match.group(2)))
+                replacement_nodes.append(equation)
+                cursor = match.end()
+                converted += 1
+            if cursor < len(text):
+                replacement_nodes.append(_word_text_run(text[cursor:], run_properties))
+            parent.remove(run._r)
+            for offset, node in enumerate(replacement_nodes):
+                parent.insert(position + offset, node)
+    if converted:
+        findings.append(Finding(7, "fixed", f"Converted {converted} slash-style fraction(s) into native stacked Word fractions."))
+    else:
+        findings.append(Finding(7, "passed", "No safely convertible slash-style fractions were found in ordinary text runs."))
+
+
+def _append_native_equation(paragraph: Paragraph, expression: str) -> None:
+    equation = OxmlElement("m:oMath")
+    cursor = 0
+    for match in SIMPLE_FRACTION_RE.finditer(expression):
+        if match.start() > cursor:
+            equation.append(_math_run(expression[cursor : match.start()]))
+        equation.append(_math_fraction(match.group(1), match.group(2)))
+        cursor = match.end()
+    if cursor < len(expression):
+        equation.append(_math_run(expression[cursor:]))
+    paragraph._p.append(equation)
+
+
+def _convert_simple_math_paragraphs(doc: _Document, findings: list[Finding]) -> None:
+    """Convert only unambiguous standalone expressions; prose remains for review."""
+    context = _section_for_paragraphs(doc)
+    converted = 0
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
+            continue
+        if paragraph._p.xpath(".//m:oMath | .//w:drawing | .//w:pict"):
+            continue
+        raw = paragraph.text.strip()
+        if not raw or raw.startswith("@"):
+            continue
+        label_match = re.match(r"^(\([a-z]\))\s+", raw, re.I)
+        label = label_match.group(1) if label_match else ""
+        expression = raw[label_match.end() :] if label_match else raw
+        if re.search(r"[A-Za-z]{2,}", expression):
+            continue
+        if "^" in expression or not re.fullmatch(r"[A-Za-z0-9.,()\s=+×÷−*/]+", expression):
+            continue
+        if not re.search(r"[=+×÷−/]", expression):
+            continue
+        paragraph.clear()
+        if label:
+            paragraph.add_run(label + " ")
+        _append_native_equation(paragraph, _normalise_spacing(expression))
+        converted += 1
+        findings.append(Finding(2, "fixed", f"Converted a standalone mathematical expression to a native Word equation: {raw!r}", question))
+    if converted:
+        findings.append(Finding(7, "fixed", f"Converted slash fractions to stacked fractions wherever they occurred in {converted} unambiguous standalone expression(s)."))
+
+
+def _split_answers(doc: _Document, findings: list[Finding]) -> None:
+    context = _section_for_paragraphs(doc)
+    splits = 0
+    for paragraph in list(body_paragraphs(doc)):
+        section, question = context.get(paragraph._p, (None, None))
+        if section != "@Answers:@":
+            continue
+        text = paragraph.text.strip()
+        matches = list(re.finditer(r"(?<!\w)(\([a-z]\)|[a-z]\))\s*", text, re.I))
+        if len(matches) < 2:
+            continue
+        parts: list[str] = []
+        for idx, match in enumerate(matches):
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            parts.append(text[match.start() : end].strip())
+        _set_text(paragraph, parts[0])
+        cursor = paragraph
+        for part in parts[1:]:
+            cursor = _insert_after(cursor, part)
+        splits += len(parts) - 1
+        findings.append(Finding(8, "fixed", f"Placed {len(parts)} labelled answers on separate lines.", question))
+    if not splits:
+        findings.append(Finding(8, "passed", "No combined labelled answer lines required splitting."))
+
+
+def _normalise_subparts(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> None:
+    if not options.convert_top_level_roman_subparts:
+        findings.append(Finding(9, "manual_review", "Automatic top-level subpart conversion was disabled."))
+        return
+    context = _section_for_paragraphs(doc)
+    candidates: list[tuple[Paragraph, re.Match[str], int | None]] = []
+    alpha_exists = False
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section != "@Question:@":
+            continue
+        alpha_exists = alpha_exists or bool(ALPHA_RE.match(paragraph.text))
+        match = ROMAN_RE.match(paragraph.text)
+        if match:
+            candidates.append((paragraph, match, question))
+    if candidates and not alpha_exists:
+        for idx, (paragraph, match, question) in enumerate(candidates):
+            label = chr(ord("a") + idx)
+            _set_text(paragraph, f"({label}) {paragraph.text[match.end():].strip()}")
+        findings.append(Finding(9, "fixed", f"Converted {len(candidates)} top-level Roman-numeral subpart label(s) to alphabetic labels."))
+    elif candidates and alpha_exists:
+        findings.append(Finding(9, "manual_review", "Both alphabetic and Roman-numeral labels occur at the same visible level. Verify which Roman numerals are nested."))
+    else:
+        findings.append(Finding(9, "passed", "Top-level subpart labels are compatible with the required format."))
+
+
+ASSERTION_CHOICES = [
+    "Both Assertion (A) and Reason (R) are true and Reason (R) is the correct explanation of Assertion (A)",
+    "Both Assertion (A) and Reason (R) are true and Reason (R) is not the correct explanation of Assertion (A)",
+    "Assertion (A) is true but Reason (R) is false",
+    "Assertion (A) is false but Reason (R) is true",
+]
+
+
+def _audit_assertion_reason(doc: _Document, findings: list[Finding]) -> None:
+    starts = _question_starts(doc)
+    found_any = False
+    for ordinal, (start, number) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        block = _block_paragraphs(start, next_start)
+        texts = [p.text.strip() for p in block]
+        if not any(t.startswith("Assertion (A):") for t in texts) or not any(t.startswith("Reason (R):") for t in texts):
+            continue
+        found_any = True
+        intro = "A statement of Assertion (A) is followed by a statement of Reason (R)."
+        assertion_index = next(i for i, t in enumerate(texts) if t.startswith("Assertion (A):"))
+        if intro not in texts[:assertion_index]:
+            block[assertion_index].insert_paragraph_before(intro)
+            findings.append(Finding(10, "fixed", "Inserted the required Assertion–Reason introductory sentence.", number))
+
+        choice_marker = next((p for p in block if p.text.strip() == "@Choices:@"), None)
+        if choice_marker is None:
+            findings.append(Finding(10, "manual_review", "Assertion–Reason item has no @Choices:@ block.", number))
+            continue
+        option_paragraphs: list[Paragraph] = []
+        node = choice_marker._p.getnext()
+        while node is not None and node is not (next_start._p if next_start else None):
+            if node.tag == qn("w:p"):
+                paragraph = Paragraph(node, choice_marker._parent)
+                if paragraph.text.strip() in {"@e@", "@Solution:@"}:
+                    break
+                if OPTION_RE.match(paragraph.text):
+                    option_paragraphs.append(paragraph)
+            node = node.getnext()
+        if len(option_paragraphs) != 4:
+            findings.append(Finding(10, "manual_review", f"Assertion–Reason item has {len(option_paragraphs)} detectable choices; four are required.", number))
+            continue
+        correct_indexes = [i for i, p in enumerate(option_paragraphs) if "@correct answer@" in p.text]
+        if len(correct_indexes) != 1:
+            findings.append(Finding(10, "manual_review", "Assertion–Reason item must have exactly one @correct answer@ marker.", number))
+        for i, paragraph in enumerate(option_paragraphs):
+            suffix = " @correct answer@" if i in correct_indexes else ""
+            _set_text(paragraph, f"@{i + 1}@ {ASSERTION_CHOICES[i]}{suffix}")
+        findings.append(Finding(10, "fixed", "Normalised the four Assertion–Reason choice sentences while preserving the existing correct-answer position.", number))
+    if not found_any:
+        findings.append(Finding(10, "passed", "No Assertion–Reason items were detected."))
+
+
+def _bold_table_headers(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> None:
+    cells_changed = 0
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        header_cells = list(table.rows[0].cells)
+        if options.bold_first_table_column:
+            header_cells.extend(row.cells[0] for row in table.rows[1:] if row.cells)
+        seen: set[int] = set()
+        for cell in header_cells:
+            if id(cell._tc) in seen:
+                continue
+            seen.add(id(cell._tc))
+            for paragraph in cell.paragraphs:
+                if not paragraph.runs and paragraph.text:
+                    paragraph.add_run(paragraph.text)
+                for run in paragraph.runs:
+                    if run.bold is not True:
+                        run.bold = True
+                        cells_changed += 1
+    findings.append(Finding(11, "fixed" if cells_changed else "passed", f"Applied bold formatting to {cells_changed} table-header run(s)." if cells_changed else "All detected table headers were already bold, or the document has no tables."))
+
+
+def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
+    context = _section_for_paragraphs(doc)
+    changed = 0
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section != "@Choices:@":
+            continue
+        match = OPTION_RE.fullmatch(paragraph.text.strip())
+        if not match:
+            continue
+        digit, letter, rest = match.groups()
+        option = int(digit) if digit else ord(letter.upper()) - ord("A") + 1
+        if 1 <= option <= 4:
+            canonical = f"@{option}@ {rest.strip()}"
+            if paragraph.text.strip() != canonical:
+                _set_text(paragraph, canonical)
+                changed += 1
+    if changed:
+        findings.append(Finding(0, "fixed", f"Normalised {changed} MCQ option marker(s)."))
+
+
+def process_docx(
+    source: bytes | str | Path,
+    original_filename: str,
+    options: ProcessorOptions,
+    storage_dir: str | Path | None = None,
+) -> ProcessResult:
+    if not original_filename.lower().endswith(".docx"):
+        raise ValueError("Only .docx files are supported.")
+
+    root = _storage_root(storage_dir)
+    uploads = root / "uploads"
+    processed = root / "processed"
+    reports = root / "reports"
+    queue = root / "verification_queue"
+    images_root = root / "images"
+    packages = root / "packages"
+    for folder in (uploads, processed, reports, queue, images_root, packages):
+        folder.mkdir(parents=True, exist_ok=True)
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
+    safe_name = _safe_filename(original_filename)
+    original_path = uploads / f"{run_id}_{safe_name}"
+    if isinstance(source, (str, Path)):
+        shutil.copyfile(source, original_path)
+    else:
+        original_path.write_bytes(source)
+
+    doc = Document(original_path)
+    findings: list[Finding] = []
+    question_count = _ensure_cms_records(doc, options, findings)
+    _normalise_choices(doc, findings)
+    _remove_bold_from_questions_and_solutions(doc, findings)
+    _remove_empty_scripts(doc, findings)
+    _repair_spacing(doc, findings)
+    _repair_italics(doc, findings)
+    _split_answers(doc, findings)
+    _normalise_subparts(doc, options, findings)
+    _convert_inline_slash_fractions(doc, findings)
+    _convert_simple_math_paragraphs(doc, findings)
+    _equation_and_fraction_audit(doc, findings)
+    _audit_assertion_reason(doc, findings)
+    _bold_table_headers(doc, options, findings)
+
+    project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
+    run_images_dir = images_root / run_id
+    images_zip_path = packages / f"{run_id}_{project_id}_images.zip"
+    image_result = process_document_images(doc, project_id, run_images_dir, images_zip_path)
+    for warning in image_result.warnings:
+        findings.append(Finding(0, "manual_review", warning))
+    if image_result.artifacts:
+        findings.append(Finding(0, "fixed", f"Extracted {len(image_result.artifacts)} image occurrence(s), applied CMS filenames and wrote resolved filenames into Word Alt Text."))
+    else:
+        findings.append(Finding(0, "passed", "No embedded images were detected."))
+
+    output_name = f"{Path(safe_name).stem}_CMS_Verification_Ready.docx"
+    output_path = processed / f"{run_id}_{output_name}"
+    doc.core_properties.title = f"{Path(safe_name).stem} - CMS Verification Ready"
+    doc.core_properties.subject = "Processed and audited for HeyMath CMS verification"
+    doc.save(output_path)
+
+    report_path = reports / f"{run_id}_{Path(safe_name).stem}_report.json"
+    manual_review_count = sum(f.status == "manual_review" for f in findings)
+    verification_status = "PENDING_MANUAL_REVIEW" if manual_review_count else "READY_FOR_VERIFICATION"
+    report = {
+        "run_id": run_id,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "original_filename": safe_name,
+        "server_original_path": str(original_path),
+        "server_output_path": str(output_path),
+        "question_count": question_count,
+        "image_count": len(image_result.artifacts),
+        "image_manifest": str(image_result.manifest_json),
+        "images_zip": str(images_zip_path),
+        "fixed_count": sum(f.status == "fixed" for f in findings),
+        "manual_review_count": manual_review_count,
+        "verification_status": verification_status,
+        "options": asdict(options),
+        "findings": [asdict(f) for f in findings],
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    manifest_path = queue / f"{run_id}.json"
+    manifest = {
+        "run_id": run_id,
+        "status": verification_status,
+        "created_utc": report["created_utc"],
+        "original_filename": safe_name,
+        "processed_document": str(output_path),
+        "audit_report": str(report_path),
+        "question_count": question_count,
+        "image_count": len(image_result.artifacts),
+        "image_manifest": str(image_result.manifest_json),
+        "images_zip": str(images_zip_path),
+        "manual_review_count": manual_review_count,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return ProcessResult(
+        output_path,
+        report_path,
+        manifest_path,
+        image_result.manifest_json,
+        images_zip_path,
+        original_path,
+        run_id,
+        question_count,
+        len(image_result.artifacts),
+        findings,
+    )
+
+
+def process_docx_bytes(data: bytes, filename: str, options: ProcessorOptions, storage_dir: str | Path | None = None) -> ProcessResult:
+    return process_docx(data, filename, options, storage_dir)

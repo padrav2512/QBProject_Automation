@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from cms_processor import ProcessorOptions, process_docx_bytes
+
+
+st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅", layout="wide")
+
+st.title("CMS DOCX Verification Processor")
+st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
+
+with st.sidebar:
+    st.header("CMS numbering")
+    project_id = st.text_input("Project ID", value="project10436", help="The app generates question IDs such as project10436_q1 and CMS image names from this value.")
+    start_question = st.number_input("First question number", min_value=1, value=1, step=1)
+    start_snippet = st.number_input("First snippet ID", min_value=1, value=218989, step=1)
+    replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
+
+    st.header("Defaults for missing metadata")
+    default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
+    default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
+    default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
+
+    st.header("Document structure")
+    bold_first_column = st.checkbox("Treat first table column as a header", value=False)
+    convert_romans = st.checkbox("Convert top-level (i), (ii)… to (a), (b)…", value=True)
+
+storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
+st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")
+
+uploaded = st.file_uploader("Upload a Word document", type=["docx"], accept_multiple_files=False)
+
+if uploaded is not None:
+    size_mb = uploaded.size / (1024 * 1024)
+    st.write(f"**Selected:** {uploaded.name} ({size_mb:.2f} MB)")
+    max_mb = int(os.environ.get("CMS_MAX_UPLOAD_MB", "50"))
+    if size_mb > max_mb:
+        st.error(f"The file exceeds the configured {max_mb} MB upload limit.")
+    elif st.button("Process document", type="primary", use_container_width=True):
+        options = ProcessorOptions(
+            project_question_prefix=f"{project_id.strip().removesuffix('_q')}_q",
+            start_question_number=int(start_question),
+            start_snippet_id=int(start_snippet),
+            default_type=default_type,
+            default_difficulty=default_difficulty,
+            default_objective=default_objective,
+            replace_existing_ids=replace_ids,
+            bold_first_table_column=bold_first_column,
+            convert_top_level_roman_subparts=convert_romans,
+        )
+        try:
+            with st.spinner("Processing the Word document…"):
+                result = process_docx_bytes(uploaded.getvalue(), uploaded.name, options, storage_root)
+        except Exception as exc:
+            st.exception(exc)
+        else:
+            st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Questions detected", result.question_count)
+            col2.metric("Automatic fixes", result.fixed_count)
+            col3.metric("Manual checks", result.manual_review_count)
+            col4.metric("Images extracted", result.image_count)
+
+            if result.manual_review_count:
+                st.warning("Complete the listed manual checks before final CMS upload. The app does not guess when a change could alter mathematical meaning.")
+                st.caption("Verification queue status: PENDING_MANUAL_REVIEW")
+            else:
+                st.success("No unresolved manual-review findings were detected.")
+                st.caption("Verification queue status: READY_FOR_VERIFICATION")
+
+            rows = [
+                {
+                    "Rule": f.rule,
+                    "Status": f.status.replace("_", " ").title(),
+                    "Question": f.question or "—",
+                    "Paragraph": f.paragraph or "—",
+                    "Finding": f.message,
+                }
+                for f in result.findings
+            ]
+            st.subheader("Verification report")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
+            output_download_name = f"{Path(uploaded.name).stem}_CMS_Verification_Ready.docx"
+            col_doc, col_images, col_report = st.columns(3)
+            col_doc.download_button(
+                "Download processed DOCX",
+                data=result.output_path.read_bytes(),
+                file_name=output_download_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+            col_images.download_button(
+                "Download images ZIP",
+                data=result.images_zip_path.read_bytes(),
+                file_name=f"{project_id.strip()}_images.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+            col_report.download_button(
+                "Download JSON audit report",
+                data=json.dumps(report_data, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{Path(uploaded.name).stem}_CMS_audit.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            st.caption(f"Processing reference: {result.run_id}")
+
+st.divider()
+with st.expander("What the app checks"):
+    st.markdown(
+        """
+1. Removes bold only when an entire Question or Solution block is bold; selective bold emphasis is preserved.
+2. Detects native Word equations and flags possible equation images or ordinary-text equations.
+3. Removes italics from non-variable runs and flags mixed runs needing a human check.
+4. Removes completely blank equation objects, blank exponent/subscript templates and repeated spaces.
+5. Normalises spaces around `=`, `+`, `−`, `×` and `÷`.
+6. Adds a space after commas.
+7. Converts slash-style fractions into native stacked Word equations and flags only cases that cannot be transformed safely.
+8. Places labelled answers on separate lines when they are combined in one paragraph.
+9. Normalises top-level subpart labels where the structure is unambiguous.
+10. Checks and normalises Assertion–Reason wording and choice structure without guessing the correct answer.
+11. Bolds table header rows and, optionally, the first column.
+
+The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. It validates the generated structure afterwards.
+"""
+    )
