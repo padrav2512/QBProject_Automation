@@ -161,7 +161,7 @@ with st.expander("What the app checks"):
 8. Places labelled answers on separate lines when they are combined in one paragraph.
 9. Normalises top-level subpart labels where the structure is unambiguous.
 10. Checks and normalises Assertion–Reason wording and choice structure without guessing the correct answer.
-11. Bolds table header rows and the first column, following the fixed table convention.
+11. Preserves table formatting. Authors must identify and bold any header rows or header columns in the source document.
 
 The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. Metadata and section tag paragraphs are bold, matching the approved CMS document convention; choice markers, `@correct answer@` and `@e@` remain ordinary text. It validates the generated structure afterwards.
 """

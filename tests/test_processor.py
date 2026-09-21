@@ -63,8 +63,7 @@ def test_processing_assigns_tags_and_repairs_safe_formatting(tmp_path: Path):
     for paragraph in out.paragraphs[question_index + 1 : answer_index]:
         assert all(run.bold is not True for run in paragraph.runs)
 
-    assert all(run.bold is True for cell in out.tables[0].rows[0].cells for p in cell.paragraphs for run in p.runs)
-    assert all(run.bold is True for row in out.tables[0].rows for p in row.cells[0].paragraphs for run in p.runs)
+    assert all(run.bold is not True for row in out.tables[0].rows for cell in row.cells for p in cell.paragraphs for run in p.runs)
 
     xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
     ns = {"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"}

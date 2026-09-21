@@ -935,26 +935,11 @@ def _audit_assertion_reason(doc: _Document, findings: list[Finding]) -> None:
         findings.append(Finding(10, "passed", "No Assertion–Reason items were detected."))
 
 
-def _bold_table_headers(doc: _Document, findings: list[Finding]) -> None:
-    cells_changed = 0
-    for table in doc.tables:
-        if not table.rows:
-            continue
-        header_cells = list(table.rows[0].cells)
-        header_cells.extend(row.cells[0] for row in table.rows[1:] if row.cells)
-        seen: set[int] = set()
-        for cell in header_cells:
-            if id(cell._tc) in seen:
-                continue
-            seen.add(id(cell._tc))
-            for paragraph in cell.paragraphs:
-                if not paragraph.runs and paragraph.text:
-                    paragraph.add_run(paragraph.text)
-                for run in paragraph.runs:
-                    if run.bold is not True:
-                        run.bold = True
-                        cells_changed += 1
-    findings.append(Finding(11, "fixed" if cells_changed else "passed", f"Applied bold formatting to {cells_changed} table-header run(s)." if cells_changed else "All detected table headers were already bold, or the document has no tables."))
+def _preserve_table_formatting(doc: _Document, findings: list[Finding]) -> None:
+    if doc.tables:
+        findings.append(Finding(11, "passed", "Preserved existing table formatting. Header rows or columns must be identified and bolded by the author."))
+    else:
+        findings.append(Finding(11, "passed", "The document has no tables."))
 
 
 def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
@@ -1026,7 +1011,7 @@ def process_docx(
         _convert_simple_math_paragraphs(doc, findings)
         _equation_and_fraction_audit(doc, findings)
         _audit_assertion_reason(doc, findings)
-        _bold_table_headers(doc, findings)
+        _preserve_table_formatting(doc, findings)
         _bold_cms_tags(doc, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
