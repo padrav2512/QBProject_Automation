@@ -28,7 +28,10 @@ DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDra
 NS = {"m": MATH_NS, "w": WORD_NS, "wp": DRAWING_NS}
 
 QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)@$", re.I)
-PLAIN_QUESTION_START_RE = re.compile(r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*$", re.I)
+PLAIN_QUESTION_START_RE = re.compile(
+    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s*(Easy|Medium|Average|Challenging|Hard)?\s*$",
+    re.I,
+)
 KNOWN_METADATA_RE = re.compile(
     r"^@(Type|Question id|New snippet id|Difficulty level|Objective):\s*(.*?)\s*@$",
     re.I,
@@ -62,6 +65,14 @@ INLINE_EQUATION_RE = re.compile(r"(?:\b\d+\b|\b[A-Za-z]\b)\s*=\s*(?:\b\d+\b|\b[A
 ROMAN_RE = re.compile(r"^\s*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)\s*", re.I)
 ALPHA_RE = re.compile(r"^\s*\(([a-z])\)\s*", re.I)
 OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
+LETTER_ANSWER_RE = re.compile(r"^\s*Answer\s*:?\s*([A-Da-d])\s*$", re.I)
+DIFFICULTY_ALIASES = {
+    "easy": "Easy",
+    "medium": "Average",
+    "average": "Average",
+    "hard": "Challenging",
+    "challenging": "Challenging",
+}
 
 
 @dataclass
@@ -197,8 +208,83 @@ def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
     return None
 
 
+def _has_visible_content(paragraph: Paragraph) -> bool:
+    return bool(paragraph.text.strip() or paragraph._p.xpath(".//w:drawing | .//w:pict | .//m:oMath"))
+
+
+def _split_compound_choices(paragraph: Paragraph) -> list[Paragraph] | None:
+    lines = [line.strip() for line in paragraph.text.splitlines() if line.strip()]
+    if len(lines) != 4 or not all(OPTION_RE.fullmatch(line) for line in lines):
+        return None
+    _set_text(paragraph, lines[0])
+    choices = [paragraph]
+    cursor = paragraph
+    for line in lines[1:]:
+        cursor = _insert_after(cursor, line)
+        choices.append(cursor)
+    return choices
+
+
+def _write_choice_marker(paragraph: Paragraph, option: int, correct: bool) -> None:
+    suffix = " @correct answer@" if correct else ""
+    if paragraph._p.xpath(".//w:drawing | .//w:pict"):
+        prefix = paragraph.add_run(f"@{option}@")
+        paragraph._p.remove(prefix._r)
+        paragraph._p.insert(0, prefix._r)
+        if correct:
+            paragraph.add_run(suffix)
+        return
+    raw = paragraph.text.strip()
+    match = OPTION_RE.fullmatch(raw)
+    content = match.group(3).strip() if match else raw
+    _set_text(paragraph, f"@{option}@ {content}{suffix}".rstrip())
+
+
+def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> None:
+    """Structure common untagged MCQs only when a letter answer and four choices are clear."""
+    starts = _question_starts(doc)
+    for ordinal, (start, detected_number) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        block = _block_paragraphs(start, next_start)
+        if any(p.text.strip() in SECTION_MARKERS for p in block):
+            continue
+        answer_candidates = [(i, LETTER_ANSWER_RE.fullmatch(p.text.strip())) for i, p in enumerate(block)]
+        answer_candidates = [(i, match) for i, match in answer_candidates if match]
+        if len(answer_candidates) != 1:
+            continue
+        answer_index, answer_match = answer_candidates[0]
+        correct_option = ord(answer_match.group(1).upper()) - ord("A") + 1
+
+        choice_paragraphs: list[Paragraph] | None = None
+        for paragraph in block[1:answer_index]:
+            compound = _split_compound_choices(paragraph)
+            if compound is not None:
+                choice_paragraphs = compound
+                break
+        if choice_paragraphs is None:
+            candidates = [p for p in block[1:answer_index] if _has_visible_content(p)]
+            if len(candidates) >= 5:
+                choice_paragraphs = candidates[-4:]
+        if not choice_paragraphs or len(choice_paragraphs) != 4:
+            findings.append(Finding(0, "manual_review", "A letter answer was found, but four MCQ choices could not be identified safely.", detected_number))
+            continue
+
+        choice_paragraphs[0].insert_paragraph_before("@Choices:@")
+        for option, paragraph in enumerate(choice_paragraphs, 1):
+            _write_choice_marker(paragraph, option, option == correct_option)
+
+        # Locate the answer paragraph again because splitting a compound choice can change the block.
+        refreshed = _block_paragraphs(start, next_start)
+        answer_paragraph = next((p for p in refreshed if LETTER_ANSWER_RE.fullmatch(p.text.strip())), None)
+        if answer_paragraph is not None:
+            answer_paragraph.insert_paragraph_before("@Solution:@")
+            _set_text(answer_paragraph, f"The correct answer is option ({answer_match.group(1).lower()}).")
+        findings.append(Finding(0, "fixed", "Identified an untagged MCQ, created its Choices and Solution sections, and marked the keyed answer.", detected_number))
+
+
 def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> int:
     _canonicalise_section_labels(doc, findings)
+    _infer_untagged_mcq_sections(doc, findings)
     starts = _question_starts(doc)
     if not starts:
         findings.append(Finding(0, "manual_review", "No question headings were detected. Use @Question: n@ or a standalone heading such as Question 1."))
@@ -210,12 +296,14 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
         assigned_number = options.start_question_number + ordinal
+        heading_match = PLAIN_QUESTION_START_RE.fullmatch(start.text.strip())
+        heading_difficulty = DIFFICULTY_ALIASES.get((heading_match.group(2) or "").casefold()) if heading_match else None
         _set_text(start, f"@Question: {assigned_number}@")
 
         existing_type = (_metadata_value(block, "Type") or "").upper()
         has_choices = any(p.text.strip() == "@Choices:@" for p in block)
         question_type = existing_type if existing_type in {"FIB", "MCQ"} else ("MCQ" if has_choices else options.default_type)
-        difficulty = _metadata_value(block, "Difficulty level") or options.default_difficulty
+        difficulty = _metadata_value(block, "Difficulty level") or heading_difficulty or options.default_difficulty
         objective = _metadata_value(block, "Objective") or options.default_objective
         existing_qid = _metadata_value(block, "Question id")
         existing_snippet = _metadata_value(block, "New snippet id")
@@ -727,7 +815,7 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
         digit, letter, rest = match.groups()
         option = int(digit) if digit else ord(letter.upper()) - ord("A") + 1
         if 1 <= option <= 4:
-            canonical = f"@{option}@ {rest.strip()}"
+            canonical = f"@{option}@" + (f" {rest.strip()}" if rest.strip() else "")
             if paragraph.text.strip() != canonical:
                 _set_text(paragraph, canonical)
                 changed += 1

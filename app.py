@@ -60,7 +60,10 @@ if uploaded is not None:
         except Exception as exc:
             st.exception(exc)
         else:
-            st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
+            if result.question_count:
+                st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
+            else:
+                st.error("No question headings were detected, so CMS records and tags were not created. Review the verification report and correct the question-heading format before downloading a CMS-ready document.")
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Questions detected", result.question_count)
             col2.metric("Automatic fixes", result.fixed_count)
@@ -90,13 +93,16 @@ if uploaded is not None:
             report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
             output_download_name = f"{Path(uploaded.name).stem}_CMS_Verification_Ready.docx"
             col_doc, col_images, col_report = st.columns(3)
-            col_doc.download_button(
-                "Download processed DOCX",
-                data=result.output_path.read_bytes(),
-                file_name=output_download_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
+            if result.question_count:
+                col_doc.download_button(
+                    "Download processed DOCX",
+                    data=result.output_path.read_bytes(),
+                    file_name=output_download_name,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            else:
+                col_doc.caption("Processed DOCX unavailable because no questions were detected.")
             col_images.download_button(
                 "Download images ZIP",
                 data=result.images_zip_path.read_bytes(),

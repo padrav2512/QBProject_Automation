@@ -100,3 +100,29 @@ def test_selective_bold_emphasis_is_preserved(tmp_path: Path):
     solution_out = next(p for p in output.paragraphs if p.text == "Use the factor shown.")
     assert next(r for r in question_out.runs if r.text == "important").bold is True
     assert next(r for r in solution_out.runs if r.text == "factor").bold is True
+
+
+def test_heading_with_difficulty_and_untagged_mcq_are_structured(tmp_path: Path):
+    source = tmp_path / "untagged_mcq.docx"
+    doc = Document()
+    doc.add_paragraph("Q1) Easy")
+    doc.add_paragraph("Which pair has a sum of 55?")
+    doc.add_paragraph("a) 30 and 25")
+    doc.add_paragraph("b) 35 and 20")
+    doc.add_paragraph("20 and 35")
+    doc.add_paragraph("25 and 30")
+    doc.add_paragraph("Answer: b")
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    texts = [p.text for p in Document(result.output_path).paragraphs]
+
+    assert result.question_count == 1
+    assert "@Question: 1@" in texts
+    assert "@Type: MCQ@" in texts
+    assert "@Difficulty level: Easy @" in texts
+    assert "@Question:@" in texts
+    assert "@Choices:@" in texts
+    assert "@2@ 35 and 20 @correct answer@" in texts
+    assert "@Solution:@" in texts
+    assert "The correct answer is option (b)." in texts
