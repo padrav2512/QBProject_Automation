@@ -308,6 +308,7 @@ def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(t
         "@4@ x = 1/8",
         "@e@",
         "@Solution:@",
+        "0.1666…, √2, 1/5",
         "x = -3^12",
         "@e@",
     ]:
@@ -328,11 +329,12 @@ def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(t
     xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
     ns = {"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"}
     assert len(xml.xpath(".//m:rad", namespaces=ns)) == 2
-    assert len(xml.xpath(".//m:f", namespaces=ns)) == 1
+    assert len(xml.xpath(".//m:f", namespaces=ns)) == 2
     assert "@correct answer@" in "".join(xml.itertext())
     assert "@3@ √3, √5/9, 1/√9" in output_texts
     ambiguous = [f for f in result.findings if f.status == "manual_review" and "ambiguous scope" in f.message and f.question == 5]
     assert len(ambiguous) == 2
+    assert not any("0.1666" in f.message and f.status == "manual_review" for f in result.findings)
 
     unchanged = process_docx(
         source,

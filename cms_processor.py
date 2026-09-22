@@ -721,7 +721,8 @@ def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> Non
         if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
             continue
         text = paragraph.text
-        if SIMPLE_FRACTION_RE.search(text):
+        ambiguous_scope = ("√" in text and ("/" in text or "^" in text)) or bool(re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text))
+        if SIMPLE_FRACTION_RE.search(text) and not ambiguous_scope:
             fraction_hits += 1
             findings.append(Finding(7, "manual_review", f"Slash-style fraction requires conversion to a stacked Word equation: {text.strip()!r}", question, index))
         if paragraph._p.xpath(".//w:drawing | .//w:pict"):
@@ -733,7 +734,7 @@ def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> Non
         ):
             math_text_hits += 1
             findings.append(Finding(2, "manual_review", f"A math-like expression is ordinary text and should be recreated with Insert → Equation: {text.strip()!r}", question, index))
-        if ("√" in text and ("/" in text or "^" in text)) or re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text):
+        if ambiguous_scope:
             ambiguous_scope_hits += 1
             findings.append(
                 Finding(
@@ -845,9 +846,14 @@ def _convert_inline_slash_fractions(doc: _Document, findings: list[Finding]) -> 
             matches = list(SIMPLE_FRACTION_RE.finditer(text))
             if not matches:
                 continue
-            # Do not isolate a simple-looking fraction from a radical or
-            # exponent expression whose visual scope may change the meaning.
-            if "√" in text or re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text):
+            # Exponents can change the scope of a nearby fraction. A radical
+            # only blocks a fraction when it is directly attached to that
+            # numerator; comma-separated fractions such as "√2, 1/5" remain
+            # safe to convert.
+            if re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text):
+                continue
+            matches = [match for match in matches if not text[: match.start()].rstrip().endswith("√")]
+            if not matches:
                 continue
             # Runs containing tabs, line breaks or drawings need a human-safe edit.
             if any(child.tag not in {qn("w:rPr"), qn("w:t")} for child in run._r):
