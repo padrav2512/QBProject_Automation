@@ -38,7 +38,7 @@ For a public deployment, place the container behind HTTPS and your organisationâ
 
 ## Input expectations
 
-The intended input is a quality-checked Word document; it does not need to contain CMS tags. Each question must still have an identifiable boundary, such as a standalone `Question 1` or `Q1` heading, and recognisable Question, Answers or Choices, and Solution sections. Existing CMS-style documents containing `@Question: n@` records are also accepted. A heading such as `@Question: 29@ case study` is counted, but is reported for manual review. In Full CMS preparation mode, the suffix is moved to the start of the Question block so it is not lost. The app then creates or repairs:
+The intended input is a quality-checked Word document; it does not need to contain CMS tags. Each question must still have an identifiable boundary, such as a standalone `Question 1` or `Q1` heading, and recognisable Question, Answers or Choices, and Solution sections. Existing CMS-style documents containing `@Question: n@` records are also accepted, including harmless spacing variants such as `@Question:10 @`. A heading such as `@Question: 29@ case study` is counted, but is reported for manual review. In Full CMS preparation mode, the suffix is moved to the start of the Question block so it is not lost. The app then creates or repairs:
 
 - `@Question: n@`
 - `@Type: FIB@` or `@Type: MCQ@`

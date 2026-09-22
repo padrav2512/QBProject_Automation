@@ -243,6 +243,51 @@ def test_tagged_question_suffix_is_counted_preserved_and_flagged(tmp_path: Path)
     assert any(f.status == "manual_review" and "counted as a question" in f.message for f in image_only.findings)
 
 
+def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):
+    source = tmp_path / "spaced_question_tags.docx"
+    doc = Document()
+    headings = ["@Question:10 @ case study", "@Question:24 @", "@Question: 42@"]
+    for number, heading in zip((10, 24, 42), headings):
+        for text in [
+            heading,
+            "@Type: FIB@",
+            f"@Question id: project10434_q{number}@",
+            f"@New snippet id: {220000 + number}@",
+            "@Question:@",
+            f"Question {number} text.",
+            "@e@",
+            "@Answers:@",
+            str(number),
+            "@e@",
+            "@Solution:@",
+            f"The answer is {number}.",
+            "@e@",
+        ]:
+            doc.add_paragraph(text)
+    doc.save(source)
+
+    image_only = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project10434_q"),
+        tmp_path / "image_only_storage",
+    )
+    assert image_only.question_count == 3
+
+    full = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=10, start_snippet_id=220010),
+        tmp_path / "full_storage",
+    )
+    output_texts = [p.text for p in Document(full.output_path).paragraphs]
+    assert full.question_count == 3
+    assert "@Question: 10@" in output_texts
+    assert "@Question: 11@" in output_texts
+    assert "@Question: 12@" in output_texts
+    assert "case study" in output_texts
+
+
 def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
     source = tmp_path / "already_tagged.docx"
     picture = tmp_path / "tagged_image.png"

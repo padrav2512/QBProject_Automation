@@ -27,8 +27,8 @@ WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 NS = {"m": MATH_NS, "w": WORD_NS, "wp": DRAWING_NS}
 
-QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)@$", re.I)
-QUESTION_START_WITH_SUFFIX_RE = re.compile(r"^@Question:\s*(\d+)@\s+(.+?)\s*$", re.I)
+QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)\s*@$", re.I)
+QUESTION_START_WITH_SUFFIX_RE = re.compile(r"^@Question:\s*(\d+)\s*@\s+(.+?)\s*$", re.I)
 QUESTION_ID_RE = re.compile(r"^@Question id:\s*(.*?)\s*@$", re.I)
 PLAIN_QUESTION_START_RE = re.compile(
     r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s*(Easy|Medium|Average|Challenging|Hard)?\s*$",
