@@ -19,10 +19,14 @@ with st.sidebar:
     st.header("Processing mode")
     processing_mode_label = st.radio(
         "Choose what the app should change",
-        ["Full CMS preparation", "Images and Alt Text only"],
-        help="Use Images and Alt Text only when the document already contains correct CMS tags and you want its text, tags, IDs and formatting preserved.",
+        ["Full CMS preparation", "Images and Alt Text only", "Images, Alt Text and safe Math formatting"],
+        help="Use either image mode when the document already contains correct CMS tags and IDs. The safe Math option also converts only unambiguous mathematical forms and reports uncertain expressions.",
     )
-    processing_mode = "images_only" if processing_mode_label == "Images and Alt Text only" else "full"
+    processing_mode = {
+        "Full CMS preparation": "full",
+        "Images and Alt Text only": "images_only",
+        "Images, Alt Text and safe Math formatting": "images_math",
+    }[processing_mode_label]
 
     st.header("CMS numbering")
     project_id = st.text_input(
@@ -34,18 +38,22 @@ with st.sidebar:
         start_question = st.number_input("First question number", min_value=1, value=1, step=1)
         start_snippet_text = st.text_input("First snippet ID", value="", placeholder="Enter the first snippet ID")
         replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
+        st.header("Defaults for missing metadata")
+        default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
+        default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
+        default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
     else:
         start_question = 1
         start_snippet_text = ""
         replace_ids = False
-
-    st.header("Defaults for missing metadata")
-    default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
-    default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
-    default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
+        default_type = "FIB"
+        default_difficulty = "Average"
+        default_objective = "Application"
 
     if processing_mode == "images_only":
         st.info("Existing CMS text, tags, question IDs and snippet IDs will be preserved. The project ID in existing Question id tags takes priority over the fallback Project ID above.")
+    elif processing_mode == "images_math":
+        st.info("Existing CMS tags, question IDs and snippet IDs will be preserved. Images and Alt Text will be prepared, and only unambiguous mathematical forms will be converted to native Word equations. Uncertain expressions will be reported for review.")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
 st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")
@@ -82,6 +90,8 @@ if uploaded is not None:
             if result.question_count:
                 if processing_mode == "images_only":
                     st.success("Image filenames and Alt Text are ready. Download the updated DOCX, images ZIP and audit report below.")
+                elif processing_mode == "images_math":
+                    st.success("Image filenames, Alt Text and safe mathematical formatting are ready. Download the updated DOCX, images ZIP and audit report below.")
                 else:
                     st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
             else:
@@ -114,7 +124,11 @@ if uploaded is not None:
 
             report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
             effective_project_id = report_data.get("effective_project_id") or project_id.strip() or "project"
-            output_suffix = "Images_Alt_Text_Ready" if processing_mode == "images_only" else "CMS_Verification_Ready"
+            output_suffix = {
+                "images_only": "Images_Alt_Text_Ready",
+                "images_math": "Images_Alt_Text_Math_Ready",
+                "full": "CMS_Verification_Ready",
+            }[processing_mode]
             output_download_name = f"{Path(uploaded.name).stem}_{output_suffix}.docx"
             col_doc, col_images, col_report = st.columns(3)
             if result.question_count:
@@ -152,7 +166,7 @@ with st.expander("What the app checks"):
     st.markdown(
         """
 1. Removes bold only when an entire Question or Solution block is bold; selective bold emphasis is preserved.
-2. Detects native Word equations and flags possible equation images or ordinary-text equations.
+2. Preserves native Word equations, converts unambiguous radical or simple-fraction assignments, and flags possible equation images or expressions with uncertain mathematical scope.
 3. Keeps only mathematical variables in italics across Questions, Answers, Choices and Solutions, including ordinary text and native equations.
 4. Removes completely blank equation objects, blank exponent/subscript templates and repeated spaces.
 5. Normalises spaces around `=`, `+`, `−`, `×` and `÷`.

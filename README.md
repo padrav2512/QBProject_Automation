@@ -4,6 +4,8 @@ A deployable Streamlit application that accepts a Word `.docx`, applies safe CMS
 
 For the team's Streamlit Community Cloud deployment, follow [COMMUNITY_CLOUD_DEPLOYMENT.md](COMMUNITY_CLOUD_DEPLOYMENT.md). Community Cloud is treated as a document processor: users download the processed DOCX, image ZIP and audit report after each run rather than relying on its temporary filesystem for permanent storage.
 
+The app provides three modes: Full CMS preparation; Images and Alt Text only; and Images, Alt Text and safe Math formatting. The safe-Math image mode preserves existing CMS tags and IDs while converting unambiguous ordinary-text forms such as `x = √27` and `x = 1/8` to native Word equations. Existing native equations are preserved, and expressions with uncertain exponent or radical scope are left unchanged and reported for review.
+
 ## Run locally
 
 ```powershell

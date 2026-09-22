@@ -288,6 +288,62 @@ def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):
     assert "case study" in output_texts
 
 
+def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(tmp_path: Path):
+    source = tmp_path / "safe_math_choices.docx"
+    doc = Document()
+    for text in [
+        "@Question: 5@",
+        "@Type: MCQ@",
+        "@Question id: project10434_q5@",
+        "@New snippet id: 219065@",
+        "@Difficulty level: Average@",
+        "@Objective: Comprehension@",
+        "@Question:@",
+        "Choose the correct value.",
+        "@e@",
+        "@Choices:@",
+        "@1@ x = √27 @correct answer@",
+        "@2@ x = √36",
+        "@3@ √3, √5/9, 1/√9",
+        "@4@ x = 1/8",
+        "@e@",
+        "@Solution:@",
+        "x = -3^12",
+        "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_math", project_question_prefix="project10434_q"),
+        tmp_path / "safe_math_storage",
+    )
+    output = Document(result.output_path)
+    output_texts = [p.text for p in output.paragraphs]
+    assert "@Question id: project10434_q5@" in output_texts
+    assert "@New snippet id: 219065@" in output_texts
+
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    ns = {"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"}
+    assert len(xml.xpath(".//m:rad", namespaces=ns)) == 2
+    assert len(xml.xpath(".//m:f", namespaces=ns)) == 1
+    assert "@correct answer@" in "".join(xml.itertext())
+    assert "@3@ √3, √5/9, 1/√9" in output_texts
+    ambiguous = [f for f in result.findings if f.status == "manual_review" and "ambiguous scope" in f.message and f.question == 5]
+    assert len(ambiguous) == 2
+
+    unchanged = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project10434_q"),
+        tmp_path / "images_only_storage",
+    )
+    unchanged_xml = etree.fromstring(ZipFile(unchanged.output_path).read("word/document.xml"))
+    assert len(unchanged_xml.xpath(".//m:oMath", namespaces=ns)) == 0
+
+
 def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
     source = tmp_path / "already_tagged.docx"
     picture = tmp_path / "tagged_image.png"

@@ -68,6 +68,9 @@ INLINE_EQUATION_RE = re.compile(r"(?:\b\d+\b|\b[A-Za-z]\b)\s*=\s*(?:\b\d+\b|\b[A
 ROMAN_RE = re.compile(r"^\s*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)\s*", re.I)
 ALPHA_RE = re.compile(r"^\s*\(([a-z])\)\s*", re.I)
 OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
+TAGGED_CHOICE_RE = re.compile(r"^(\s*@[1-4]@\s*)(.*?)(\s+@correct answer@\s*)?$", re.I)
+SAFE_ROOT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*√\s*(\d+)$")
+SAFE_FRACTION_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])$")
 LETTER_ANSWER_RE = re.compile(r"^\s*Answer\s*:?\s*([A-Da-d])\s*$", re.I)
 ANSWER_VALUE_RE = re.compile(r"^\s*Answer\s*:?\s*(.+?)\s*$", re.I)
 DIFFICULTY_ALIASES = {
@@ -710,6 +713,7 @@ def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> Non
     fraction_hits = 0
     image_hits = 0
     math_text_hits = 0
+    ambiguous_scope_hits = 0
     for index, paragraph in enumerate(body_paragraphs(doc), 1):
         section, question = context.get(paragraph._p, (None, None))
         if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
@@ -727,9 +731,20 @@ def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> Non
         ):
             math_text_hits += 1
             findings.append(Finding(2, "manual_review", f"A math-like expression is ordinary text and should be recreated with Insert → Equation: {text.strip()!r}", question, index))
+        if ("√" in text and ("/" in text or "^" in text)) or re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text):
+            ambiguous_scope_hits += 1
+            findings.append(
+                Finding(
+                    2,
+                    "manual_review",
+                    f"An exponent or radical expression has potentially ambiguous scope and was not changed automatically: {text.strip()!r}",
+                    question,
+                    index,
+                )
+            )
     if not fraction_hits:
         findings.append(Finding(7, "passed", "No slash-style fractions were detected in student-facing content."))
-    if not image_hits and not math_text_hits:
+    if not image_hits and not math_text_hits and not ambiguous_scope_hits:
         findings.append(Finding(2, "passed", "No likely equation screenshots or ordinary-text equations were detected."))
 
 
@@ -752,6 +767,19 @@ def _math_fraction(numerator: str, denominator: str) -> OxmlElement:
     return fraction
 
 
+def _math_radical(radicand: str) -> OxmlElement:
+    radical = OxmlElement("m:rad")
+    properties = OxmlElement("m:radPr")
+    degree_hidden = OxmlElement("m:degHide")
+    degree_hidden.set(qn("m:val"), "1")
+    properties.append(degree_hidden)
+    degree = OxmlElement("m:deg")
+    expression = OxmlElement("m:e")
+    expression.append(_math_run(radicand))
+    radical.extend((properties, degree, expression))
+    return radical
+
+
 def _word_text_run(text: str, run_properties) -> OxmlElement:
     run = OxmlElement("w:r")
     if run_properties is not None:
@@ -762,6 +790,44 @@ def _word_text_run(text: str, run_properties) -> OxmlElement:
     value.text = text
     run.append(value)
     return run
+
+
+def _convert_safe_choice_equations(doc: _Document, findings: list[Finding]) -> None:
+    """Convert only unambiguous tagged-choice assignments to native Word equations."""
+    context = _section_for_paragraphs(doc)
+    converted = 0
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section != "@Choices:@" or paragraph._p.xpath(".//m:oMath"):
+            continue
+        choice_match = TAGGED_CHOICE_RE.fullmatch(paragraph.text)
+        if not choice_match:
+            continue
+        prefix, expression, suffix = choice_match.groups()
+        expression = expression.strip()
+        root_match = SAFE_ROOT_ASSIGNMENT_RE.fullmatch(expression)
+        fraction_match = SAFE_FRACTION_ASSIGNMENT_RE.fullmatch(expression)
+        if not root_match and not fraction_match:
+            continue
+
+        paragraph.clear()
+        paragraph.add_run(prefix)
+        equation = OxmlElement("m:oMath")
+        if root_match:
+            equation.append(_math_run(root_match.group(1)))
+            equation.append(_math_run(" = "))
+            equation.append(_math_radical(root_match.group(2)))
+        else:
+            equation.append(_math_run(fraction_match.group(1)))
+            equation.append(_math_run(" = "))
+            equation.append(_math_fraction(fraction_match.group(2), fraction_match.group(3)))
+        paragraph._p.append(equation)
+        if suffix:
+            paragraph.add_run(suffix)
+        converted += 1
+        findings.append(Finding(2, "fixed", f"Converted an unambiguous choice expression to a native Word equation: {expression!r}", question))
+    if not converted:
+        findings.append(Finding(2, "passed", "No unambiguous ordinary-text radical or fraction assignments in choices required conversion."))
 
 
 def _convert_inline_slash_fractions(doc: _Document, findings: list[Finding]) -> None:
@@ -776,6 +842,10 @@ def _convert_inline_slash_fractions(doc: _Document, findings: list[Finding]) -> 
             text = run.text
             matches = list(SIMPLE_FRACTION_RE.finditer(text))
             if not matches:
+                continue
+            # Do not isolate a simple-looking fraction from a radical or
+            # exponent expression whose visual scope may change the meaning.
+            if "√" in text or re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text):
                 continue
             # Runs containing tabs, line breaks or drawings need a human-safe edit.
             if any(child.tag not in {qn("w:rPr"), qn("w:t")} for child in run._r):
@@ -1009,10 +1079,14 @@ def process_docx(
 
     doc = Document(original_path)
     findings: list[Finding] = []
-    if options.processing_mode == "images_only":
+    preserve_cms_mode = options.processing_mode in {"images_only", "images_math"}
+    if preserve_cms_mode:
         question_count = len(_question_starts(doc))
         if question_count:
-            findings.append(Finding(0, "passed", "Images-only mode preserved the existing document text, CMS tags, metadata and formatting."))
+            if options.processing_mode == "images_only":
+                findings.append(Finding(0, "passed", "Images-only mode preserved the existing document text, CMS tags, metadata and formatting."))
+            else:
+                findings.append(Finding(0, "passed", "Safe-Math image mode preserved existing CMS tags, question IDs, snippet IDs and document structure."))
             for paragraph, number in _question_starts(doc):
                 suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
                 if suffix_match:
@@ -1020,12 +1094,21 @@ def process_docx(
                         Finding(
                             0,
                             "manual_review",
-                            f"The question heading contains text after its closing tag: {suffix_match.group(2).strip()!r}. It was counted as a question and preserved unchanged in Images and Alt Text only mode; move the text into the Question block before CMS upload.",
+                            f"The question heading contains text after its closing tag: {suffix_match.group(2).strip()!r}. It was counted as a question and preserved in the selected existing-CMS mode; move the text into the Question block before CMS upload.",
                             number,
                         )
                     )
         else:
             findings.append(Finding(0, "manual_review", "No @Question: n@ records were detected. Images cannot be assigned reliable CMS filenames without existing question tags."))
+        if options.processing_mode == "images_math":
+            _remove_empty_scripts(doc, findings)
+            _repair_spacing(doc, findings)
+            _repair_italics(doc, findings)
+            _convert_safe_choice_equations(doc, findings)
+            _convert_inline_slash_fractions(doc, findings)
+            _convert_simple_math_paragraphs(doc, findings)
+            _equation_and_fraction_audit(doc, findings)
+            _preserve_table_formatting(doc, findings)
     else:
         question_count = _ensure_cms_records(doc, options, findings)
         _normalise_choices(doc, findings)
@@ -1035,6 +1118,7 @@ def process_docx(
         _repair_italics(doc, findings)
         _split_answers(doc, findings)
         _normalise_subparts(doc, findings)
+        _convert_safe_choice_equations(doc, findings)
         _convert_inline_slash_fractions(doc, findings)
         _convert_simple_math_paragraphs(doc, findings)
         _equation_and_fraction_audit(doc, findings)
@@ -1043,7 +1127,7 @@ def process_docx(
         _bold_cms_tags(doc, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
-    if options.processing_mode == "images_only":
+    if preserve_cms_mode:
         document_project_id, document_project_ids = _existing_project_id(doc)
         if document_project_id:
             project_id = document_project_id
@@ -1064,7 +1148,11 @@ def process_docx(
     else:
         findings.append(Finding(0, "passed", "No embedded images were detected."))
 
-    suffix = "Images_Alt_Text_Ready" if options.processing_mode == "images_only" else "CMS_Verification_Ready"
+    suffix = {
+        "images_only": "Images_Alt_Text_Ready",
+        "images_math": "Images_Alt_Text_Math_Ready",
+        "full": "CMS_Verification_Ready",
+    }[options.processing_mode]
     output_name = f"{Path(safe_name).stem}_{suffix}.docx"
     output_path = processed / f"{run_id}_{output_name}"
     doc.core_properties.title = f"{Path(safe_name).stem} - CMS Verification Ready"
