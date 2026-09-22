@@ -494,3 +494,49 @@ def test_safe_math_mode_preserves_existing_native_equations_images_and_ids(tmp_p
     assert result.image_count == 2
     report = __import__("json").loads(result.report_path.read_text(encoding="utf-8"))
     assert report["processor_build_id"] == PROCESSOR_BUILD_ID
+
+
+def test_question_type_is_corrected_only_when_structure_is_unambiguous(tmp_path: Path):
+    source = tmp_path / "type_mismatches.docx"
+    doc = Document()
+    for text in [
+        "@Question: 1@", "@Type: FIB@", "@Question id: project1_q1@", "@New snippet id: 10@",
+        "@Question:@", "Choose one.", "@e@", "@Choices:@",
+        "@1@ One @correct answer@", "@2@ Two", "@3@ Three", "@4@ Four", "@e@", "@Solution:@", "One.", "@e@",
+        "@Question: 2@", "@Type: MCQ@", "@Question id: project1_q2@", "@New snippet id: 11@",
+        "@Question:@", "Fill the blank.", "@e@", "@Answers:@", "5", "@e@", "@Solution:@", "Five.", "@e@",
+        "@Question: 3@", "@Type: MCQ@", "@Question id: project1_q3@", "@New snippet id: 12@",
+        "@Question:@", "Ambiguous structure.", "@e@", "@Choices:@",
+        "@1@ One @correct answer@", "@2@ Two", "@3@ Three", "@4@ Four", "@e@", "@Answers:@", "1", "@e@", "@Solution:@", "One.", "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    repaired = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_math", project_question_prefix="project1_q"),
+        tmp_path / "repair_storage",
+    )
+    repaired_texts = [paragraph.text for paragraph in Document(repaired.output_path).paragraphs]
+    assert repaired_texts.count("@Type: MCQ@") == 2
+    assert repaired_texts.count("@Type: FIB@") == 1
+    fixed = [finding for finding in repaired.findings if finding.rule == 12 and finding.status == "fixed"]
+    assert [(finding.question, "MCQ" in finding.message, "FIB" in finding.message) for finding in fixed] == [
+        (1, True, True),
+        (2, True, True),
+    ]
+    ambiguous = [finding for finding in repaired.findings if finding.rule == 12 and finding.status == "manual_review"]
+    assert len(ambiguous) == 1 and ambiguous[0].question == 3
+
+    preserved = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project1_q"),
+        tmp_path / "preserve_storage",
+    )
+    preserved_texts = [paragraph.text for paragraph in Document(preserved.output_path).paragraphs]
+    assert preserved_texts.count("@Type: FIB@") == 1
+    assert preserved_texts.count("@Type: MCQ@") == 2
+    mismatches = [finding for finding in preserved.findings if finding.rule == 12 and finding.status == "manual_review"]
+    assert {finding.question for finding in mismatches} == {1, 2, 3}

@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.22-safe-math-v2"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.22-type-check-v3"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -33,7 +33,7 @@ with st.sidebar:
     processing_mode_label = st.radio(
         "Choose what the app should change",
         ["Full CMS preparation", "Images and Alt Text only", "Images, Alt Text and safe Math formatting"],
-        help="Use either image mode when the document already contains correct CMS tags and IDs. The safe Math option also converts only unambiguous mathematical forms and reports uncertain expressions.",
+        help="Use either image mode when the document already contains CMS tags and IDs. The safe Math option converts unambiguous mathematical forms and corrects a clearly mismatched FIB/MCQ Type tag; uncertain structures are reported.",
     )
     processing_mode = {
         "Full CMS preparation": "full",
@@ -66,7 +66,7 @@ with st.sidebar:
     if processing_mode == "images_only":
         st.info("Existing CMS text, tags, question IDs and snippet IDs will be preserved. The project ID in existing Question id tags takes priority over the fallback Project ID above.")
     elif processing_mode == "images_math":
-        st.info("Existing CMS tags, question IDs and snippet IDs will be preserved. Images and Alt Text will be prepared, and only unambiguous mathematical forms will be converted to native Word equations. Uncertain expressions will be reported for review.")
+        st.info("Existing question IDs and snippet IDs will be preserved. Images and Alt Text will be prepared, unambiguous mathematical forms will be converted to native Word equations, and a clearly mismatched FIB/MCQ Type tag will be corrected. Uncertain expressions or question structures will be reported for review.")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
 st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")

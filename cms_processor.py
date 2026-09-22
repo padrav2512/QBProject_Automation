@@ -22,7 +22,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.22-safe-math-v2"
+PROCESSOR_BUILD_ID = "2026.09.22-type-check-v3"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -268,6 +268,93 @@ def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
         if match and field_name == name.casefold():
             return match.group(2).strip()
     return None
+
+
+def _set_text_preserving_run_format(paragraph: Paragraph, text: str) -> None:
+    """Replace a simple tag paragraph without discarding its run formatting."""
+    source_properties = None
+    for run in paragraph.runs:
+        if run._r.rPr is not None:
+            source_properties = deepcopy(run._r.rPr)
+            break
+    paragraph.clear()
+    run = paragraph.add_run(text)
+    if source_properties is not None:
+        if run._r.rPr is not None:
+            run._r.remove(run._r.rPr)
+        run._r.insert(0, source_properties)
+
+
+def _audit_question_types(doc: _Document, findings: list[Finding], *, fix_mismatches: bool) -> None:
+    """Check a tagged Type value against an unambiguous Answers/Choices structure."""
+    starts = _question_starts(doc)
+    checked = 0
+    issues = 0
+    for ordinal, (start, question_number) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        block = _block_paragraphs(start, next_start)
+        type_paragraph = None
+        declared_type = None
+        for paragraph in block:
+            match = KNOWN_METADATA_RE.fullmatch(paragraph.text.strip())
+            if match and match.group(1).casefold() == "type":
+                type_paragraph = paragraph
+                declared_type = match.group(2).strip().upper()
+                break
+
+        has_answers = any(paragraph.text.strip() == "@Answers:@" for paragraph in block)
+        has_choices = any(paragraph.text.strip() == "@Choices:@" for paragraph in block)
+        choice_numbers: set[int] = set()
+        in_choices = False
+        for paragraph in block:
+            text = paragraph.text.strip()
+            if text == "@Choices:@":
+                in_choices = True
+                continue
+            if in_choices and (text == "@e@" or text in SECTION_MARKERS):
+                in_choices = False
+            if in_choices:
+                marker = re.match(r"^@([1-4])@", text)
+                if marker:
+                    choice_numbers.add(int(marker.group(1)))
+
+        expected_type = None
+        structure_description = None
+        if has_choices and not has_answers and choice_numbers == {1, 2, 3, 4}:
+            expected_type = "MCQ"
+            structure_description = "a @Choices:@ block with choices @1@ to @4@"
+        elif has_answers and not has_choices:
+            expected_type = "FIB"
+            structure_description = "an @Answers:@ block and no @Choices:@ block"
+        elif has_choices and has_answers:
+            issues += 1
+            findings.append(Finding(12, "manual_review", "Both @Choices:@ and @Answers:@ occur in the record, so the question type cannot be corrected safely.", question_number))
+            continue
+        elif has_choices and choice_numbers != {1, 2, 3, 4}:
+            issues += 1
+            visible = ", ".join(str(number) for number in sorted(choice_numbers)) or "none"
+            findings.append(Finding(12, "manual_review", f"The @Choices:@ block contains choice markers {visible}; four choices @1@ to @4@ are required before the Type tag can be corrected safely.", question_number))
+            continue
+        else:
+            continue
+
+        checked += 1
+        if type_paragraph is None or declared_type not in {"FIB", "MCQ"}:
+            issues += 1
+            findings.append(Finding(12, "manual_review", f"The structure indicates {expected_type}, but a valid @Type:@ tag was not found.", question_number))
+            continue
+        if declared_type == expected_type:
+            continue
+
+        issues += 1
+        if fix_mismatches:
+            _set_text_preserving_run_format(type_paragraph, f"@Type: {expected_type}@")
+            findings.append(Finding(12, "fixed", f"Changed @Type: {declared_type}@ to @Type: {expected_type}@ because the record contains {structure_description}.", question_number))
+        else:
+            findings.append(Finding(12, "manual_review", f"The Type tag says {declared_type}, but the structure indicates {expected_type} because the record contains {structure_description}. Images and Alt Text only mode preserved the tag unchanged.", question_number))
+
+    if checked and not issues:
+        findings.append(Finding(12, "passed", f"Question Type tags matched the detected Answers/Choices structure in {checked} record(s)."))
 
 
 def _has_visible_content(paragraph: Paragraph) -> bool:
@@ -1094,7 +1181,7 @@ def process_docx(
             if options.processing_mode == "images_only":
                 findings.append(Finding(0, "passed", "Images-only mode preserved the existing document text, CMS tags, metadata and formatting."))
             else:
-                findings.append(Finding(0, "passed", "Safe-Math image mode preserved existing CMS tags, question IDs, snippet IDs and document structure."))
+                findings.append(Finding(0, "passed", "Safe-Math image mode preserved existing question IDs, snippet IDs and document structure; only a deterministically mismatched Type tag may be corrected."))
             for paragraph, number in _question_starts(doc):
                 suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
                 if suffix_match:
@@ -1108,6 +1195,7 @@ def process_docx(
                     )
         else:
             findings.append(Finding(0, "manual_review", "No @Question: n@ records were detected. Images cannot be assigned reliable CMS filenames without existing question tags."))
+        _audit_question_types(doc, findings, fix_mismatches=options.processing_mode == "images_math")
         if options.processing_mode == "images_math":
             _remove_empty_scripts(doc, findings)
             _repair_spacing(doc, findings)
@@ -1119,6 +1207,7 @@ def process_docx(
             _preserve_table_formatting(doc, findings)
     else:
         question_count = _ensure_cms_records(doc, options, findings)
+        _audit_question_types(doc, findings, fix_mismatches=True)
         _normalise_choices(doc, findings)
         _remove_bold_from_questions_and_solutions(doc, findings)
         _remove_empty_scripts(doc, findings)
