@@ -22,6 +22,8 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
+PROCESSOR_BUILD_ID = "2026.09.22-safe-math-v2"
+
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -1163,6 +1165,7 @@ def process_docx(
     manual_review_count = sum(f.status == "manual_review" for f in findings)
     verification_status = "PENDING_MANUAL_REVIEW" if manual_review_count else "READY_FOR_VERIFICATION"
     report = {
+        "processor_build_id": PROCESSOR_BUILD_ID,
         "run_id": run_id,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "original_filename": safe_name,

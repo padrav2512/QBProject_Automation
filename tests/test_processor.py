@@ -5,7 +5,7 @@ from docx import Document
 from lxml import etree
 from PIL import Image
 
-from cms_processor import ProcessorOptions, process_docx
+from cms_processor import PROCESSOR_BUILD_ID, ProcessorOptions, process_docx
 
 
 def make_sample(path: Path) -> None:
@@ -434,3 +434,61 @@ def test_images_only_mode_uses_project_id_from_existing_question_ids(tmp_path: P
     assert "@Question id: project777_q3 @" in output_texts
     assert "@New snippet id: 445566 @" in output_texts
     assert alt_texts == ["project777_q3_1.gif"]
+
+
+def test_safe_math_mode_preserves_existing_native_equations_images_and_ids(tmp_path: Path):
+    source = tmp_path / "safe_math_preservation.docx"
+    picture = tmp_path / "graph.png"
+    Image.new("RGB", (40, 30), "white").save(picture)
+    doc = Document()
+    for text in [
+        "@Question: 4@",
+        "@Type: MCQ@",
+        "@Question id: project10434_q4@",
+        "@New snippet id: 219064@",
+        "@Question:@",
+        "Choose the correct value.",
+        "@e@",
+        "@Choices:@",
+    ]:
+        doc.add_paragraph(text)
+    native_choice = doc.add_paragraph()
+    native_choice.add_run("@1@ ")
+    native_choice._p.append(
+        etree.fromstring(
+            b'<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x = 1</m:t></m:r></m:oMath>'
+        )
+    )
+    native_choice.add_run(" @correct answer@")
+    doc.add_paragraph("@2@ x = \u221a27")
+    doc.add_paragraph("@3@ Three")
+    doc.add_paragraph("@4@ Four")
+    for text in ["@e@", "@Solution:@", "Use the graph."]:
+        doc.add_paragraph(text)
+    doc.add_picture(str(picture))
+    doc.add_picture(str(picture))
+    doc.add_paragraph("@e@")
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_math", project_question_prefix="project_q"),
+        tmp_path / "storage",
+    )
+    output = Document(result.output_path)
+    output_texts = [p.text for p in output.paragraphs]
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    ns = {
+        "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    }
+
+    assert "@Question id: project10434_q4@" in output_texts
+    assert "@New snippet id: 219064@" in output_texts
+    assert len(xml.xpath(".//m:oMath", namespaces=ns)) == 2
+    assert "@correct answer@" in "".join(xml.itertext())
+    assert len(xml.xpath(".//wp:docPr", namespaces=ns)) == 2
+    assert result.image_count == 2
+    report = __import__("json").loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["processor_build_id"] == PROCESSOR_BUILD_ID

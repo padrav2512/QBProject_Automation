@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from pathlib import Path
@@ -7,13 +8,25 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from cms_processor import ProcessorOptions, process_docx_bytes
+import cms_processor as _cms_processor
+
+
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.22-safe-math-v2"
+if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
+    _cms_processor = importlib.reload(_cms_processor)
+if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
+    st.error("The app interface and document processor are temporarily out of sync. Reboot the Streamlit app before processing a document.")
+    st.stop()
+
+ProcessorOptions = _cms_processor.ProcessorOptions
+process_docx_bytes = _cms_processor.process_docx_bytes
 
 
 st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅", layout="wide")
 
 st.title("CMS DOCX Verification Processor")
 st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
+st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
 
 with st.sidebar:
     st.header("Processing mode")
