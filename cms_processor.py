@@ -28,6 +28,7 @@ DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDra
 NS = {"m": MATH_NS, "w": WORD_NS, "wp": DRAWING_NS}
 
 QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)@$", re.I)
+QUESTION_START_WITH_SUFFIX_RE = re.compile(r"^@Question:\s*(\d+)@\s+(.+?)\s*$", re.I)
 QUESTION_ID_RE = re.compile(r"^@Question id:\s*(.*?)\s*@$", re.I)
 PLAIN_QUESTION_START_RE = re.compile(
     r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s*(Easy|Medium|Average|Challenging|Hard)?\s*$",
@@ -223,7 +224,11 @@ def _question_starts(doc: _Document) -> list[tuple[Paragraph, int]]:
     starts: list[tuple[Paragraph, int]] = []
     for paragraph in body_paragraphs(doc):
         text = paragraph.text.strip()
-        match = QUESTION_START_RE.fullmatch(text) or PLAIN_QUESTION_START_RE.fullmatch(text)
+        match = (
+            QUESTION_START_RE.fullmatch(text)
+            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            or PLAIN_QUESTION_START_RE.fullmatch(text)
+        )
         if match:
             starts.append((paragraph, int(match.group(1))))
     return starts
@@ -376,6 +381,8 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
         assigned_number = options.start_question_number + ordinal
+        suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
+        heading_suffix = suffix_match.group(2).strip() if suffix_match else None
         heading_match = PLAIN_QUESTION_START_RE.fullmatch(start.text.strip())
         heading_difficulty = DIFFICULTY_ALIASES.get((heading_match.group(2) or "").casefold()) if heading_match else None
         _set_text(start, f"@Question: {assigned_number}@")
@@ -410,6 +417,16 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         if q_marker is None:
             q_marker = _insert_after(cursor, "@Question:@")
             findings.append(Finding(0, "fixed", "Inserted the missing @Question:@ marker.", assigned_number))
+        if heading_suffix:
+            _insert_after(q_marker, heading_suffix)
+            findings.append(
+                Finding(
+                    0,
+                    "manual_review",
+                    f"The question heading contained text after its closing tag: {heading_suffix!r}. The text was preserved at the start of the Question block; verify its placement.",
+                    assigned_number,
+                )
+            )
 
         findings.append(Finding(0, "fixed", f"Normalised CMS metadata and assigned question ID {qid} and snippet ID {snippet}.", assigned_number))
 
@@ -452,7 +469,7 @@ def _section_for_paragraphs(doc: _Document) -> dict[object, tuple[str | None, in
     question: int | None = None
     for paragraph in body_paragraphs(doc):
         text = paragraph.text.strip()
-        start = QUESTION_START_RE.fullmatch(text)
+        start = QUESTION_START_RE.fullmatch(text) or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
         if start:
             question = int(start.group(1))
             section = None
@@ -996,6 +1013,17 @@ def process_docx(
         question_count = len(_question_starts(doc))
         if question_count:
             findings.append(Finding(0, "passed", "Images-only mode preserved the existing document text, CMS tags, metadata and formatting."))
+            for paragraph, number in _question_starts(doc):
+                suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
+                if suffix_match:
+                    findings.append(
+                        Finding(
+                            0,
+                            "manual_review",
+                            f"The question heading contains text after its closing tag: {suffix_match.group(2).strip()!r}. It was counted as a question and preserved unchanged in Images and Alt Text only mode; move the text into the Question block before CMS upload.",
+                            number,
+                        )
+                    )
         else:
             findings.append(Finding(0, "manual_review", "No @Question: n@ records were detected. Images cannot be assigned reliable CMS filenames without existing question tags."))
     else:

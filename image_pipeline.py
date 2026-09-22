@@ -14,7 +14,7 @@ from docx.oxml.ns import qn
 from PIL import Image, ImageChops
 
 
-QUESTION_RE = re.compile(r"^@Question:\s*(\d+)@$", re.I)
+QUESTION_RE = re.compile(r"^@Question:\s*(\d+)@(?:\s+.+)?$", re.I)
 CHOICE_RE = re.compile(r"^@([1-4])@")
 SECTION_MARKERS = {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}
 WHITE_TOLERANCE = 12

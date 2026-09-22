@@ -198,6 +198,51 @@ def test_untagged_fib_answer_is_structured(tmp_path: Path):
     assert "The answer is 50." in texts
 
 
+def test_tagged_question_suffix_is_counted_preserved_and_flagged(tmp_path: Path):
+    source = tmp_path / "case_study_suffix.docx"
+    doc = Document()
+    for text in [
+        "@Question: 29@ case study",
+        "@Type: FIB@",
+        "@Question id: project10436_q29 @",
+        "@New snippet id: 219089 @",
+        "@Difficulty level: Challenging @",
+        "@Objective: Analysis @",
+        "@Question:@",
+        "Read the following information.",
+        "@e@",
+        "@Answers:@",
+        "10",
+        "@e@",
+        "@Solution:@",
+        "The answer is 10.",
+        "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    options = ProcessorOptions(start_question_number=29, start_snippet_id=219089)
+    result = process_docx(source, source.name, options, tmp_path / "storage")
+    output = Document(result.output_path)
+    texts = [p.text for p in output.paragraphs]
+
+    assert result.question_count == 1
+    assert "@Question: 29@" in texts
+    question_marker_index = texts.index("@Question:@")
+    assert texts[question_marker_index + 1] == "case study"
+    assert texts.count("case study") == 1
+    assert any(f.status == "manual_review" and "text after its closing tag" in f.message for f in result.findings)
+
+    image_only = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project10436_q"),
+        tmp_path / "image_only_storage",
+    )
+    assert image_only.question_count == 1
+    assert any(f.status == "manual_review" and "counted as a question" in f.message for f in image_only.findings)
+
+
 def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
     source = tmp_path / "already_tagged.docx"
     picture = tmp_path / "tagged_image.png"
