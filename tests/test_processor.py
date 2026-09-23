@@ -323,6 +323,31 @@ def test_plain_heading_accepts_difficulty_and_objective(tmp_path: Path):
     assert "@Type: MCQ@" in texts
 
 
+def test_mcq_answer_key_with_closing_parenthesis_is_inferred_as_mcq(tmp_path: Path):
+    source = tmp_path / "parenthesized_answer_key.docx"
+    doc = Document()
+    for text in [
+        "Question 4: Easy, Comprehension",
+        "Which statement is correct?",
+        "a) First",
+        "b) Second",
+        "c) Third",
+        "d) Fourth",
+        "Answer: b)",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    texts = [paragraph.text for paragraph in Document(result.output_path).paragraphs]
+
+    assert result.question_count == 1
+    assert "@Type: MCQ@" in texts
+    assert "@Choices:@" in texts
+    assert "@2@ Second @correct answer@" in texts
+    assert "@Answers:@" not in texts
+
+
 def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(tmp_path: Path):
     source = tmp_path / "safe_math_choices.docx"
     doc = Document()

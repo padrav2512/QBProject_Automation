@@ -22,7 +22,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.23-empty-solution-v6"
+PROCESSOR_BUILD_ID = "2026.09.23-answer-key-v7"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -73,7 +73,7 @@ OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
 TAGGED_CHOICE_RE = re.compile(r"^(\s*@[1-4]@\s*)(.*?)(\s+@correct answer@\s*)?$", re.I)
 SAFE_ROOT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*√\s*(\d+)$")
 SAFE_FRACTION_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])$")
-LETTER_ANSWER_RE = re.compile(r"^\s*Answer\s*:?\s*([A-Da-d])\s*$", re.I)
+LETTER_ANSWER_RE = re.compile(r"^\s*Answer\s*:?\s*\(?([A-Da-d])\)?\.?\s*$", re.I)
 ANSWER_VALUE_RE = re.compile(r"^\s*Answer\s*:?\s*(.+?)\s*$", re.I)
 DIFFICULTY_ALIASES = {
     "easy": "Easy",
