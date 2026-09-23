@@ -198,7 +198,9 @@ def test_untagged_fib_answer_is_structured(tmp_path: Path):
     assert "@Answers:@" in texts
     assert "50" in texts
     assert "@Solution:@" in texts
-    assert "The answer is 50." in texts
+    solution_index = texts.index("@Solution:@")
+    assert texts[solution_index + 1] == "@e@"
+    assert "The answer is 50." not in texts
 
 
 def test_tagged_question_suffix_is_counted_preserved_and_flagged(tmp_path: Path):

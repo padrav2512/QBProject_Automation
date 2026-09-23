@@ -22,7 +22,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.23-empty-solution-v5"
+PROCESSOR_BUILD_ID = "2026.09.23-empty-solution-v6"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -456,7 +456,8 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
         answer_paragraph.insert_paragraph_before("@Answers:@")
         _set_text(answer_paragraph, answer_value)
         solution_marker = _insert_after(answer_paragraph, "@Solution:@")
-        _insert_after(solution_marker, f"The answer is {answer_value}.")
+        # Keep the explicit answer in @Answers:@, but do not invent solution prose.
+        _insert_after(solution_marker, "@e@")
         findings.append(Finding(0, "fixed", "Identified an untagged FIB and created its Answers and Solution sections.", detected_number))
 
 
