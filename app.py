@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.22-type-check-v3"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.23-vml-images-v4"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:

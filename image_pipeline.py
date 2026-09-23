@@ -18,6 +18,7 @@ QUESTION_RE = re.compile(r"^@Question:\s*(\d+)\s*@(?:\s+.+)?$", re.I)
 CHOICE_RE = re.compile(r"^@([1-4])@")
 SECTION_MARKERS = {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}
 WHITE_TOLERANCE = 12
+VML_NS = "urn:schemas-microsoft-com:vml"
 
 
 @dataclass
@@ -161,9 +162,12 @@ def _collect_occurrences(doc: _Document) -> list[_Occurrence]:
                     occurrences.append(_Occurrence(question, section, choice, payload[0], payload[1], alt_node, "descr"))
 
         for pict in paragraph.xpath(".//w:pict"):
-            shapes = pict.xpath(".//v:shape")
+            # python-docx's XPath helper does not register the legacy VML
+            # prefix on every element. Use expanded namespace names so DOCX
+            # files containing older Word/VML pictures work on all lxml builds.
+            shapes = pict.findall(f".//{{{VML_NS}}}shape")
             alt_node = shapes[0] if shapes else None
-            for image_data in pict.xpath(".//v:imagedata"):
+            for image_data in pict.findall(f".//{{{VML_NS}}}imagedata"):
                 rid = image_data.get(qn("r:id"))
                 if not rid:
                     continue

@@ -22,7 +22,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.22-type-check-v3"
+PROCESSOR_BUILD_ID = "2026.09.23-vml-images-v4"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -33,7 +33,7 @@ QUESTION_START_RE = re.compile(r"^@Question:\s*(\d+)\s*@$", re.I)
 QUESTION_START_WITH_SUFFIX_RE = re.compile(r"^@Question:\s*(\d+)\s*@\s+(.+?)\s*$", re.I)
 QUESTION_ID_RE = re.compile(r"^@Question id:\s*(.*?)\s*@$", re.I)
 PLAIN_QUESTION_START_RE = re.compile(
-    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s*(Easy|Medium|Average|Challenging|Hard)?\s*$",
+    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s*(Easy|Medium|Average|Challenging|Hard)?(?:\s*,\s*(Knowledge|Comprehension|Application|Analysis))?\s*$",
     re.I,
 )
 KNOWN_METADATA_RE = re.compile(
@@ -477,13 +477,14 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         heading_suffix = suffix_match.group(2).strip() if suffix_match else None
         heading_match = PLAIN_QUESTION_START_RE.fullmatch(start.text.strip())
         heading_difficulty = DIFFICULTY_ALIASES.get((heading_match.group(2) or "").casefold()) if heading_match else None
+        heading_objective = heading_match.group(3).title() if heading_match and heading_match.group(3) else None
         _set_text(start, f"@Question: {assigned_number}@")
 
         existing_type = (_metadata_value(block, "Type") or "").upper()
         has_choices = any(p.text.strip() == "@Choices:@" for p in block)
         question_type = existing_type if existing_type in {"FIB", "MCQ"} else ("MCQ" if has_choices else options.default_type)
         difficulty = _metadata_value(block, "Difficulty level") or heading_difficulty or options.default_difficulty
-        objective = _metadata_value(block, "Objective") or options.default_objective
+        objective = _metadata_value(block, "Objective") or heading_objective or options.default_objective
         existing_qid = _metadata_value(block, "Question id")
         existing_snippet = _metadata_value(block, "New snippet id")
         qid = f"{options.project_question_prefix}{assigned_number}" if options.replace_existing_ids or not existing_qid else existing_qid

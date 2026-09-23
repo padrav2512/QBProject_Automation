@@ -2,6 +2,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from docx import Document
+from docx.oxml.ns import qn
 from lxml import etree
 from PIL import Image
 
@@ -288,6 +289,36 @@ def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):
     assert "case study" in output_texts
 
 
+def test_plain_heading_accepts_difficulty_and_objective(tmp_path: Path):
+    source = tmp_path / "difficulty_objective_heading.docx"
+    doc = Document()
+    for text in [
+        "Question 44: Easy, Comprehension",
+        "Which number is even?",
+        "a) 3",
+        "b) 4",
+        "c) 5",
+        "d) 7",
+        "Answer: b",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(project_question_prefix="projecttest_q", start_question_number=44, start_snippet_id=1044),
+        tmp_path / "storage",
+    )
+    texts = [paragraph.text for paragraph in Document(result.output_path).paragraphs]
+
+    assert result.question_count == 1
+    assert "@Question: 44@" in texts
+    assert "@Difficulty level: Easy @" in texts
+    assert "@Objective: Comprehension @" in texts
+    assert "@Type: MCQ@" in texts
+
+
 def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(tmp_path: Path):
     source = tmp_path / "safe_math_choices.docx"
     doc = Document()
@@ -540,3 +571,53 @@ def test_question_type_is_corrected_only_when_structure_is_unambiguous(tmp_path:
     assert preserved_texts.count("@Type: MCQ@") == 2
     mismatches = [finding for finding in preserved.findings if finding.rule == 12 and finding.status == "manual_review"]
     assert {finding.question for finding in mismatches} == {1, 2, 3}
+
+
+def test_legacy_vml_picture_is_extracted_and_receives_alt_text(tmp_path: Path):
+    source = tmp_path / "legacy_vml.docx"
+    picture = tmp_path / "legacy.png"
+    Image.new("RGB", (48, 32), "white").save(picture)
+    doc = Document()
+    for text in [
+        "@Question: 1@",
+        "@Type: FIB@",
+        "@Question id: projectvml_q1@",
+        "@New snippet id: 1@",
+        "@Question:@",
+        "Use the legacy diagram.",
+    ]:
+        doc.add_paragraph(text)
+
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    run.add_picture(str(picture))
+    drawing = run._r.xpath("./w:drawing")[0]
+    relationship_id = drawing.xpath(".//a:blip")[0].get(qn("r:embed"))
+    run._r.remove(drawing)
+    word_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    vml_ns = "urn:schemas-microsoft-com:vml"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pict = etree.Element(f"{{{word_ns}}}pict", nsmap={"w": word_ns, "v": vml_ns, "r": rel_ns})
+    shape = etree.SubElement(pict, f"{{{vml_ns}}}shape")
+    shape.set("alt", "Legacy diagram")
+    image_data = etree.SubElement(shape, f"{{{vml_ns}}}imagedata")
+    image_data.set(f"{{{rel_ns}}}id", relationship_id)
+    run._r.append(pict)
+
+    for text in ["@e@", "@Answers:@", "1", "@e@", "@Solution:@", "One.", "@e@"]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="fallback_q"),
+        tmp_path / "storage",
+    )
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    alt_values = xml.xpath(".//v:shape/@alt", namespaces={"v": vml_ns})
+
+    assert result.image_count == 1
+    assert alt_values == ["projectvml_q1_1.gif"]
+    with ZipFile(result.images_zip_path) as archive:
+        assert [name for name in archive.namelist() if name.lower().endswith(".gif")] == ["projectvml_q1_1.gif"]

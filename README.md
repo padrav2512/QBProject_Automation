@@ -6,6 +6,8 @@ For the team's Streamlit Community Cloud deployment, follow [COMMUNITY_CLOUD_DEP
 
 The app provides three modes: Full CMS preparation; Images and Alt Text only; and Images, Alt Text and safe Math formatting. The safe-Math image mode preserves existing CMS IDs while converting unambiguous ordinary-text forms such as `x = √27` and `x = 1/8` to native Word equations. Existing native equations are preserved, and expressions with uncertain exponent or radical scope are left unchanged and reported for review. Full preparation and safe-Math mode also correct a mismatched `@Type:@` tag when a four-choice MCQ or an Answers-only FIB structure is unambiguous; Images and Alt Text only reports the mismatch without changing it.
 
+Full preparation accepts plain headings that include both difficulty and objective, such as `Question 44: Easy, Comprehension`. Image extraction supports modern DrawingML pictures and legacy Word VML picture containers.
+
 ## Run locally
 
 ```powershell
