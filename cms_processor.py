@@ -427,7 +427,9 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         answer_paragraph = next((p for p in refreshed if LETTER_ANSWER_RE.fullmatch(p.text.strip())), None)
         if answer_paragraph is not None:
             answer_paragraph.insert_paragraph_before("@Solution:@")
-            _set_text(answer_paragraph, f"The correct answer is option ({answer_match.group(1).lower()}).")
+            # Do not invent solution prose when the source MCQ has no solution.
+            # CMS still requires the Solution block and its closing marker.
+            _set_text(answer_paragraph, "@e@")
         findings.append(Finding(0, "fixed", "Identified an untagged MCQ, created its Choices and Solution sections, and marked the keyed answer.", detected_number))
 
 

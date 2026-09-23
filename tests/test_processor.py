@@ -176,7 +176,9 @@ def test_heading_with_difficulty_and_untagged_mcq_are_structured(tmp_path: Path)
     assert "@Choices:@" in texts
     assert "@2@ 35 and 20 @correct answer@" in texts
     assert "@Solution:@" in texts
-    assert "The correct answer is option (b)." in texts
+    solution_index = texts.index("@Solution:@")
+    assert texts[solution_index + 1] == "@e@"
+    assert "The correct answer is option (b)." not in texts
 
 
 def test_untagged_fib_answer_is_structured(tmp_path: Path):
