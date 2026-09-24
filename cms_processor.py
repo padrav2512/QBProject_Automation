@@ -7,6 +7,7 @@ import re
 import shutil
 import uuid
 from copy import deepcopy
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.24-plain-input-v8"
+PROCESSOR_BUILD_ID = "2026.09.24-math-preservation-v9"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -171,8 +172,49 @@ def body_paragraphs(doc: _Document) -> list[Paragraph]:
 
 
 def _set_text(paragraph: Paragraph, text: str) -> None:
+    if _has_embedded_content(paragraph):
+        raise ValueError("Processing stopped to protect an equation or embedded object from a text-only rewrite. The original document is preserved.")
     paragraph.clear()
     paragraph.add_run(text)
+
+
+def _has_embedded_content(paragraph: Paragraph) -> bool:
+    return bool(paragraph._p.xpath(".//m:oMath | .//w:drawing | .//w:pict | .//w:object"))
+
+
+def _equation_inventory(doc: _Document) -> Counter:
+    # Keep structural operators as well as text: a radical and a fraction with
+    # the same digits must never be treated as interchangeable.
+    result = Counter()
+    for equation in doc.element.xpath(".//m:oMath"):
+        tokens = tuple(re.sub(r"\s+", "", n.text or "") for n in equation.iter(qn("m:t")))
+        if not any(tokens):
+            continue  # Empty equation templates are intentionally removed.
+        operators = tuple(n.tag for n in equation.iter() if n.tag in {
+            qn("m:rad"), qn("m:f"), qn("m:sSup"), qn("m:sSub"), qn("m:sSubSup"), qn("m:nary")
+        } and any((t.text or "").strip() for t in n.iter(qn("m:t"))))
+        result[(tokens, operators)] += 1
+    return result
+
+
+def _replace_text_prefix(paragraph: Paragraph, length: int, replacement: str = "") -> None:
+    """Edit only the ordinary-text prefix, preserving equations, objects and run properties."""
+    for run in paragraph.runs:
+        for node in run._r.findall(qn("w:t")):
+            text = node.text or ""
+            take = min(length, len(text))
+            node.text = text[take:]
+            length -= take
+            if not length:
+                break
+        if not length:
+            break
+    if length:
+        raise ValueError("Cannot safely edit this Word paragraph's prefix.")
+    if replacement:
+        run = paragraph.add_run(replacement)
+        paragraph._p.remove(run._r)
+        paragraph._p.insert(1 if paragraph._p.pPr is not None else 0, run._r)
 
 
 def _is_bold_cms_tag(text: str) -> bool:
@@ -244,6 +286,11 @@ def _canonicalise_section_labels(doc: _Document, findings: list[Finding]) -> Non
         raw = paragraph.text.strip()
         key = raw.casefold()
         if key in SECTION_ALIASES and raw != SECTION_ALIASES[key]:
+            if _has_embedded_content(paragraph):
+                if key in {"answer", "answer:", "answers", "answers:"}:
+                    paragraph.insert_paragraph_before("@Answers:@")
+                    _replace_text_prefix(paragraph, len(paragraph.text))
+                continue
             _set_text(paragraph, SECTION_ALIASES[key])
             findings.append(Finding(0, "fixed", f"Converted section label to {SECTION_ALIASES[key]}", paragraph=index))
 
@@ -362,6 +409,8 @@ def _has_visible_content(paragraph: Paragraph) -> bool:
 
 
 def _split_compound_choices(paragraph: Paragraph) -> list[Paragraph] | None:
+    if _has_embedded_content(paragraph):
+        return None
     lines = [line.strip() for line in paragraph.text.splitlines() if line.strip()]
     if len(lines) != 4 or not all(OPTION_RE.fullmatch(line) for line in lines):
         return None
@@ -376,10 +425,9 @@ def _split_compound_choices(paragraph: Paragraph) -> list[Paragraph] | None:
 
 def _write_choice_marker(paragraph: Paragraph, option: int, correct: bool) -> None:
     suffix = " @correct answer@" if correct else ""
-    if paragraph._p.xpath(".//w:drawing | .//w:pict"):
-        prefix = paragraph.add_run(f"@{option}@")
-        paragraph._p.remove(prefix._r)
-        paragraph._p.insert(0, prefix._r)
+    if _has_embedded_content(paragraph):
+        match = re.match(r"^\s*(?:@[1-4]@|\(?[A-Da-d]\)?[.)])\s*", paragraph.text)
+        _replace_text_prefix(paragraph, match.end() if match else 0, f"@{option}@ ")
         if correct:
             paragraph.add_run(suffix)
         return
@@ -400,7 +448,7 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         # A Question or Solution heading does not imply that choices are already structured.
         solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
         block = block[:solution_index]
-        answer_candidates = [(i, LETTER_ANSWER_RE.fullmatch(p.text.strip())) for i, p in enumerate(block)]
+        answer_candidates = [(i, LETTER_ANSWER_RE.fullmatch(p.text.strip())) for i, p in enumerate(block) if not _has_embedded_content(p)]
         answer_candidates = [(i, match) for i, match in answer_candidates if match]
         if len(answer_candidates) != 1:
             continue
@@ -458,7 +506,7 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
         candidates: list[tuple[Paragraph, re.Match[str]]] = []
         for paragraph in answer_block:
             match = ANSWER_VALUE_RE.fullmatch(paragraph.text.strip())
-            if match and (not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or (_metadata_value(block, "Type") or "").upper() == "FIB"):
+            if match and (_has_embedded_content(paragraph) or not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or (_metadata_value(block, "Type") or "").upper() == "FIB"):
                 candidates.append((paragraph, match))
         if len(candidates) != 1:
             continue
@@ -468,7 +516,8 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             findings.append(Finding(0, "manual_review", "An FIB-style answer was found but is too complex to structure automatically.", detected_number))
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
-        _set_text(answer_paragraph, answer_value)
+        prefix = re.match(r"^\s*Answer\s*:?\s*", answer_paragraph.text, re.I)
+        _replace_text_prefix(answer_paragraph, prefix.end())
         if solution_index == len(block):
             solution_marker = _insert_after(answer_paragraph, "@Solution:@")
             # Keep the explicit answer in @Answers:@, but do not invent solution prose.
@@ -745,6 +794,8 @@ def _copy_run_with_italic(paragraph: Paragraph, source_run, text: str, italic: b
 def _apply_variable_italics(paragraph: Paragraph) -> int:
     changed = 0
     for run in list(paragraph.runs):
+        if any(child.tag not in {qn("w:rPr"), qn("w:t")} for child in run._r):
+            continue
         spans = _variable_spans(run.text)
         if not spans:
             continue
@@ -1047,6 +1098,9 @@ def _split_answers(doc: _Document, findings: list[Finding]) -> None:
         matches = list(re.finditer(r"(?<!\w)(\([a-z]\)|[a-z]\))\s*", text, re.I))
         if len(matches) < 2:
             continue
+        if _has_embedded_content(paragraph):
+            findings.append(Finding(8, "manual_review", "Combined answers contain equations or objects; preserved intact. Put each labelled answer in its own paragraph.", question))
+            continue
         parts: list[str] = []
         for idx, match in enumerate(matches):
             end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
@@ -1076,7 +1130,7 @@ def _normalise_subparts(doc: _Document, findings: list[Finding]) -> None:
     if candidates and not alpha_exists:
         for idx, (paragraph, match, question) in enumerate(candidates):
             label = chr(ord("a") + idx)
-            _set_text(paragraph, f"({label}) {paragraph.text[match.end():].strip()}")
+            _replace_text_prefix(paragraph, match.end(), f"({label}) ")
         findings.append(Finding(9, "fixed", f"Converted {len(candidates)} top-level Roman-numeral subpart label(s) to alphabetic labels."))
     elif candidates and alpha_exists:
         findings.append(Finding(9, "manual_review", "Both alphabetic and Roman-numeral labels occur at the same visible level. Verify which Roman numerals are nested."))
@@ -1158,7 +1212,10 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
         if 1 <= option <= 4:
             canonical = f"@{option}@" + (f" {rest.strip()}" if rest.strip() else "")
             if paragraph.text.strip() != canonical:
-                _set_text(paragraph, canonical)
+                if _has_embedded_content(paragraph):
+                    _write_choice_marker(paragraph, option, False)
+                else:
+                    _set_text(paragraph, canonical)
                 changed += 1
     if changed:
         findings.append(Finding(0, "fixed", f"Normalised {changed} MCQ option marker(s)."))
@@ -1192,6 +1249,7 @@ def process_docx(
         original_path.write_bytes(source)
 
     doc = Document(original_path)
+    original_equations = _equation_inventory(doc)
     findings: list[Finding] = []
     preserve_cms_mode = options.processing_mode in {"images_only", "images_math"}
     if preserve_cms_mode:
@@ -1243,6 +1301,9 @@ def process_docx(
         _bold_cms_tags(doc, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
+    if original_equations - _equation_inventory(doc):
+        raise ValueError("Processing stopped: an original Word equation changed or went missing. No processed document was released. Please share the original for review.")
+    findings.append(Finding(2, "passed", "Verified that all non-empty original Word equations retained their mathematical text and operators."))
     if preserve_cms_mode:
         document_project_id, document_project_ids = _existing_project_id(doc)
         if document_project_id:

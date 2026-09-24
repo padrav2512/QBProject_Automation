@@ -3,11 +3,95 @@ from zipfile import ZipFile
 
 from docx import Document
 from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from lxml import etree
 from PIL import Image
 import pytest
 
 from cms_processor import PROCESSOR_BUILD_ID, ProcessorOptions, process_docx
+
+
+def add_radical_answer(paragraph):
+    from cms_processor import _math_run, _math_radical
+    equation = OxmlElement("m:oMath")
+    equation.append(_math_run("2"))
+    equation.append(_math_radical("13"))
+    paragraph._p.append(equation)
+
+
+@pytest.mark.parametrize("operator", ["f", "sSup", "sSub"])
+def test_fraction_and_script_answers_are_preserved(tmp_path: Path, operator):
+    containers = {"f": ("num", "den"), "sSup": ("e", "sup"), "sSub": ("e", "sub")}
+    left, right = containers[operator]
+    equation = etree.fromstring((f'<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:{operator}><m:{left}><m:r><m:t>3</m:t></m:r></m:{left}><m:{right}><m:r><m:t>2</m:t></m:r></m:{right}></m:{operator}></m:oMath>').encode())
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    doc.add_paragraph("Find the value.")
+    p = doc.add_paragraph("Answer: ")
+    p._p.append(equation)
+    source = tmp_path / "math.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+    assert len(out.element.xpath(f".//m:{operator}")) == 1
+    assert [n.text for n in out.element.xpath(".//m:t")] == ["3", "2"]
+
+
+def test_equation_loss_blocks_output(tmp_path: Path, monkeypatch):
+    import cms_processor
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    doc.add_paragraph("Answers:")
+    add_radical_answer(doc.add_paragraph())
+    source = tmp_path / "protected.docx"
+    doc.save(source)
+    def lose_equations(document, findings):
+        for node in document.element.xpath(".//m:oMath"):
+            node.getparent().remove(node)
+    monkeypatch.setattr(cms_processor, "_repair_spacing", lose_equations)
+    with pytest.raises(ValueError, match="original Word equation"):
+        process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    assert not list((tmp_path / "storage" / "processed").glob("*.docx"))
+
+
+@pytest.mark.parametrize("units", [" cm", ""])
+def test_native_equation_fib_answer_survives(tmp_path: Path, units):
+    doc = Document()
+    doc.add_paragraph("Question 37: Average, Comprehension")
+    doc.add_paragraph("A circle has radius 7 cm, and a chord is 6 cm from its centre. Find its length.")
+    answer = doc.add_paragraph("Answer: ")
+    add_radical_answer(answer)
+    answer.add_run(units)
+    source = tmp_path / "radical.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+    texts = [p.text for p in out.paragraphs]
+    answer_out = out.paragraphs[texts.index("@Answers:@") + 1]
+    assert [n.text for n in answer_out._p.xpath(".//m:t")] == ["2", "13"]
+    assert len(answer_out._p.xpath(".//m:rad")) == 1
+    assert answer_out.text.strip() == units.strip()
+
+
+def test_native_equation_choices_and_subparts_survive(tmp_path: Path):
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    part = doc.add_paragraph("(i) Choose ")
+    add_radical_answer(part)
+    for label in "abcd":
+        p = doc.add_paragraph(label + ") ")
+        add_radical_answer(p)
+    doc.add_paragraph("Answer: c")
+    doc.add_paragraph("Solution:")
+    add_radical_answer(doc.add_paragraph("The length is "))
+    source = tmp_path / "choices.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+    assert len(out.element.xpath(".//m:rad")) == 6
+    correct = next(p for p in out.paragraphs if "@correct answer@" in p.text)
+    assert correct.text.startswith("@3@")
+    assert correct._p.xpath(".//m:rad")
 
 
 @pytest.mark.parametrize("headings", [False, True])
