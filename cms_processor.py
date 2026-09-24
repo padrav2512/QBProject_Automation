@@ -22,7 +22,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.23-answer-key-v7"
+PROCESSOR_BUILD_ID = "2026.09.24-plain-input-v8"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -395,8 +395,11 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
     for ordinal, (start, detected_number) in enumerate(starts):
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
-        if any(p.text.strip() in SECTION_MARKERS for p in block):
+        if any(p.text.strip() == "@Answers:@" for p in block):
             continue
+        # A Question or Solution heading does not imply that choices are already structured.
+        solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
+        block = block[:solution_index]
         answer_candidates = [(i, LETTER_ANSWER_RE.fullmatch(p.text.strip())) for i, p in enumerate(block)]
         answer_candidates = [(i, match) for i, match in answer_candidates if match]
         if len(answer_candidates) != 1:
@@ -411,14 +414,22 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
                 choice_paragraphs = compound
                 break
         if choice_paragraphs is None:
-            candidates = [p for p in block[1:answer_index] if _has_visible_content(p)]
-            if len(candidates) >= 5:
+            choices_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Choices:@"), None)
+            candidates = [p for p in block[(choices_index + 1 if choices_index is not None else 1):answer_index]
+                          if _has_visible_content(p) and p.text.strip() not in SECTION_MARKERS | {"@e@"}
+                          and not (PLAIN_METADATA_RE.fullmatch(p.text.strip()) or KNOWN_METADATA_RE.fullmatch(p.text.strip()))]
+            if (choices_index is not None and len(candidates) == 4) or (choices_index is None and len(candidates) >= 5):
                 choice_paragraphs = candidates[-4:]
         if not choice_paragraphs or len(choice_paragraphs) != 4:
             findings.append(Finding(0, "manual_review", "A letter answer was found, but four MCQ choices could not be identified safely.", detected_number))
             continue
 
-        choice_paragraphs[0].insert_paragraph_before("@Choices:@")
+        if any("@correct answer@" in p.text.lower() for p in choice_paragraphs):
+            findings.append(Finding(0, "manual_review", "Both a letter answer key and an existing correct-answer marker were found; check that they agree.", detected_number))
+            continue
+
+        if not any(p.text.strip() == "@Choices:@" for p in block):
+            choice_paragraphs[0].insert_paragraph_before("@Choices:@")
         for option, paragraph in enumerate(choice_paragraphs, 1):
             _write_choice_marker(paragraph, option, option == correct_option)
 
@@ -426,7 +437,8 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         refreshed = _block_paragraphs(start, next_start)
         answer_paragraph = next((p for p in refreshed if LETTER_ANSWER_RE.fullmatch(p.text.strip())), None)
         if answer_paragraph is not None:
-            answer_paragraph.insert_paragraph_before("@Solution:@")
+            if not any(p.text.strip() == "@Solution:@" for p in refreshed):
+                answer_paragraph.insert_paragraph_before("@Solution:@")
             # Do not invent solution prose when the source MCQ has no solution.
             # CMS still requires the Solution block and its closing marker.
             _set_text(answer_paragraph, "@e@")
@@ -439,12 +451,14 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
     for ordinal, (start, detected_number) in enumerate(starts):
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
-        if any(p.text.strip() in SECTION_MARKERS for p in block):
+        if any(p.text.strip() in {"@Answers:@", "@Choices:@"} for p in block):
             continue
+        solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
+        answer_block = block[:solution_index]
         candidates: list[tuple[Paragraph, re.Match[str]]] = []
-        for paragraph in block:
+        for paragraph in answer_block:
             match = ANSWER_VALUE_RE.fullmatch(paragraph.text.strip())
-            if match and not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()):
+            if match and (not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or (_metadata_value(block, "Type") or "").upper() == "FIB"):
                 candidates.append((paragraph, match))
         if len(candidates) != 1:
             continue
@@ -455,9 +469,10 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
         _set_text(answer_paragraph, answer_value)
-        solution_marker = _insert_after(answer_paragraph, "@Solution:@")
-        # Keep the explicit answer in @Answers:@, but do not invent solution prose.
-        _insert_after(solution_marker, "@e@")
+        if solution_index == len(block):
+            solution_marker = _insert_after(answer_paragraph, "@Solution:@")
+            # Keep the explicit answer in @Answers:@, but do not invent solution prose.
+            _insert_after(solution_marker, "@e@")
         findings.append(Finding(0, "fixed", "Identified an untagged FIB and created its Answers and Solution sections.", detected_number))
 
 

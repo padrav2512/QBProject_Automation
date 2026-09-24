@@ -5,8 +5,59 @@ from docx import Document
 from docx.oxml.ns import qn
 from lxml import etree
 from PIL import Image
+import pytest
 
 from cms_processor import PROCESSOR_BUILD_ID, ProcessorOptions, process_docx
+
+
+@pytest.mark.parametrize("headings", [False, True])
+def test_plain_mcq_with_solution_preserves_sections(tmp_path: Path, headings):
+    doc = Document()
+    lines = ["Question 26: Average, Comprehension"]
+    if headings:
+        lines += ["Question:"]
+    lines += ["Let M be the midpoint of chord AB in a circle with centre O.",
+              "Which criterion proves triangles OMA and OMB congruent?"]
+    if headings:
+        lines += ["Options:"]
+    lines += ["a) ASA", "b) SAS", "c) SSS", "d) RHS", "Answer: c",
+              "Solution:", "OA = OB (radii), AM = BM (midpoint), OM common."]
+    for line in lines:
+        assert "@" not in line
+        doc.add_paragraph(line)
+    source = tmp_path / "plain.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(start_question_number=26), tmp_path / "storage")
+    texts = [p.text for p in Document(result.output_path).paragraphs]
+    assert "@Type: MCQ@" in texts
+    assert texts.count("@Choices:@") == 1
+    assert texts.count("@Solution:@") == 1
+    assert "@3@ SSS @correct answer@" in texts
+    assert sum("@correct answer@" in t for t in texts) == 1
+    assert "Answer: c" not in texts
+    assert "@Objective: Comprehension @" in texts
+    solution = texts.index("@Solution:@")
+    assert texts[solution + 1] == lines[-1]
+    assert texts[solution + 2] == "@e@"
+    assert texts[texts.index("@Choices:@") - 1] == "@e@"
+
+
+def test_plain_fib_with_solution_and_following_mcq(tmp_path: Path):
+    doc = Document()
+    for line in ["Question 1", "Type: FIB", "Question:", "How many?", "Answer: 42",
+                 "Solution:", "Six groups of seven.", "Question 2", "Which number?",
+                 "a) 1", "b) 2", "c) 3", "d) 4", "Answer: b", "Solution:", "Two is correct."]:
+        doc.add_paragraph(line)
+    source = tmp_path / "mixed.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    texts = [p.text for p in Document(result.output_path).paragraphs]
+    assert result.question_count == 2
+    assert texts.count("@Solution:@") == 2
+    assert "@Type: FIB@" in texts and "@Type: MCQ@" in texts
+    assert texts[texts.index("@Answers:@") + 1] == "42"
+    assert "Six groups of seven." in texts
+    assert "@2@ 2 @correct answer@" in texts
 
 
 def make_sample(path: Path) -> None:

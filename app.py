@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.23-answer-key-v7"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.24-plain-input-v8"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -72,6 +72,27 @@ storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "d
 st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")
 
 uploaded = st.file_uploader("Upload a Word document", type=["docx"], accept_multiple_files=False)
+
+if processing_mode == "full":
+    with st.expander("Input format — no CMS tags needed"):
+        st.write("Use ordinary text in Word. Put each heading, option and answer on its own paragraph (Enter). The app adds CMS tags to the output automatically.")
+        st.code("""Question 26: Average, Comprehension
+Which congruence criterion applies?
+a) ASA
+b) SAS
+c) SSS
+d) RHS
+Answer: c
+Solution:
+OA = OB, AM = BM, and OM is common.
+
+Question 27: Easy, Knowledge
+Type: FIB
+What is 6 times 7?
+Answer: 42
+Solution:
+6 times 7 equals 42.""", language=None)
+        st.write("Question: and Choices: (or Options:) headings are optional for MCQs. Use four options a) to d) and one Answer: a/b/c/d line before Solution:. For multiple FIB answers, use an Answers: heading followed by one labelled answer per paragraph. For a single-letter FIB answer, include Type: FIB and use an Answers: heading. Review the audit report before using the output.")
 
 if uploaded is not None:
     size_mb = uploaded.size / (1024 * 1024)

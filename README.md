@@ -42,6 +42,31 @@ For a public deployment, place the container behind HTTPS and your organisationâ
 
 ## Input expectations
 
+### Plain-text input (no `@` characters required)
+
+Choose **Full CMS preparation**. Put each line below in its own Word paragraph:
+
+```text
+Question 26: Average, Comprehension
+Which congruence criterion applies?
+a) ASA
+b) SAS
+c) SSS
+d) RHS
+Answer: c
+Solution:
+OA = OB, AM = BM, and OM is common.
+
+Question 27: Easy, Knowledge
+Type: FIB
+What is 6 times 7?
+Answer: 42
+Solution:
+6 times 7 equals 42.
+```
+
+Optional `Question:` and `Choices:` / `Options:` headings are supported. For MCQs, use four options a)â€“d), with one `Answer: c` style key before `Solution:`. For multiple FIB answers, use `Answers:` followed by one labelled answer per paragraph. For single-letter FIB answers, use `Type: FIB` and an `Answers:` section to avoid ambiguity with an MCQ key. Use Enter between paragraphs. The app generates all CMS markers in the output; existing tagged documents remain supported. Check the audit report for ambiguous or incomplete input.
+
 The intended input is a quality-checked Word document; it does not need to contain CMS tags. Each question must still have an identifiable boundary, such as a standalone `Question 1` or `Q1` heading, and recognisable Question, Answers or Choices, and Solution sections. Existing CMS-style documents containing `@Question: n@` records are also accepted, including harmless spacing variants such as `@Question:10 @`. A heading such as `@Question: 29@ case study` is counted, but is reported for manual review. In Full CMS preparation mode, the suffix is moved to the start of the Question block so it is not lost. The app then creates or repairs:
 
 - `@Question: n@`
