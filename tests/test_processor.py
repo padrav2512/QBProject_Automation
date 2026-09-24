@@ -19,6 +19,50 @@ def add_radical_answer(paragraph):
     paragraph._p.append(equation)
 
 
+@pytest.mark.parametrize("all_bold", [False, True])
+def test_author_formatting_and_whole_choice_bold(tmp_path: Path, all_bold):
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    doc.add_paragraph("A circle has radius 15 m. Find the distance to line ")
+    doc.paragraphs[-1].add_run("AB").italic = True
+    for i, label in enumerate("abcd"):
+        p = doc.add_paragraph(label + ") ")
+        r = p.add_run("AB" if i == 0 else "15 m")
+        r.italic = i == 0
+        r.bold = all_bold or i == 0
+    doc.add_paragraph("Answer: a")
+    doc.add_paragraph("Solution:")
+    p = doc.add_paragraph()
+    p.add_run("Use ").bold = True
+    r = p.add_run("AB")
+    r.bold = True
+    r.italic = True
+    doc.add_paragraph("Question 2")
+    doc.add_paragraph("Type: FIB")
+    doc.add_paragraph("Find the length.")
+    p = doc.add_paragraph("Answer: ")
+    r = p.add_run("AB")
+    r.bold = True
+    r.italic = True
+    source = tmp_path / "authored.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+    question = next(p for p in out.paragraphs if p.text.startswith("A circle"))
+    assert all(r.italic is not True for r in question.runs if r.text != "AB")
+    assert next(r for r in question.runs if r.text == "AB").italic is True
+    choice = next(p for p in out.paragraphs if p.text.startswith("@1@"))
+    r = next(r for r in choice.runs if r.text == "AB")
+    assert r.italic is True
+    assert r.bold is (not all_bold)
+    solution = next(p for p in out.paragraphs if p.text == "Use AB")
+    assert all(r.bold is False for r in solution.runs if r.text)
+    assert next(r for r in solution.runs if r.text == "AB").italic is True
+    answer = next(p for p in out.paragraphs if p.text == "AB")
+    r = next(r for r in answer.runs if r.text == "AB")
+    assert r.bold is True and r.italic is True
+
+
 @pytest.mark.parametrize("operator", ["f", "sSup", "sSub"])
 def test_fraction_and_script_answers_are_preserved(tmp_path: Path, operator):
     containers = {"f": ("num", "den"), "sSup": ("e", "sup"), "sSub": ("e", "sub")}
@@ -238,7 +282,7 @@ def test_selective_bold_emphasis_is_preserved(tmp_path: Path):
     assert next(r for r in solution_out.runs if r.text == "factor").bold is True
 
 
-def test_cms_tags_are_bold_and_choice_variables_are_italic(tmp_path: Path):
+def test_cms_tags_are_bold_and_author_italics_are_preserved(tmp_path: Path):
     source = tmp_path / "choice_variables.docx"
     doc = Document()
     for text in [
@@ -277,11 +321,10 @@ def test_cms_tags_are_bold_and_choice_variables_are_italic(tmp_path: Path):
             assert all(run.bold is True for run in paragraph.runs if run.text)
 
     choice = next(p for p in output.paragraphs if p.text == "@1@ x = 4")
-    assert next(run for run in choice.runs if run.text == "x").italic is True
-    assert all(run.italic is not True for run in choice.runs if run.text != "x")
+    assert all(run.italic is not True for run in choice.runs)
 
     solution = next(p for p in output.paragraphs if p.text == "The value of x is 7.")
-    assert next(run for run in solution.runs if run.text == "x").italic is True
+    assert all(run.italic is not True for run in solution.runs)
 
     end_tags = [p for p in output.paragraphs if p.text == "@e@"]
     assert end_tags

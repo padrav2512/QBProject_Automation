@@ -23,7 +23,7 @@ from docx.text.paragraph import Paragraph
 from image_pipeline import process_document_images
 
 
-PROCESSOR_BUILD_ID = "2026.09.24-math-preservation-v9"
+PROCESSOR_BUILD_ID = "2026.09.24-author-formatting-v10"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -408,33 +408,46 @@ def _has_visible_content(paragraph: Paragraph) -> bool:
     return bool(paragraph.text.strip() or paragraph._p.xpath(".//w:drawing | .//w:pict | .//m:oMath"))
 
 
+def _split_formatted_text(paragraph: Paragraph, spans: list[tuple[int, int]]) -> list[Paragraph]:
+    """Clone plain-text runs for each slice, retaining their original properties."""
+    original = [(deepcopy(r._r), r.text) for r in paragraph.runs]
+    result = [paragraph]
+    for _ in spans[1:]:
+        result.append(_insert_after(result[-1]))
+    for target, (start, end) in zip(result, spans):
+        full_text = "".join(text for _, text in original)
+        while start < end and full_text[start].isspace():
+            start += 1
+        while end > start and full_text[end - 1].isspace():
+            end -= 1
+        target.clear()
+        offset = 0
+        for node, text in original:
+            left, right = max(0, start - offset), min(len(text), end - offset)
+            if left < right:
+                run = target.add_run(text[left:right])
+                properties = node.find(qn("w:rPr"))
+                if properties is not None:
+                    run._r.insert(0, deepcopy(properties))
+            offset += len(text)
+    return result
+
+
 def _split_compound_choices(paragraph: Paragraph) -> list[Paragraph] | None:
     if _has_embedded_content(paragraph):
         return None
-    lines = [line.strip() for line in paragraph.text.splitlines() if line.strip()]
-    if len(lines) != 4 or not all(OPTION_RE.fullmatch(line) for line in lines):
+    spans = [(m.start(), m.end()) for m in re.finditer(r"[^\r\n]+", paragraph.text) if m.group().strip()]
+    if len(spans) != 4 or not all(OPTION_RE.fullmatch(paragraph.text[a:b]) for a, b in spans):
         return None
-    _set_text(paragraph, lines[0])
-    choices = [paragraph]
-    cursor = paragraph
-    for line in lines[1:]:
-        cursor = _insert_after(cursor, line)
-        choices.append(cursor)
-    return choices
+    return _split_formatted_text(paragraph, spans)
 
 
 def _write_choice_marker(paragraph: Paragraph, option: int, correct: bool) -> None:
     suffix = " @correct answer@" if correct else ""
-    if _has_embedded_content(paragraph):
-        match = re.match(r"^\s*(?:@[1-4]@|\(?[A-Da-d]\)?[.)])\s*", paragraph.text)
-        _replace_text_prefix(paragraph, match.end() if match else 0, f"@{option}@ ")
-        if correct:
-            paragraph.add_run(suffix)
-        return
-    raw = paragraph.text.strip()
-    match = OPTION_RE.fullmatch(raw)
-    content = match.group(3).strip() if match else raw
-    _set_text(paragraph, f"@{option}@ {content}{suffix}".rstrip())
+    match = re.match(r"^\s*(?:@[1-4]@|\(?[A-Da-d]\)?[.)])\s*", paragraph.text)
+    _replace_text_prefix(paragraph, match.end() if match else 0, f"@{option}@ ")
+    if correct:
+        paragraph.add_run(suffix)
 
 
 def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> None:
@@ -646,7 +659,7 @@ def _remove_bold_from_questions_and_solutions(doc: _Document, findings: list[Fin
     sections: dict[tuple[int | None, str], list[Paragraph]] = {}
     for paragraph in body_paragraphs(doc):
         section, question = context.get(paragraph._p, (None, None))
-        if section not in {"@Question:@", "@Solution:@"}:
+        if section not in {"@Question:@", "@Choices:@", "@Solution:@"}:
             continue
         if paragraph.text.strip() in SECTION_MARKERS or paragraph.text.strip() == "@e@":
             continue
@@ -658,7 +671,7 @@ def _remove_bold_from_questions_and_solutions(doc: _Document, findings: list[Fin
         substantive_runs: list[tuple[Paragraph, object]] = []
         for paragraph in paragraphs:
             for run in paragraph.runs:
-                if run.text.strip():
+                if re.sub(r"@[1-4]@|@correct answer@", "", run.text).strip():
                     substantive_runs.append((paragraph, run))
         if not substantive_runs:
             continue
@@ -677,15 +690,15 @@ def _remove_bold_from_questions_and_solutions(doc: _Document, findings: list[Fin
             for _, run in substantive_runs:
                 run.bold = False
             changed_sections += 1
-            label = "Question" if section == "@Question:@" else "Solution"
+            label = section.strip("@:")
             findings.append(Finding(1, "fixed", f"Removed whole-block bold formatting from the {label.lower()} while preserving the text.", question))
         elif any(bold_flags):
             emphasis_sections += 1
-            label = "question" if section == "@Question:@" else "solution"
+            label = section.strip("@:").lower()
             findings.append(Finding(1, "passed", f"Preserved selective bold emphasis within the {label}; the entire block was not bold.", question))
 
     if not changed_sections and not emphasis_sections:
-        findings.append(Finding(1, "passed", "No whole-question or whole-solution bold formatting was found."))
+        findings.append(Finding(1, "passed", "No whole-question, whole-choices or whole-solution bold formatting was found."))
     else:
         findings.append(Finding(1, "passed", f"Bold-format review completed: {changed_sections} whole block(s) corrected and {emphasis_sections} selectively emphasised block(s) preserved."))
 
@@ -734,7 +747,7 @@ def _normalise_spacing(text: str) -> str:
     text = re.sub(r"\s*,\s*", ", ", text)
     text = re.sub(r"\s*([=+×÷−])\s*", r" \1 ", text)
     text = re.sub(r" +([.;:?!])", r"\1", text)
-    return text.strip() if text.strip().startswith("@") and text.strip().endswith("@") else text
+    return text
 
 
 def _repair_spacing(doc: _Document, findings: list[Finding]) -> None:
@@ -823,46 +836,7 @@ def _apply_variable_italics(paragraph: Paragraph) -> int:
 
 
 def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
-    removed = 0
-    added = 0
-    context = _section_for_paragraphs(doc)
-    for paragraph in body_paragraphs(doc):
-        section, _question = context.get(paragraph._p, (None, None))
-        if section not in {"@Question:@", "@Answers:@", "@Choices:@", "@Solution:@"}:
-            continue
-        for run in paragraph.runs:
-            if not run.italic:
-                continue
-            text = run.text.strip()
-            if VARIABLE_ONLY_RE.fullmatch(text):
-                continue
-            run.italic = False
-            removed += 1
-        added += _apply_variable_italics(paragraph)
-
-    # Explicitly keep variables italic and non-variable equation content plain.
-    for math_run in doc.element.xpath(".//m:r"):
-        text = "".join(math_run.itertext()).strip()
-        style = math_run.find("m:rPr/m:sty", namespaces=NS)
-        if VARIABLE_ONLY_RE.fullmatch(text):
-            if style is None:
-                properties = math_run.find(qn("m:rPr"))
-                if properties is None:
-                    properties = OxmlElement("m:rPr")
-                    math_run.insert(0, properties)
-                style = OxmlElement("m:sty")
-                properties.append(style)
-            if style.get(qn("m:val")) != "i":
-                style.set(qn("m:val"), "i")
-                added += 1
-        elif style is not None and style.get(qn("m:val")) == "i":
-            style.set(qn("m:val"), "p")
-            removed += 1
-
-    if removed or added:
-        findings.append(Finding(3, "fixed", f"Corrected italics in student-facing content: removed italics from {removed} non-variable run(s) and italicised {added} variable occurrence(s), including variables in choices."))
-    else:
-        findings.append(Finding(3, "passed", "Only variables are italic in questions, answers, choices and solutions."))
+    findings.append(Finding(3, "passed", "Preserved author-supplied italics in text and native equations; no variable or unit styling was inferred."))
 
 
 def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> None:
@@ -957,6 +931,8 @@ def _convert_safe_choice_equations(doc: _Document, findings: list[Finding]) -> N
     context = _section_for_paragraphs(doc)
     converted = 0
     for paragraph in body_paragraphs(doc):
+        if any(r.italic is not None or r.bold is True for r in paragraph.runs):
+            continue
         section, question = context.get(paragraph._p, (None, None))
         if section != "@Choices:@" or paragraph._p.xpath(".//m:oMath"):
             continue
@@ -995,6 +971,8 @@ def _convert_inline_slash_fractions(doc: _Document, findings: list[Finding]) -> 
     context = _section_for_paragraphs(doc)
     converted = 0
     for paragraph in body_paragraphs(doc):
+        if any(r.italic is not None or r.bold is True for r in paragraph.runs):
+            continue
         section, question = context.get(paragraph._p, (None, None))
         if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
             continue
@@ -1060,6 +1038,8 @@ def _convert_simple_math_paragraphs(doc: _Document, findings: list[Finding]) -> 
     context = _section_for_paragraphs(doc)
     converted = 0
     for paragraph in body_paragraphs(doc):
+        if any(r.italic is not None or r.bold is True for r in paragraph.runs):
+            continue
         section, question = context.get(paragraph._p, (None, None))
         if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
             continue
@@ -1101,14 +1081,10 @@ def _split_answers(doc: _Document, findings: list[Finding]) -> None:
         if _has_embedded_content(paragraph):
             findings.append(Finding(8, "manual_review", "Combined answers contain equations or objects; preserved intact. Put each labelled answer in its own paragraph.", question))
             continue
-        parts: list[str] = []
-        for idx, match in enumerate(matches):
-            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-            parts.append(text[match.start() : end].strip())
-        _set_text(paragraph, parts[0])
-        cursor = paragraph
-        for part in parts[1:]:
-            cursor = _insert_after(cursor, part)
+        # Match against the original string so offsets include leading whitespace.
+        matches = list(re.finditer(r"(?<!\w)(\([a-z]\)|[a-z]\))\s*", paragraph.text, re.I))
+        spans = [(m.start(), matches[i + 1].start() if i + 1 < len(matches) else len(paragraph.text)) for i, m in enumerate(matches)]
+        parts = _split_formatted_text(paragraph, spans)
         splits += len(parts) - 1
         findings.append(Finding(8, "fixed", f"Placed {len(parts)} labelled answers on separate lines.", question))
     if not splits:
@@ -1182,10 +1158,7 @@ def _audit_assertion_reason(doc: _Document, findings: list[Finding]) -> None:
         correct_indexes = [i for i, p in enumerate(option_paragraphs) if "@correct answer@" in p.text]
         if len(correct_indexes) != 1:
             findings.append(Finding(10, "manual_review", "Assertion–Reason item must have exactly one @correct answer@ marker.", number))
-        for i, paragraph in enumerate(option_paragraphs):
-            suffix = " @correct answer@" if i in correct_indexes else ""
-            _set_text(paragraph, f"@{i + 1}@ {ASSERTION_CHOICES[i]}{suffix}")
-        findings.append(Finding(10, "fixed", "Normalised the four Assertion–Reason choice sentences while preserving the existing correct-answer position.", number))
+        findings.append(Finding(10, "passed", "Preserved author-supplied Assertion–Reason choice wording and formatting.", number))
     if not found_any:
         findings.append(Finding(10, "passed", "No Assertion–Reason items were detected."))
 
@@ -1212,10 +1185,7 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
         if 1 <= option <= 4:
             canonical = f"@{option}@" + (f" {rest.strip()}" if rest.strip() else "")
             if paragraph.text.strip() != canonical:
-                if _has_embedded_content(paragraph):
-                    _write_choice_marker(paragraph, option, False)
-                else:
-                    _set_text(paragraph, canonical)
+                _write_choice_marker(paragraph, option, False)
                 changed += 1
     if changed:
         findings.append(Finding(0, "fixed", f"Normalised {changed} MCQ option marker(s)."))

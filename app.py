@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.24-math-preservation-v9"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.24-author-formatting-v10"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -199,9 +199,9 @@ st.divider()
 with st.expander("What the app checks"):
     st.markdown(
         """
-1. Removes bold only when an entire Question or Solution block is bold; selective bold emphasis is preserved.
+1. Removes bold only when an entire Question, Choices or Solution block is bold; selective bold emphasis is preserved.
 2. Preserves native Word equations, converts unambiguous radical or simple-fraction assignments, and flags possible equation images or expressions with uncertain mathematical scope.
-3. Keeps only mathematical variables in italics across Questions, Answers, Choices and Solutions, including ordinary text and native equations.
+3. Preserves author-supplied italics in text and native equations. Authors decide the formatting of variables, geometry labels and units.
 4. Removes completely blank equation objects, blank exponent/subscript templates and repeated spaces.
 5. Normalises spaces around `=`, `+`, `−`, `×` and `÷`.
 6. Adds a space after commas.
