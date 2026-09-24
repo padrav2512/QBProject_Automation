@@ -320,7 +320,8 @@ def test_cms_tags_are_bold_and_author_italics_are_preserved(tmp_path: Path):
             assert paragraph.runs
             assert all(run.bold is True for run in paragraph.runs if run.text)
 
-    choice = next(p for p in output.paragraphs if p.text == "@1@ x = 4")
+    choice = next(p for p in output.paragraphs if p.text.startswith("@1@"))
+    assert [n.text for n in choice._p.xpath(".//m:t")] == ["x", "=", "4"]
     assert all(run.italic is not True for run in choice.runs)
 
     solution = next(p for p in output.paragraphs if p.text == "The value of x is 7.")

@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.24-author-formatting-v10"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.24-safe-equations-v11"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -27,6 +27,7 @@ st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅"
 st.title("CMS DOCX Verification Processor")
 st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
 st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
+st.caption("Clearly grouped mathematical expressions become Word equations with italic variables. Prose formatting is preserved. Ambiguous expressions are kept for review; missing Solution sections are added empty and flagged.")
 
 with st.sidebar:
     st.header("Processing mode")

@@ -21,9 +21,10 @@ from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 
 from image_pipeline import process_document_images
+from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.24-author-formatting-v10"
+PROCESSOR_BUILD_ID = "2026.09.24-safe-equations-v11"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -613,7 +614,9 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         if not any(block[i].text.strip() in {"@Answers:@", "@Choices:@"} for i in section_positions):
             findings.append(Finding(8, "manual_review", "The record has no @Answers:@ or @Choices:@ block.", assigned_number))
         if not any(block[i].text.strip() == "@Solution:@" for i in section_positions):
-            findings.append(Finding(1, "manual_review", "The record has no @Solution:@ block.", assigned_number))
+            marker = _insert_after(block[-1], "@Solution:@")
+            _insert_after(marker, "@e@")
+            findings.append(Finding(1, "manual_review", "Added an empty Solution section because no solution was supplied. No solution content was invented.", assigned_number))
 
         for pos_index in range(len(section_positions) - 1, -1, -1):
             pos = section_positions[pos_index]
@@ -924,6 +927,55 @@ def _word_text_run(text: str, run_properties) -> OxmlElement:
     value.text = text
     run.append(value)
     return run
+
+
+def _convert_explicit_math(doc: _Document, findings: list[Finding]) -> None:
+    context = _section_for_paragraphs(doc)
+    atom = r"(?:\d+(?:\.\d+)?|[A-Za-z](?![A-Za-z])|[²³=+−\-×*÷/()√^])"
+    assignment = re.compile(r"\b[A-Za-z]\s*=\s*" + atom + r"(?:\s*" + atom + r")*")
+    fraction = re.compile(r"(?<![\w/])\d+\s*/\s*\d+(?![\w/])")
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if section not in {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}:
+            continue
+        # Do not flatten existing equations, objects, hyperlinks or complex runs.
+        if _has_embedded_content(paragraph):
+            continue
+        if any(child.tag not in {qn('w:pPr'), qn('w:r')} for child in paragraph._p) or any(
+            child.tag not in {qn('w:rPr'), qn('w:t')} for r in paragraph.runs for child in r._r
+        ):
+            continue
+        text = paragraph.text
+        if text.strip() in SECTION_MARKERS | {"@e@"}:
+            continue
+        spans = []
+        choice = TAGGED_CHOICE_RE.fullmatch(text)
+        if choice:
+            expression = choice.group(2).strip()
+            expression = re.sub(r"\s+(?:units|cm|mm|km|m)\s*$", "", expression)
+            start = text.find(expression, len(choice.group(1)))
+            if re.search(r"[²³√=+−×÷/^]|\d\s*\(", expression):
+                spans = [(start, start + len(expression))]
+        else:
+            spans = [m.span() for m in assignment.finditer(text)]
+            if not spans and re.fullmatch(r"\s*(?:\([a-z]\)\s*)?[\dA-Za-z²³√=+−\-×*÷/()^ .]+\s*", text) and not re.search(r"[A-Za-z]{2}", text) and re.search(r"[²³√=+−×÷/]", text):
+                start = re.match(r"\s*(?:\([a-z]\)\s*)?", text).end()
+                spans = [(start, len(text.rstrip()))]
+            if not spans:
+                spans = [m.span() for m in fraction.finditer(text)]
+        for start, end in reversed(spans):
+            expression = text[start:end].strip()
+            # A fraction may be part of a date, ratio label or an ambiguous larger expression.
+            if '/' in expression and (re.search(r"[/\w]", text[max(0, start - 1):start]) or re.match(r"\s*[A-Za-z(\/^²³]", text[end:])):
+                findings.append(Finding(2, "manual_review", f"Preserved ambiguous fraction context: {expression!r}. Use Word Equation Editor to specify its meaning.", question))
+                continue
+            try:
+                equation = parse_safe_math(expression)
+                replace_math_span(paragraph, start, end, equation)
+            except ValueError:
+                findings.append(Finding(2, "manual_review", f"Preserved uncertain mathematical expression: {expression!r}. Use explicit parentheses or Word Equation Editor.", question))
+                continue
+            findings.append(Finding(7 if '/' in expression else 2, "fixed", f"Converted explicit expression to a native Word equation with italic variables: {expression!r}", question))
 
 
 def _convert_safe_choice_equations(doc: _Document, findings: list[Finding]) -> None:
@@ -1247,9 +1299,7 @@ def process_docx(
             _remove_empty_scripts(doc, findings)
             _repair_spacing(doc, findings)
             _repair_italics(doc, findings)
-            _convert_safe_choice_equations(doc, findings)
-            _convert_inline_slash_fractions(doc, findings)
-            _convert_simple_math_paragraphs(doc, findings)
+            _convert_explicit_math(doc, findings)
             _equation_and_fraction_audit(doc, findings)
             _preserve_table_formatting(doc, findings)
     else:
@@ -1262,9 +1312,7 @@ def process_docx(
         _repair_italics(doc, findings)
         _split_answers(doc, findings)
         _normalise_subparts(doc, findings)
-        _convert_safe_choice_equations(doc, findings)
-        _convert_inline_slash_fractions(doc, findings)
-        _convert_simple_math_paragraphs(doc, findings)
+        _convert_explicit_math(doc, findings)
         _equation_and_fraction_audit(doc, findings)
         _audit_assertion_reason(doc, findings)
         _preserve_table_formatting(doc, findings)
