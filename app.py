@@ -12,7 +12,7 @@ import cms_processor as _cms_processor
 from heymath_cms_mapper import HeyMathCmsMapper
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-plain-case-study-heading-v14.4"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-question-heading-notes-v14.5"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:

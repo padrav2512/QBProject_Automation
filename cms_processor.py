@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-plain-case-study-heading-v14.4"
+PROCESSOR_BUILD_ID = "2026.09.25-question-heading-notes-v14.5"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -49,7 +49,7 @@ PLAIN_METADATA_RE = re.compile(
     re.I,
 )
 PLAIN_QUESTION_START_WITH_SUFFIX_RE = re.compile(
-    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s+(Case\s+study)\s*$",
+    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s+(.+?)\s*$",
     re.I,
 )
 SECTION_ALIASES = {
@@ -255,6 +255,7 @@ def _is_bold_cms_tag(text: str) -> bool:
     stripped = text.strip()
     return bool(
         QUESTION_START_RE.fullmatch(stripped)
+        or QUESTION_START_WITH_SUFFIX_RE.fullmatch(stripped)
         or KNOWN_METADATA_RE.fullmatch(stripped)
         or stripped in SECTION_MARKERS
     )
@@ -302,14 +303,19 @@ def _remove_paragraph(paragraph: Paragraph) -> None:
 
 def _question_starts(doc: _Document) -> list[tuple[Paragraph, int]]:
     starts: list[tuple[Paragraph, int]] = []
-    for paragraph in body_paragraphs(doc):
+    paragraphs = body_paragraphs(doc)
+    for index, paragraph in enumerate(paragraphs):
         text = paragraph.text.strip()
         match = (
             QUESTION_START_RE.fullmatch(text)
             or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
             or PLAIN_QUESTION_START_RE.fullmatch(text)
-            or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
         )
+        if match is None:
+            suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            next_paragraph = next((candidate for candidate in paragraphs[index + 1 :] if candidate.text.strip()), None)
+            if suffix_match and next_paragraph is not None and _contains_only_metadata(next_paragraph):
+                match = suffix_match
         if match:
             starts.append((paragraph, int(match.group(1))))
     return starts
@@ -632,15 +638,15 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
         assigned_number = options.start_question_number + ordinal
-        suffix_match = (
-            QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
-            or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
-        )
-        heading_suffix = suffix_match.group(2).strip() if suffix_match else None
         heading_match = PLAIN_QUESTION_START_RE.fullmatch(start.text.strip())
+        suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
+        if suffix_match is None and heading_match is None:
+            suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
+        heading_suffix = suffix_match.group(2).strip() if suffix_match else None
         heading_difficulty = DIFFICULTY_ALIASES.get((heading_match.group(2) or "").casefold()) if heading_match else None
         heading_objective = heading_match.group(3).title() if heading_match and heading_match.group(3) else None
-        _set_text(start, f"@Question: {assigned_number}@")
+        canonical_heading = f"@Question: {assigned_number}@" + (f" {heading_suffix}" if heading_suffix else "")
+        _set_text(start, canonical_heading)
 
         existing_type = (_metadata_value(block, "Type") or "").upper()
         has_choices = any(p.text.strip() == "@Choices:@" for p in block)
@@ -673,15 +679,7 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
             q_marker = _insert_after(cursor, "@Question:@")
             findings.append(Finding(0, "fixed", "Inserted the missing @Question:@ marker.", assigned_number))
         if heading_suffix:
-            _insert_after(q_marker, heading_suffix)
-            findings.append(
-                Finding(
-                    0,
-                    "manual_review",
-                    f"The question heading contained text after its closing tag: {heading_suffix!r}. The text was preserved at the start of the Question block; verify its placement.",
-                    assigned_number,
-                )
-            )
+            findings.append(Finding(0, "fixed", f"Retained question-heading text after the canonical tag: {heading_suffix!r}.", assigned_number))
 
         findings.append(Finding(0, "fixed", f"Normalised CMS metadata and assigned question ID {qid} and snippet ID {snippet}.", assigned_number))
 
@@ -754,13 +752,13 @@ def _audit_unsectioned_record_text(doc: _Document, findings: list[Finding]) -> N
 
 def _section_for_paragraphs(doc: _Document) -> dict[object, tuple[str | None, int | None]]:
     state: dict[object, tuple[str | None, int | None]] = {}
+    question_numbers = {paragraph._p: number for paragraph, number in _question_starts(doc)}
     section: str | None = None
     question: int | None = None
     for paragraph in body_paragraphs(doc):
         text = paragraph.text.strip()
-        start = QUESTION_START_RE.fullmatch(text) or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
-        if start:
-            question = int(start.group(1))
+        if paragraph._p in question_numbers:
+            question = question_numbers[paragraph._p]
             section = None
         elif text in SECTION_MARKERS:
             section = text
@@ -1772,17 +1770,13 @@ def _normalise_mapping_path(raw: str) -> str | None:
 
 def _extract_mapping_instructions(doc: _Document, findings: list[Finding]) -> list[MappingInstruction]:
     paragraphs = body_paragraphs(doc)
+    question_numbers = {paragraph._p: number for paragraph, number in _question_starts(doc)}
     snippet_ids: dict[int, int] = {}
     current_question: int | None = None
     for paragraph in paragraphs:
         text = paragraph.text.strip()
-        question_match = (
-            QUESTION_START_RE.fullmatch(text)
-            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
-            or PLAIN_QUESTION_START_RE.fullmatch(text)
-        )
-        if question_match:
-            current_question = int(question_match.group(1))
+        if paragraph._p in question_numbers:
+            current_question = question_numbers[paragraph._p]
             continue
         snippet_match = SNIPPET_ID_RE.fullmatch(text)
         if current_question is not None and snippet_match:
@@ -1816,13 +1810,8 @@ def _extract_mapping_instructions(doc: _Document, findings: list[Finding]) -> li
 
     for paragraph in paragraphs:
         text = paragraph.text.strip()
-        question_match = (
-            QUESTION_START_RE.fullmatch(text)
-            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
-            or PLAIN_QUESTION_START_RE.fullmatch(text)
-        )
-        if question_match:
-            current_question = int(question_match.group(1))
+        if paragraph._p in question_numbers:
+            current_question = question_numbers[paragraph._p]
             active_type = None
             active_label = None
             continue
@@ -2013,16 +2002,16 @@ def process_docx(
         if question_count:
             findings.append(Finding(0, "passed", "CMS tag insertion was not selected; existing question IDs, snippet IDs and CMS record structure were preserved."))
             for paragraph, number in _question_starts(doc):
-                suffix_match = (
-                    QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
-                    or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
-                )
+                plain_heading = PLAIN_QUESTION_START_RE.fullmatch(paragraph.text.strip())
+                suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
+                if suffix_match is None and plain_heading is None:
+                    suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
                 if suffix_match:
                     findings.append(
                         Finding(
                             0,
-                            "manual_review",
-                            f"The question heading contains text after its closing tag: {suffix_match.group(2).strip()!r}. It was counted as a question and preserved because CMS tag insertion was not selected; move the text into the Question block before CMS upload.",
+                            "passed",
+                            f"Preserved question-heading text after the question number: {suffix_match.group(2).strip()!r}.",
                             number,
                         )
                     )

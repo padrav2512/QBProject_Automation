@@ -32,7 +32,7 @@ def test_case_study_and_inline_expression(tmp_path):
     out = Document(result.output_path)
     texts = [p.text for p in out.paragraphs]
     assert texts.count('@Solution:@') == 2
-    assert 'Case study' in texts
+    assert '@Question: 81@ Case study' in texts
     assert len(out.element.xpath('.//m:rad')) == 3
     assert len(out.element.xpath('.//m:f')) == 1
     reason = next(p for p in out.paragraphs if p.text.startswith('Reason'))

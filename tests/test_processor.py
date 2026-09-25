@@ -59,7 +59,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-plain-case-study-heading-v14.4"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-question-heading-notes-v14.5"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -644,11 +644,10 @@ def test_tagged_question_suffix_is_counted_preserved_and_flagged(tmp_path: Path)
     texts = [p.text for p in output.paragraphs]
 
     assert result.question_count == 1
-    assert "@Question: 29@" in texts
-    question_marker_index = texts.index("@Question:@")
-    assert texts[question_marker_index + 1] == "case study"
-    assert texts.count("case study") == 1
-    assert any(f.status == "manual_review" and "text after its closing tag" in f.message for f in result.findings)
+    assert "@Question: 29@ case study" in texts
+    heading = next(paragraph for paragraph in output.paragraphs if paragraph.text == "@Question: 29@ case study")
+    assert all(run.bold is True for run in heading.runs if run.text)
+    assert any(f.status == "fixed" and "Retained question-heading text" in f.message for f in result.findings)
 
     image_only = process_docx(
         source,
@@ -657,7 +656,7 @@ def test_tagged_question_suffix_is_counted_preserved_and_flagged(tmp_path: Path)
         tmp_path / "image_only_storage",
     )
     assert image_only.question_count == 1
-    assert any(f.status == "manual_review" and "counted as a question" in f.message for f in image_only.findings)
+    assert not any(f.status == "manual_review" and "question heading" in f.message.lower() for f in image_only.findings)
 
 
 def test_plain_case_study_heading_and_stray_interquestion_text(tmp_path: Path):
@@ -677,7 +676,7 @@ def test_plain_case_study_heading_and_stray_interquestion_text(tmp_path: Path):
     add_metadata("Easy", "Application", "FIB")
     doc.add_paragraph("If 3x+5=20, find the value of x.")
     doc.add_paragraph("Answer: 5")
-    doc.add_paragraph("Question 2 Case study")
+    doc.add_paragraph("Question: 2 Case study")
     add_metadata("Easy", "Comprehension", "FIB")
     doc.add_paragraph("Riya drank juice in the morning and 1/4 litres in the evening.")
     doc.add_paragraph("Answer: 7/12 litres")
@@ -702,13 +701,13 @@ def test_plain_case_study_heading_and_stray_interquestion_text(tmp_path: Path):
     assert result.question_count == 3
     assert [text for text in texts if text.startswith("@Question: ")] == [
         "@Question: 1@",
-        "@Question: 2@",
+        "@Question: 2@ Case study",
         "@Question: 3@",
     ]
-    q2_marker = texts.index("@Question:@", texts.index("@Question: 2@"))
-    assert texts[q2_marker + 1] == "Case study"
+    q2_heading = next(paragraph for paragraph in output.paragraphs if paragraph.text == "@Question: 2@ Case study")
+    assert all(run.bold is True for run in q2_heading.runs if run.text)
     assert "@1@ Both Assertion (A) and Reason (R) are true and Reason (R) is the correct explanation of Assertion (A) @correct answer@" in texts
-    assert any("text after its closing tag" in finding.message and finding.question == 2 for finding in result.findings)
+    assert not any("question heading" in finding.message.lower() and finding.status == "manual_review" for finding in result.findings)
     assert any("outside a recognised" in finding.message and "Inserting text on purpose" in finding.message for finding in result.findings)
 
 
@@ -751,10 +750,10 @@ def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):
     )
     output_texts = [p.text for p in Document(full.output_path).paragraphs]
     assert full.question_count == 3
-    assert "@Question: 10@" in output_texts
+    assert "@Question: 10@ case study" in output_texts
     assert "@Question: 11@" in output_texts
     assert "@Question: 12@" in output_texts
-    assert "case study" in output_texts
+    assert "case study" not in output_texts
 
 
 def test_plain_heading_accepts_difficulty_and_objective(tmp_path: Path):
