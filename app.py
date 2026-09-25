@@ -427,7 +427,10 @@ with st.expander("Apply mappings to CMS", expanded=False):
                     validation_errors.append(f"{row['Mapping Type']}: {error}")
 
         if validation_errors:
-            st.error("Nothing was mapped because the pre-check found a problem.")
+            st.error(
+                "Nothing was mapped because the pre-check found a problem:\n\n"
+                + "\n".join(f"- {problem}" for problem in validation_errors)
+            )
             st.dataframe(pd.DataFrame({"Problem": validation_errors}), use_container_width=True, hide_index=True)
         else:
             result_rows = []

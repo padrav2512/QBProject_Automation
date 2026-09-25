@@ -7,6 +7,7 @@ it never removes or replaces mappings already present in CMS.
 from __future__ import annotations
 
 import html as _html
+from difflib import get_close_matches
 import logging
 import re
 import threading
@@ -158,7 +159,9 @@ class HeyMathCmsMapper:
             index = self._taxonomy_index if taxonomy else self._curriculum_index
             matches = index.get(norm(path)) if index else None
             if not matches:
-                return f"Path not found: {path}"
+                candidates = get_close_matches(norm(path), list(index or {}), n=3, cutoff=0.72)
+                suggestion = f" Did you mean: {'; '.join(candidates)}?" if candidates else ""
+                return f"Path not found: {path}.{suggestion}"
             if len(matches) > 1:
                 return f"Path is ambiguous ({len(matches)} nodes): {path}"
             return None

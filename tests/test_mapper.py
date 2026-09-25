@@ -75,6 +75,26 @@ def test_mapper_saves_nothing_when_any_path_is_invalid(monkeypatch):
     assert posts == []
 
 
+def test_validate_path_suggests_a_close_cms_path():
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._curriculum_index = {"Known >> Path": ["10"]}
+    mapper._taxonomy_index = {
+        "Mathematics >> Measurement >> Measuring Temperature": ["20"],
+        "Mathematics >> Geometry >> Circles": ["21"],
+    }
+    mapper._trees_loaded_at = 10**12
+    mapper._logged_in = True
+
+    error = mapper.validate_path(
+        "Mathematics >> Measurement >> Measuring Temparature",
+        taxonomy=True,
+    )
+
+    assert error is not None
+    assert "Path not found" in error
+    assert "Did you mean: Mathematics >> Measurement >> Measuring Temperature?" in error
+
+
 def test_mapper_accepts_realistic_form_spacing_and_single_quotes():
     page = """
     <form action = '/curriculum_trees/add_mapping' method = 'post'>
