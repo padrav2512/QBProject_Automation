@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.24-safe-equations-v11"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-authoring-rules-v12"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -27,7 +27,7 @@ st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅"
 st.title("CMS DOCX Verification Processor")
 st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
 st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
-st.caption("Clearly grouped mathematical expressions become Word equations with italic variables. Prose formatting is preserved. Ambiguous expressions are kept for review; missing Solution sections are added empty and flagged.")
+st.caption("Clearly grouped mathematical expressions become Word equations. Version 12 also converts spaced slash fractions, inline radicals and rupee amounts, and applies conservative variable and geometry-label italics while protecting recognised units. Ambiguous cases remain for review.")
 
 with st.sidebar:
     st.header("Processing mode")
@@ -93,7 +93,7 @@ What is 6 times 7?
 Answer: 42
 Solution:
 6 times 7 equals 42.""", language=None)
-        st.write("Question: and Choices: (or Options:) headings are optional for MCQs. Use four options a) to d) and one Answer: a/b/c/d line before Solution:. For multiple FIB answers, use an Answers: heading followed by one labelled answer per paragraph. For a single-letter FIB answer, include Type: FIB and use an Answers: heading. Review the audit report before using the output.")
+        st.write("Question: and Choices: (or Options:) headings are optional for MCQs. Type: and Question type: are accepted. Use four options a) to d) and an Answer: or Correct answer: line before Solution:. MCQ keys may be b, b), (b), 2 or b) choice text. For multiple FIB answers, use an Answers: heading followed by one labelled answer per paragraph. A space after a slash fraction ends the fraction; use brackets for a multi-term denominator. Review the audit report before using the output.")
 
 if uploaded is not None:
     size_mb = uploaded.size / (1024 * 1024)
@@ -211,6 +211,8 @@ with st.expander("What the app checks"):
 9. Normalises top-level subpart labels where the structure is unambiguous.
 10. Checks and normalises Assertion–Reason wording and choice structure without guessing the correct answer.
 11. Preserves table formatting. Authors must identify and bold any header rows or header columns in the source document.
+12. Converts `₹50`, `₹ 50` and similar numeric amounts to `Rs 50`.
+13. Italicises high-confidence variables and geometry labels while protecting articles, option labels and recognised measurement units; uncertain labels are reported.
 
 The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. Metadata and section tag paragraphs are bold, matching the approved CMS document convention; choice markers, `@correct answer@` and `@e@` remain ordinary text. It validates the generated structure afterwards.
 """

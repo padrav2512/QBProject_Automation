@@ -5,7 +5,7 @@ from cms_processor import ProcessorOptions, process_docx
 from safe_math import parse
 
 
-@pytest.mark.parametrize('text', ['r² − d²', '√(r² + d²)', '2√(r² − d²)', '2(r − d)', 'c = 2√(r² − d²)', '1/2'])
+@pytest.mark.parametrize('text', ['r² − d²', '√(r² + d²)', '2√(r² − d²)', '2(r − d)', 'c = 2√(r² − d²)', '1/2', '1/2 r', '1/(2r)', '(1/2)r'])
 def test_explicit_expressions(text):
     equation = parse(text)
     for node in equation.iter(qn('m:r')):

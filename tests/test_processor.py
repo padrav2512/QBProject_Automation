@@ -19,6 +19,104 @@ def add_radical_answer(paragraph):
     paragraph._p.append(equation)
 
 
+def italicised_text(paragraph):
+    return [(run.text, run.italic is True) for run in paragraph.runs if run.text]
+
+
+def test_v12_authoring_rules(tmp_path: Path):
+    from cms_processor import _math_fraction
+
+    doc = Document()
+    doc.add_paragraph("Question 1: Easy, Knowledge")
+    doc.add_paragraph("Question type: FIB")
+    question = doc.add_paragraph("Riya drank ")
+    existing = OxmlElement("m:oMath")
+    existing.append(_math_fraction("1", "3"))
+    question._p.append(existing)
+    question.add_run(" litres in the morning and 1/4 litres in the evening. What did she drink altogether ?")
+    doc.add_paragraph("Correct answer: 7/12 litres")
+
+    doc.add_paragraph("Question 2: Easy, Knowledge")
+    doc.add_paragraph("Question type: FIB")
+    doc.add_paragraph("Find the values of √144, √25 and √(r² + d²). Preserve √a+b, √5/9 and √r² for review.")
+    doc.add_paragraph("Answer: x = √144")
+
+    doc.add_paragraph("Question 3: Easy, Knowledge")
+    doc.add_paragraph("Question type: MCQ")
+    doc.add_paragraph("In the number 7³, what is the base?")
+    for text in ["a) 4", "b) 7", "c) 11", "d) 28", "Correct answer: b) 7"]:
+        doc.add_paragraph(text)
+
+    doc.add_paragraph("Question 4: Easy, Comprehension")
+    doc.add_paragraph("Question type: FIB")
+    doc.add_paragraph("Point A lies on line BC. A circle has radius r. Let m be a number. The length is 5 m. Option A is shown.")
+    doc.add_paragraph("Answer: 5 cm")
+
+    source = tmp_path / "v12_rules.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+    texts = [paragraph.text for paragraph in out.paragraphs]
+
+    assert PROCESSOR_BUILD_ID.endswith("v12")
+    assert len(out.element.xpath(".//m:f")) >= 3
+    assert "1/4" not in "\n".join(texts)
+    assert "7/12" not in "\n".join(texts)
+    assert any("What did she drink altogether?" in text for text in texts)
+    assert len(out.element.xpath(".//m:rad")) >= 4
+    assert any("√a + b" in text and "√5/9" in text and "√r²" in text for text in texts)
+    assert "@Type: MCQ@" in texts
+    assert "@2@ 7 @correct answer@" in texts
+    assert "Question type: MCQ" not in texts
+    assert not any(text.startswith("Correct answer:") for text in texts)
+
+    geometry = next(paragraph for paragraph in out.paragraphs if paragraph.text.startswith("Point A"))
+    styled = italicised_text(geometry)
+    italic_text = "".join(text for text, italic in styled if italic)
+    assert "A" in italic_text and "BC" in italic_text and "r" in italic_text and "m" in italic_text
+    article_index = geometry.text.index("A circle")
+    offset = 0
+    article_run = None
+    for run in geometry.runs:
+        if offset <= article_index < offset + len(run.text):
+            article_run = run
+            break
+        offset += len(run.text)
+    assert article_run is not None and article_run.italic is not True
+    assert any(run.text == "m" and run.italic is True for run in geometry.runs)
+    unit_index = geometry.text.index("5 m") + 2
+    offset = 0
+    unit_run = None
+    for run in geometry.runs:
+        if offset <= unit_index < offset + len(run.text):
+            unit_run = run
+            break
+        offset += len(run.text)
+    assert unit_run is not None and unit_run.italic is not True
+
+
+def test_v12_rupee_conversion_and_conflicting_mcq_key(tmp_path: Path):
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    doc.add_paragraph("Question type: FIB")
+    doc.add_paragraph("A book costs ₹50, a pen costs ₹ 50 and a bag costs ₹1,250.50.")
+    doc.add_paragraph("Answer: ₹1,350.50")
+    doc.add_paragraph("Question 2")
+    doc.add_paragraph("Question type: MCQ")
+    doc.add_paragraph("Choose the number.")
+    for text in ["a) 4", "b) 7", "c) 11", "d) 28", "Correct answer: b) 9"]:
+        doc.add_paragraph(text)
+    source = tmp_path / "currency_conflict.docx"
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+    combined = "\n".join(paragraph.text for paragraph in out.paragraphs)
+    assert "₹" not in combined
+    assert "Rs 50" in combined and "Rs 1,250.50" in combined and "Rs 1,350.50" in combined
+    assert any(f.status == "manual_review" and "does not match" in f.message and f.question == 2 for f in result.findings)
+
+
 @pytest.mark.parametrize("all_bold", [False, True])
 def test_author_formatting_and_whole_choice_bold(tmp_path: Path, all_bold):
     doc = Document()
@@ -325,7 +423,7 @@ def test_cms_tags_are_bold_and_author_italics_are_preserved(tmp_path: Path):
     assert all(run.italic is not True for run in choice.runs)
 
     solution = next(p for p in output.paragraphs if p.text == "The value of x is 7.")
-    assert all(run.italic is not True for run in solution.runs)
+    assert any(run.text == "x" and run.italic is True for run in solution.runs)
 
     end_tags = [p for p in output.paragraphs if p.text == "@e@"]
     assert end_tags
@@ -567,10 +665,10 @@ def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(t
 
     xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
     ns = {"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"}
-    assert len(xml.xpath(".//m:rad", namespaces=ns)) == 2
+    assert len(xml.xpath(".//m:rad", namespaces=ns)) == 4
     assert len(xml.xpath(".//m:f", namespaces=ns)) == 2
     assert "@correct answer@" in "".join(xml.itertext())
-    assert "@3@ √3, √5/9, 1/√9" in output_texts
+    assert any(text.startswith("@3@") and "√5/9" in text and "1/√9" in text for text in output_texts)
     ambiguous = [f for f in result.findings if f.status == "manual_review" and "ambiguous scope" in f.message and f.question == 5]
     assert len(ambiguous) == 2
     assert not any("0.1666" in f.message and f.status == "manual_review" for f in result.findings)

@@ -24,7 +24,7 @@ from image_pipeline import process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.24-safe-equations-v11"
+PROCESSOR_BUILD_ID = "2026.09.25-authoring-rules-v12"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -43,7 +43,7 @@ KNOWN_METADATA_RE = re.compile(
     re.I,
 )
 PLAIN_METADATA_RE = re.compile(
-    r"^(Type|Question id|New snippet id|Difficulty(?: level)?|Objective):\s*(.*?)\s*$",
+    r"^(Type|Question type|Question id|New snippet id|Difficulty(?: level)?|Objective):\s*(.*?)\s*$",
     re.I,
 )
 SECTION_ALIASES = {
@@ -75,8 +75,12 @@ OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
 TAGGED_CHOICE_RE = re.compile(r"^(\s*@[1-4]@\s*)(.*?)(\s+@correct answer@\s*)?$", re.I)
 SAFE_ROOT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*√\s*(\d+)$")
 SAFE_FRACTION_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])$")
-LETTER_ANSWER_RE = re.compile(r"^\s*Answer\s*:?\s*\(?([A-Da-d])\)?\.?\s*$", re.I)
-ANSWER_VALUE_RE = re.compile(r"^\s*Answer\s*:?\s*(.+?)\s*$", re.I)
+LETTER_ANSWER_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*\(?([A-Da-d])\)?\.?\s*$", re.I)
+ANSWER_VALUE_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*(.+?)\s*$", re.I)
+MCQ_ANSWER_RE = re.compile(
+    r"^\s*(?:Answer|Correct answer)\s*:?\s*(?:\(?([A-Da-d])\)?|([1-4]))(?:[.)])?(?:\s+(.+?))?\s*$",
+    re.I,
+)
 DIFFICULTY_ALIASES = {
     "easy": "Easy",
     "medium": "Average",
@@ -313,6 +317,8 @@ def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
         field_name = match.group(1).casefold() if match else ""
         if field_name == "difficulty":
             field_name = "difficulty level"
+        elif field_name == "question type":
+            field_name = "type"
         if match and field_name == name.casefold():
             return match.group(2).strip()
     return None
@@ -451,6 +457,19 @@ def _write_choice_marker(paragraph: Paragraph, option: int, correct: bool) -> No
         paragraph.add_run(suffix)
 
 
+def _parse_mcq_answer_key(text: str) -> tuple[int, str | None] | None:
+    match = MCQ_ANSWER_RE.fullmatch(text)
+    if not match:
+        return None
+    letter, digit, supplied_text = match.groups()
+    option = ord(letter.upper()) - ord("A") + 1 if letter else int(digit)
+    return option, supplied_text.strip() if supplied_text and supplied_text.strip() else None
+
+
+def _normalise_answer_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
 def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> None:
     """Structure common untagged MCQs only when a letter answer and four choices are clear."""
     starts = _question_starts(doc)
@@ -462,12 +481,14 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         # A Question or Solution heading does not imply that choices are already structured.
         solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
         block = block[:solution_index]
-        answer_candidates = [(i, LETTER_ANSWER_RE.fullmatch(p.text.strip())) for i, p in enumerate(block) if not _has_embedded_content(p)]
-        answer_candidates = [(i, match) for i, match in answer_candidates if match]
+        answer_candidates = [
+            (i, parsed)
+            for i, p in enumerate(block)
+            if not _has_embedded_content(p) and (parsed := _parse_mcq_answer_key(p.text.strip())) is not None
+        ]
         if len(answer_candidates) != 1:
             continue
-        answer_index, answer_match = answer_candidates[0]
-        correct_option = ord(answer_match.group(1).upper()) - ord("A") + 1
+        answer_index, (correct_option, supplied_answer_text) = answer_candidates[0]
 
         choice_paragraphs: list[Paragraph] | None = None
         for paragraph in block[1:answer_index]:
@@ -486,6 +507,20 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
             findings.append(Finding(0, "manual_review", "A letter answer was found, but four MCQ choices could not be identified safely.", detected_number))
             continue
 
+        if supplied_answer_text is not None:
+            selected = OPTION_RE.fullmatch(choice_paragraphs[correct_option - 1].text.strip())
+            selected_text = selected.group(3).strip() if selected else choice_paragraphs[correct_option - 1].text.strip()
+            if _normalise_answer_text(selected_text) != _normalise_answer_text(supplied_answer_text):
+                findings.append(
+                    Finding(
+                        0,
+                        "manual_review",
+                        f"The correct-answer label points to choice {correct_option}, but its supplied text does not match that choice. The record was preserved for review.",
+                        detected_number,
+                    )
+                )
+                continue
+
         if any("@correct answer@" in p.text.lower() for p in choice_paragraphs):
             findings.append(Finding(0, "manual_review", "Both a letter answer key and an existing correct-answer marker were found; check that they agree.", detected_number))
             continue
@@ -497,7 +532,7 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
 
         # Locate the answer paragraph again because splitting a compound choice can change the block.
         refreshed = _block_paragraphs(start, next_start)
-        answer_paragraph = next((p for p in refreshed if LETTER_ANSWER_RE.fullmatch(p.text.strip())), None)
+        answer_paragraph = next((p for p in refreshed if _parse_mcq_answer_key(p.text.strip()) is not None), None)
         if answer_paragraph is not None:
             if not any(p.text.strip() == "@Solution:@" for p in refreshed):
                 answer_paragraph.insert_paragraph_before("@Solution:@")
@@ -517,10 +552,15 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             continue
         solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
         answer_block = block[:solution_index]
+        declared_type = (_metadata_value(block, "Type") or "").upper()
+        option_count = sum(bool(OPTION_RE.fullmatch(p.text.strip())) for p in answer_block)
         candidates: list[tuple[Paragraph, re.Match[str]]] = []
         for paragraph in answer_block:
             match = ANSWER_VALUE_RE.fullmatch(paragraph.text.strip())
-            if match and (_has_embedded_content(paragraph) or not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or (_metadata_value(block, "Type") or "").upper() == "FIB"):
+            mcq_key = _parse_mcq_answer_key(paragraph.text.strip())
+            if match and mcq_key and declared_type != "FIB" and option_count >= 4:
+                continue
+            if match and (_has_embedded_content(paragraph) or not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or declared_type == "FIB"):
                 candidates.append((paragraph, match))
         if len(candidates) != 1:
             continue
@@ -530,7 +570,7 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             findings.append(Finding(0, "manual_review", "An FIB-style answer was found but is too complex to structure automatically.", detected_number))
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
-        prefix = re.match(r"^\s*Answer\s*:?\s*", answer_paragraph.text, re.I)
+        prefix = re.match(r"^\s*(?:Answer|Correct answer)\s*:?\s*", answer_paragraph.text, re.I)
         _replace_text_prefix(answer_paragraph, prefix.end())
         if solution_index == len(block):
             solution_marker = _insert_after(answer_paragraph, "@Solution:@")
@@ -748,9 +788,80 @@ def _normalise_spacing(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"(?<=\d),\s+(?=\d)", ",", text)
     text = re.sub(r"\s*([=+×÷−])\s*", r" \1 ", text)
     text = re.sub(r" +([.;:?!])", r"\1", text)
     return text
+
+
+def _convert_rupee_symbols(doc: _Document, findings: list[Finding]) -> None:
+    changes = 0
+    for node in doc.element.xpath(".//w:t | .//m:t"):
+        original = node.text or ""
+        updated, count = re.subn(r"₹\s*(?=\d)", "Rs ", original)
+        if count:
+            node.text = updated
+            changes += count
+    findings.append(
+        Finding(
+            13,
+            "fixed" if changes else "passed",
+            f"Converted {changes} rupee symbol occurrence(s) to Rs followed by one space."
+            if changes
+            else "No rupee symbols before numeric amounts required conversion.",
+        )
+    )
+
+
+def _normalise_paragraph_run_boundaries(paragraph: Paragraph) -> int:
+    """Normalise whitespace across adjacent ordinary Word runs without flattening formatting."""
+    groups: list[list[object]] = []
+    current: list[object] = []
+    for child in paragraph._p:
+        if child.tag == qn("w:pPr"):
+            continue
+        if child.tag != qn("w:r"):
+            if current:
+                groups.append(current)
+                current = []
+            continue
+        nodes = child.findall(qn("w:t"))
+        if not nodes:
+            if current:
+                groups.append(current)
+                current = []
+            continue
+        current.extend(nodes)
+    if current:
+        groups.append(current)
+
+    changes = 0
+    for nodes in groups:
+        previous = None
+        for node in nodes:
+            if previous is None:
+                previous = node
+                continue
+            left = previous.text or ""
+            right = node.text or ""
+            right_visible = right.lstrip()
+            if right_visible.startswith(("?", ".", ",", ":", ";", "!")):
+                new_left = left.rstrip()
+                new_right = right_visible
+            elif left[-1:].isspace() and right[:1].isspace():
+                new_left = left.rstrip() + " "
+                new_right = right.lstrip()
+            else:
+                previous = node
+                continue
+            if new_left != left:
+                previous.text = new_left
+                changes += 1
+            if new_right != right:
+                node.text = new_right
+                changes += 1
+            previous = node
+    return changes
 
 
 def _repair_spacing(doc: _Document, findings: list[Finding]) -> None:
@@ -761,6 +872,8 @@ def _repair_spacing(doc: _Document, findings: list[Finding]) -> None:
         if updated != original:
             node.text = updated
             changes += 1
+    boundary_changes = sum(_normalise_paragraph_run_boundaries(paragraph) for paragraph in iter_paragraphs(doc))
+    changes += boundary_changes
     findings.append(Finding(4, "fixed" if changes else "passed", f"Normalised spacing in {changes} text run(s)." if changes else "No repeated or operator-spacing defects were found."))
     findings.append(Finding(5, "passed", "Operator and equals-sign spacing was checked and normalised."))
     findings.append(Finding(6, "passed", "Comma spacing was checked and normalised."))
@@ -838,8 +951,181 @@ def _apply_variable_italics(paragraph: Paragraph) -> int:
     return changed
 
 
+GEOMETRY_SINGLE_CUE_RE = re.compile(r"\b(?i:point|centre|center|vertex)\s+([A-Z])\b")
+GEOMETRY_LABEL_CUE_RE = re.compile(
+    r"\b(?i:line segment|line|segment|ray|chord|arc|angle|triangle|circle)\s+([A-Z]{1,3})\b",
+)
+GEOMETRY_SYMBOL_RE = re.compile(r"(?:∠|△|Δ)\s*([A-Z]{1,3})\b")
+VARIABLE_CUE_RE = re.compile(
+    r"\b(?i:let|variable|value\s+of|solve\s+for|find|where|radius|diameter|length|breadth|height|distance|speed|time|mass)\s+([A-Za-z])\b",
+)
+PROTECTED_LABEL_RE = re.compile(r"\b(?i:option|choice|part|class)\s+([A-Da-d])\b")
+UNIT_TOKENS = {"mm", "cm", "m", "km", "mg", "g", "kg", "ml", "l", "s", "min", "h"}
+
+
+def _add_match_group_span(spans: list[tuple[int, int]], match: re.Match[str], group: int = 1) -> str:
+    spans.append(match.span(group))
+    return match.group(group)
+
+
+def _measurement_unit_ranges(text: str, paragraph: Paragraph) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    unit_pattern = r"(?:mm|cm|km|mg|kg|mL|min|m|g|L|l|s|h)(?:²|³)?"
+    for match in re.finditer(rf"(?<![A-Za-z])\d+(?:\.\d+)?\s+({unit_pattern})\b", text):
+        ranges.append(match.span(1))
+    for match in re.finditer(rf"\b({unit_pattern})\s*/\s*({unit_pattern})\b", text):
+        ranges.extend((match.span(1), match.span(2)))
+    # When a native equation is followed by a unit, paragraph.text contains only
+    # the ordinary-text suffix. Treat a leading unit as measurement text.
+    if paragraph._p.xpath(".//m:oMath"):
+        match = re.match(rf"\s*({unit_pattern})\b", text)
+        if match:
+            ranges.append(match.span(1))
+    return ranges
+
+
+def _range_contains(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
+    return any(left <= start and end <= right for left, right in ranges)
+
+
+def _looks_like_article(text: str, start: int, end: int) -> bool:
+    if text[start:end].casefold() != "a":
+        return False
+    before = text[:start].rstrip()
+    after = text[end:].lstrip()
+    next_word = re.match(r"([A-Za-z]+)", after)
+    if not next_word:
+        return False
+    sentence_start = not before or before[-1:] in ".?!:;"
+    preceding_word = re.search(r"([A-Za-z]+)\s*$", before)
+    ordinary_article_position = sentence_start or not preceding_word or preceding_word.group(1).casefold() in {
+        "of", "in", "on", "with", "from", "by", "for", "as", "draw", "construct"
+    }
+    relation_verbs = {"is", "are", "lies", "meets", "intersects", "equals", "represents", "denotes", "has"}
+    return ordinary_article_position and next_word.group(1).casefold() not in relation_verbs
+
+
+def _italicise_absolute_spans(paragraph: Paragraph, spans: list[tuple[int, int]]) -> int:
+    spans = sorted({span for span in spans if span[0] < span[1]})
+    if not spans:
+        return 0
+    changed = 0
+    offset = 0
+    for source in list(paragraph.runs):
+        text = source.text
+        run_start, run_end = offset, offset + len(text)
+        offset = run_end
+        intersections = [
+            (max(left, run_start) - run_start, min(right, run_end) - run_start)
+            for left, right in spans
+            if left < run_end and right > run_start
+        ]
+        if not intersections:
+            continue
+        boundaries = {0, len(text)}
+        for left, right in intersections:
+            boundaries.update((left, right))
+        points = sorted(boundaries)
+        source_properties = source._r.find(qn("w:rPr"))
+        for left, right in zip(points, points[1:]):
+            if left == right:
+                continue
+            new_run = paragraph.add_run(text[left:right])
+            if source_properties is not None:
+                existing = new_run._r.find(qn("w:rPr"))
+                if existing is not None:
+                    new_run._r.remove(existing)
+                new_run._r.insert(0, deepcopy(source_properties))
+            if any(span_left <= left and right <= span_right for span_left, span_right in intersections):
+                if new_run.italic is not True:
+                    new_run.italic = True
+                    changed += 1
+            source._r.addprevious(new_run._r)
+        source._r.getparent().remove(source._r)
+    return changed
+
+
 def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
-    findings.append(Finding(3, "passed", "Preserved author-supplied italics in text and native equations; no variable or unit styling was inferred."))
+    context = _section_for_paragraphs(doc)
+    declared: dict[int, set[str]] = {}
+    direct_spans: dict[object, list[tuple[int, int]]] = {}
+
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if question is None or section not in {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}:
+            continue
+        symbols = declared.setdefault(question, set())
+        for node in paragraph._p.xpath(".//m:oMath//m:t"):
+            value = (node.text or "").strip()
+            if re.fullmatch(r"[A-Za-z]", value):
+                symbols.add(value)
+        if paragraph._p.xpath(".//w:drawing | .//w:pict | .//w:object"):
+            continue
+        text = paragraph.text
+        spans: list[tuple[int, int]] = []
+        for pattern in (GEOMETRY_SINGLE_CUE_RE, GEOMETRY_LABEL_CUE_RE, GEOMETRY_SYMBOL_RE, VARIABLE_CUE_RE):
+            for match in pattern.finditer(text):
+                symbols.add(_add_match_group_span(spans, match))
+        for match in re.finditer(r"\b([A-Z])\s+and\s+([A-Z])\s+are\s+(?:two\s+)?(?:fixed\s+)?points\b", text):
+            symbols.add(_add_match_group_span(spans, match, 1))
+            symbols.add(_add_match_group_span(spans, match, 2))
+        for match in re.finditer(r"\b([A-Z]{1,3})\s+(?i:is\s+(?:a|an|the)\s+(?:diameter|radius|chord|line|segment|ray|angle|triangle))\b", text):
+            symbols.add(_add_match_group_span(spans, match))
+        direct_spans[paragraph._p] = spans
+
+    changed = 0
+    uncertain_by_question: dict[int, set[str]] = {}
+    for paragraph in body_paragraphs(doc):
+        section, question = context.get(paragraph._p, (None, None))
+        if question is None or section not in {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}:
+            continue
+        if paragraph._p.xpath(".//w:drawing | .//w:pict | .//w:object"):
+            continue
+        if any(child.tag not in {qn("w:pPr"), qn("w:r"), qn("m:oMath")} for child in paragraph._p):
+            continue
+        text = paragraph.text
+        if text.strip() in SECTION_MARKERS | {"@e@"}:
+            continue
+        spans = list(direct_spans.get(paragraph._p, []))
+        protected = [match.span(1) for match in PROTECTED_LABEL_RE.finditer(text)]
+        protected.extend(_measurement_unit_ranges(text, paragraph))
+        choice_label = re.match(r"^\s*([a-dA-D])(?:[.)]|\s*@)", text)
+        if choice_label:
+            protected.append(choice_label.span(1))
+
+        symbols = declared.get(question, set())
+        for symbol in sorted(symbols, key=len, reverse=True):
+            for match in re.finditer(rf"(?<![A-Za-z]){re.escape(symbol)}(?![A-Za-z])", text):
+                start, end = match.span()
+                if _range_contains(protected, start, end) or _looks_like_article(text, start, end):
+                    continue
+                spans.append((start, end))
+
+        geometry_context = bool(re.search(r"\b(?:point|line|segment|ray|angle|triangle|centre|center|vertex|chord|arc|circle)\b|[∠△Δ]", text, re.I))
+        if geometry_context:
+            for match in re.finditer(r"(?<![A-Za-z])([A-Z])(?![A-Za-z])", text):
+                start, end = match.span(1)
+                if any(left <= start and end <= right for left, right in spans + protected):
+                    continue
+                if _looks_like_article(text, start, end):
+                    continue
+                uncertain_by_question.setdefault(question, set()).add(match.group(1))
+
+        changed += _italicise_absolute_spans(paragraph, spans)
+
+    if changed:
+        findings.append(Finding(3, "fixed", f"Italicised {changed} high-confidence variable or geometry-label occurrence(s) while protecting recognised units and ordinary labels."))
+    else:
+        findings.append(Finding(3, "passed", "No high-confidence ordinary-text variable or geometry-label occurrences required italic formatting."))
+    for question, symbols in sorted(uncertain_by_question.items()):
+        findings.append(
+            Finding(
+                3,
+                "manual_review",
+                f"Possible geometry label(s) {', '.join(sorted(symbols))} could not be distinguished safely from ordinary text and were left unchanged.",
+                question,
+            )
+        )
 
 
 def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> None:
@@ -855,7 +1141,9 @@ def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> Non
         if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
             continue
         text = paragraph.text
-        ambiguous_scope = ("√" in text and ("/" in text or "^" in text)) or bool(re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text))
+        # Any radical left in ordinary text was not converted by the conservative
+        # parser and therefore requires an author to confirm its scope.
+        ambiguous_scope = "√" in text or bool(re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text))
         if SIMPLE_FRACTION_RE.search(text) and not ambiguous_scope:
             fraction_hits += 1
             findings.append(Finding(7, "manual_review", f"Slash-style fraction requires conversion to a stacked Word equation: {text.strip()!r}", question, index))
@@ -929,6 +1217,44 @@ def _word_text_run(text: str, run_properties) -> OxmlElement:
     return run
 
 
+def _inline_radical_spans(text: str) -> list[tuple[int, int]]:
+    """Find self-contained radicals whose scope is explicit in ordinary text."""
+    spans: list[tuple[int, int]] = []
+    for marker in re.finditer("√", text):
+        start = marker.start()
+        if text[:start].rstrip().endswith("/"):
+            continue
+        cursor = marker.end()
+        if cursor >= len(text):
+            continue
+        if text[cursor] == "(":
+            depth = 0
+            end = None
+            for index in range(cursor, len(text)):
+                if text[index] == "(":
+                    depth += 1
+                elif text[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = index + 1
+                        break
+            if end is not None:
+                spans.append((start, end))
+            continue
+        number = re.match(r"\d+(?:\.\d+)?", text[cursor:])
+        if not number:
+            continue
+        end = cursor + number.end()
+        if text[end:end + 1] in {"/", "^", "²", "³"}:
+            continue
+        spans.append((start, end))
+    return spans
+
+
+def _overlaps(span: tuple[int, int], others: list[tuple[int, int]]) -> bool:
+    return any(span[0] < right and span[1] > left for left, right in others)
+
+
 def _convert_explicit_math(doc: _Document, findings: list[Finding]) -> None:
     context = _section_for_paragraphs(doc)
     atom = r"(?:\d+(?:\.\d+)?|[A-Za-z](?![A-Za-z])|[²³=+−\-×*÷/()√^])"
@@ -938,10 +1264,11 @@ def _convert_explicit_math(doc: _Document, findings: list[Finding]) -> None:
         section, question = context.get(paragraph._p, (None, None))
         if section not in {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}:
             continue
-        # Do not flatten existing equations, objects, hyperlinks or complex runs.
-        if _has_embedded_content(paragraph):
+        # Existing equations may coexist with convertible ordinary text. Drawings,
+        # objects and hyperlinks still require a human-safe edit.
+        if paragraph._p.xpath(".//w:drawing | .//w:pict | .//w:object"):
             continue
-        if any(child.tag not in {qn('w:pPr'), qn('w:r')} for child in paragraph._p) or any(
+        if any(child.tag not in {qn('w:pPr'), qn('w:r'), qn('m:oMath')} for child in paragraph._p) or any(
             child.tag not in {qn('w:rPr'), qn('w:t')} for r in paragraph.runs for child in r._r
         ):
             continue
@@ -952,21 +1279,41 @@ def _convert_explicit_math(doc: _Document, findings: list[Finding]) -> None:
         choice = TAGGED_CHOICE_RE.fullmatch(text)
         if choice:
             expression = choice.group(2).strip()
-            expression = re.sub(r"\s+(?:units|cm|mm|km|m)\s*$", "", expression)
+            expression = re.sub(r"\s+(?:units?|litres?|liters?|cm|mm|km|m|kg|g|mL|L)\s*$", "", expression, flags=re.I)
             start = text.find(expression, len(choice.group(1)))
             if re.search(r"[²³√=+−×÷/^]|\d\s*\(", expression):
-                spans = [(start, start + len(expression))]
+                try:
+                    parse_safe_math(expression)
+                    spans = [(start, start + len(expression))]
+                except ValueError:
+                    spans = [(start + left, start + right) for left, right in _inline_radical_spans(expression)]
+                    for match in fraction.finditer(expression):
+                        candidate = (start + match.start(), start + match.end())
+                        if not _overlaps(candidate, spans):
+                            spans.append(candidate)
         else:
             spans = [m.span() for m in assignment.finditer(text)]
             if not spans and re.fullmatch(r"\s*(?:\([a-z]\)\s*)?[\dA-Za-z²³√=+−\-×*÷/()^ .]+\s*", text) and not re.search(r"[A-Za-z]{2}", text) and re.search(r"[²³√=+−×÷/]", text):
                 start = re.match(r"\s*(?:\([a-z]\)\s*)?", text).end()
                 spans = [(start, len(text.rstrip()))]
-            if not spans:
-                spans = [m.span() for m in fraction.finditer(text)]
+            for radical_span in _inline_radical_spans(text):
+                if not _overlaps(radical_span, spans):
+                    spans.append(radical_span)
+            for match in fraction.finditer(text):
+                fraction_span = match.span()
+                if not _overlaps(fraction_span, spans):
+                    spans.append(fraction_span)
         for start, end in reversed(spans):
             expression = text[start:end].strip()
-            # A fraction may be part of a date, ratio label or an ambiguous larger expression.
-            if '/' in expression and (re.search(r"[/\w]", text[max(0, start - 1):start]) or re.match(r"\s*[A-Za-z(\/^²³]", text[end:])):
+            # A literal space after a simple slash fraction ends the denominator.
+            # Without a space, an attached variable or bracket remains ambiguous.
+            immediate_after = text[end:end + 1]
+            if '/' in expression and (
+                re.search(r"[/\w]", text[max(0, start - 1):start])
+                or text[:start].rstrip().endswith("√")
+                or immediate_after in {"/", "(", "^", "²", "³"}
+                or bool(immediate_after and immediate_after.isalpha())
+            ):
                 findings.append(Finding(2, "manual_review", f"Preserved ambiguous fraction context: {expression!r}. Use Word Equation Editor to specify its meaning.", question))
                 continue
             try:
@@ -1297,9 +1644,10 @@ def process_docx(
         _audit_question_types(doc, findings, fix_mismatches=options.processing_mode == "images_math")
         if options.processing_mode == "images_math":
             _remove_empty_scripts(doc, findings)
+            _convert_rupee_symbols(doc, findings)
             _repair_spacing(doc, findings)
-            _repair_italics(doc, findings)
             _convert_explicit_math(doc, findings)
+            _repair_italics(doc, findings)
             _equation_and_fraction_audit(doc, findings)
             _preserve_table_formatting(doc, findings)
     else:
@@ -1308,11 +1656,12 @@ def process_docx(
         _normalise_choices(doc, findings)
         _remove_bold_from_questions_and_solutions(doc, findings)
         _remove_empty_scripts(doc, findings)
+        _convert_rupee_symbols(doc, findings)
         _repair_spacing(doc, findings)
-        _repair_italics(doc, findings)
         _split_answers(doc, findings)
         _normalise_subparts(doc, findings)
         _convert_explicit_math(doc, findings)
+        _repair_italics(doc, findings)
         _equation_and_fraction_audit(doc, findings)
         _audit_assertion_reason(doc, findings)
         _preserve_table_formatting(doc, findings)

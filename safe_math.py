@@ -19,8 +19,12 @@ def run(text):
 
 
 def parse(expression):
-    # Never interpret adjacent letters as multiplication, or guess slash scope.
-    if re.search(r'[A-Za-z]{2}|/.*[/]|/\s*\d+\s*[A-Za-z(]', expression):
+    # A space after a simple slash denominator ends the fraction. Without that
+    # boundary, forms such as 1/2r remain ambiguous; use 1/(2r) or (1/2)r.
+    ambiguous_simple_denominator = re.search(
+        r'/\s*(?:\d+(?:\.\d+)?|[A-Za-z])(?=[A-Za-z(])', expression
+    )
+    if re.search(r'[A-Za-z]{2}|/.*[/]', expression) or ambiguous_simple_denominator:
         raise ValueError('Ambiguous letters or fraction scope')
     tokens = re.findall(r'\d+(?:\.\d+)?|[A-Za-z]|[²³]|[=+−\-×*÷/()√^]', expression)
     if ''.join(tokens) != re.sub(r'\s+', '', expression):
