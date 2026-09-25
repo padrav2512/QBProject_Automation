@@ -58,7 +58,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID.startswith("2026.09.25-authoring-rules-v12")
+    assert PROCESSOR_BUILD_ID == "2026.09.25-processing-sections-v13"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -935,6 +935,92 @@ def test_question_type_is_corrected_only_when_structure_is_unambiguous(tmp_path:
     assert preserved_texts.count("@Type: MCQ@") == 2
     mismatches = [finding for finding in preserved.findings if finding.rule == 12 and finding.status == "manual_review"]
     assert {finding.question for finding in mismatches} == {1, 2, 3}
+
+
+def test_independent_processing_sections_change_only_selected_content(tmp_path: Path):
+    picture = tmp_path / "diagram.png"
+    Image.new("RGB", (40, 30), "white").save(picture)
+
+    tagged_source = tmp_path / "tagged_sections.docx"
+    tagged = Document()
+    for text in [
+        "@Question: 1@", "@Type: FIB@", "@Question id: project13_q1@", "@New snippet id: 13001@",
+        "@Difficulty level: Easy@", "@Objective: Application@", "@Question:@",
+        "Find the roots of the equation x²−25=0.",
+    ]:
+        tagged.add_paragraph(text)
+    tagged.add_picture(str(picture))
+    for text in ["@e@", "@Answers:@", "5, -5", "@e@", "@Solution:@", "@e@"]:
+        tagged.add_paragraph(text)
+    tagged.save(tagged_source)
+
+    image_only = process_docx(
+        tagged_source,
+        tagged_source.name,
+        ProcessorOptions(
+            processing_mode="custom",
+            add_cms_tags=False,
+            process_images=True,
+            format_math_structure=False,
+            project_question_prefix="fallback_q",
+        ),
+        tmp_path / "image_only",
+    )
+    image_xml = etree.fromstring(ZipFile(image_only.output_path).read("word/document.xml"))
+    assert not image_xml.xpath(".//m:oMath", namespaces={"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"})
+    assert image_xml.xpath(
+        ".//wp:docPr/@descr",
+        namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"},
+    ) == ["project13_q1_1.gif"]
+
+    math_only = process_docx(
+        tagged_source,
+        tagged_source.name,
+        ProcessorOptions(
+            processing_mode="custom",
+            add_cms_tags=False,
+            process_images=False,
+            format_math_structure=True,
+        ),
+        tmp_path / "math_only",
+    )
+    math_xml = etree.fromstring(ZipFile(math_only.output_path).read("word/document.xml"))
+    assert math_xml.xpath(".//m:oMath", namespaces={"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"})
+    assert math_only.image_count == 0
+    assert not math_xml.xpath(
+        ".//wp:docPr/@descr",
+        namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"},
+    )
+
+    plain_source = tmp_path / "plain_tags.docx"
+    plain = Document()
+    for text in ["Question 1: Easy, Application", "Question type: FIB", "What is 1/4 of 20?", "Answer: 5"]:
+        plain.add_paragraph(text)
+    plain.save(plain_source)
+    tags_only = process_docx(
+        plain_source,
+        plain_source.name,
+        ProcessorOptions(
+            processing_mode="custom",
+            add_cms_tags=True,
+            process_images=False,
+            format_math_structure=False,
+            project_question_prefix="project13_q",
+            start_snippet_id=13001,
+        ),
+        tmp_path / "tags_only",
+    )
+    tags_doc = Document(tags_only.output_path)
+    tags_text = "\n".join(paragraph.text for paragraph in tags_doc.paragraphs)
+    assert "@Question: 1@" in tags_text and "@Question id: project13_q1 @" in tags_text
+    assert "1/4" in tags_text
+    assert not tags_doc.element.xpath(".//m:oMath")
+    report = __import__("json").loads(tags_only.report_path.read_text(encoding="utf-8"))
+    assert report["selected_processing_sections"] == {
+        "add_cms_tags": True,
+        "process_images": False,
+        "format_math_structure": False,
+    }
 
 
 def test_legacy_vml_picture_is_extracted_and_receives_alt_text(tmp_path: Path):

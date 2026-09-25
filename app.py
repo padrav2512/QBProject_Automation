@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-authoring-rules-v12.1"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-processing-sections-v13"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -27,32 +27,39 @@ st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅"
 st.title("CMS DOCX Verification Processor")
 st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
 st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
-st.caption("Clearly grouped mathematical expressions become Word equations. Version 12 also converts spaced slash fractions, inline radicals and rupee amounts, and applies conservative variable and geometry-label italics while protecting recognised units. Ambiguous cases remain for review.")
+st.caption("Choose the processing sections you need. Mathematical changes remain conservative: clear expressions are converted and ambiguous cases are preserved for review.")
 
 with st.sidebar:
-    st.header("Processing mode")
-    processing_mode_label = st.radio(
-        "Choose what the app should change",
-        ["Full CMS preparation", "Images and Alt Text only", "Images, Alt Text and safe Math formatting"],
-        help="Use either image mode when the document already contains CMS tags and IDs. The safe Math option converts unambiguous mathematical forms and corrects a clearly mismatched FIB/MCQ Type tag; uncertain structures are reported.",
-    )
-    processing_mode = {
-        "Full CMS preparation": "full",
-        "Images and Alt Text only": "images_only",
-        "Images, Alt Text and safe Math formatting": "images_math",
-    }[processing_mode_label]
+    st.header("Processing sections")
+    with st.container(border=True):
+        add_cms_tags = st.checkbox("1. Add or repair CMS tags", value=True)
+        st.caption("Creates or repairs question records, metadata, IDs, snippet IDs, Choices/Answers/Solution sections and required `@e@` markers.")
+    with st.container(border=True):
+        process_images = st.checkbox("2. Handle images and Alt Text", value=True)
+        st.caption("Extracts images, assigns CMS filenames, reuses filenames for exact duplicates, writes Alt Text and creates the images ZIP.")
+    with st.container(border=True):
+        format_math_structure = st.checkbox("3. Check Math format and document structure", value=True)
+        st.caption("Applies safe Word equations, fractions, radicals, variable italics, spacing, rupee conversion and other deterministic formatting checks. Ambiguous cases are only reported.")
 
-    st.header("CMS numbering")
-    project_id = st.text_input(
-        "Project ID",
-        value="project",
-        help="In Full CMS preparation this is used for generated question IDs. In Images and Alt Text only it is only a fallback when no project ID can be read from existing Question id tags.",
-    )
-    if processing_mode == "full":
+    if not any((add_cms_tags, process_images, format_math_structure)):
+        st.warning("Select at least one processing section.")
+
+    if add_cms_tags or process_images:
+        st.header("CMS and image naming")
+        project_id = st.text_input(
+            "Project ID",
+            value="project",
+            help="Used for generated question IDs and image filenames. When tag insertion is off, a project ID already present in the document takes priority.",
+        )
+    else:
+        project_id = "project"
+
+    if add_cms_tags:
+        st.subheader("Question and snippet numbering")
         start_question = st.number_input("First question number", min_value=1, value=1, step=1)
         start_snippet_text = st.text_input("First snippet ID", value="", placeholder="Enter the first snippet ID")
         replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
-        st.header("Defaults for missing metadata")
+        st.subheader("Defaults for missing metadata")
         default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
         default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
         default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
@@ -64,17 +71,17 @@ with st.sidebar:
         default_difficulty = "Average"
         default_objective = "Application"
 
-    if processing_mode == "images_only":
-        st.info("Existing CMS text, tags, question IDs and snippet IDs will be preserved. The project ID in existing Question id tags takes priority over the fallback Project ID above.")
-    elif processing_mode == "images_math":
-        st.info("Existing question IDs and snippet IDs will be preserved. Images and Alt Text will be prepared, unambiguous mathematical forms will be converted to native Word equations, and a clearly mismatched FIB/MCQ Type tag will be corrected. Uncertain expressions or question structures will be reported for review.")
+    if not add_cms_tags and process_images:
+        st.info("Existing CMS tags and IDs will be preserved. A project ID found in existing Question id tags takes priority over the Project ID entered above.")
+    if not format_math_structure:
+        st.info("Math and document-formatting changes are off. Existing equations, mathematical text, italics, bold text and spacing will be preserved.")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
 st.info("Upload a quality-checked DOCX, process it, and download all three outputs before closing the page.")
 
 uploaded = st.file_uploader("Upload a Word document", type=["docx"], accept_multiple_files=False)
 
-if processing_mode == "full":
+if add_cms_tags:
     with st.expander("Input format — no CMS tags needed"):
         st.write("Use ordinary text in Word. Put each heading, option and answer on its own paragraph (Enter). The app adds CMS tags to the output automatically.")
         st.code("""Question 26: Average, Comprehension
@@ -102,8 +109,11 @@ if uploaded is not None:
     if size_mb > max_mb:
         st.error(f"The file exceeds the configured {max_mb} MB upload limit.")
     elif st.button("Process document", type="primary", use_container_width=True):
+        if not any((add_cms_tags, process_images, format_math_structure)):
+            st.error("Select at least one processing section before processing the document.")
+            st.stop()
         start_snippet = int(start_snippet_text.strip()) if start_snippet_text.strip().isdigit() and int(start_snippet_text.strip()) > 0 else None
-        if processing_mode == "full" and start_snippet is None:
+        if add_cms_tags and start_snippet is None:
             st.error("Enter a valid positive First snippet ID before processing the document.")
             st.stop()
         options = ProcessorOptions(
@@ -114,7 +124,10 @@ if uploaded is not None:
             default_difficulty=default_difficulty,
             default_objective=default_objective,
             replace_existing_ids=replace_ids,
-            processing_mode=processing_mode,
+            processing_mode="custom",
+            add_cms_tags=add_cms_tags,
+            process_images=process_images,
+            format_math_structure=format_math_structure,
         )
         try:
             with st.spinner("Processing the Word document…"):
@@ -123,12 +136,14 @@ if uploaded is not None:
             st.exception(exc)
         else:
             if result.question_count:
-                if processing_mode == "images_only":
-                    st.success("Image filenames and Alt Text are ready. Download the updated DOCX, images ZIP and audit report below.")
-                elif processing_mode == "images_math":
-                    st.success("Image filenames, Alt Text and safe mathematical formatting are ready. Download the updated DOCX, images ZIP and audit report below.")
-                else:
-                    st.success("The document is ready. Download the processed DOCX, images ZIP and audit report below.")
+                completed_sections = []
+                if add_cms_tags:
+                    completed_sections.append("CMS tags")
+                if process_images:
+                    completed_sections.append("images and Alt Text")
+                if format_math_structure:
+                    completed_sections.append("Math and document formatting")
+                st.success(f"Processing is complete for: {', '.join(completed_sections)}. Download the available outputs below.")
             else:
                 st.error("No question headings were detected, so CMS records and tags were not created. Review the verification report and correct the question-heading format before downloading a CMS-ready document.")
             col1, col2, col3, col4 = st.columns(4)
@@ -147,10 +162,14 @@ if uploaded is not None:
             report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
             effective_project_id = report_data.get("effective_project_id") or project_id.strip() or "project"
             output_suffix = {
-                "images_only": "Images_Alt_Text_Ready",
-                "images_math": "Images_Alt_Text_Math_Ready",
-                "full": "CMS_Verification_Ready",
-            }[processing_mode]
+                (True, True, True): "CMS_Verification_Ready",
+                (True, False, False): "CMS_Tags_Ready",
+                (False, True, False): "Images_Alt_Text_Ready",
+                (False, False, True): "Math_Structure_Ready",
+                (True, True, False): "CMS_Tags_Images_Ready",
+                (True, False, True): "CMS_Tags_Math_Ready",
+                (False, True, True): "Images_Alt_Text_Math_Ready",
+            }[(add_cms_tags, process_images, format_math_structure)]
             output_download_name = f"{Path(uploaded.name).stem}_{output_suffix}.docx"
             col_doc, col_images, col_report = st.columns(3)
             if result.question_count:
@@ -164,14 +183,17 @@ if uploaded is not None:
                 )
             else:
                 col_doc.caption("Processed DOCX unavailable because no questions were detected.")
-            col_images.download_button(
-                "Download images ZIP",
-                data=result.images_zip_path.read_bytes(),
-                file_name=f"{effective_project_id}_images.zip",
-                mime="application/zip",
-                use_container_width=True,
-                on_click="ignore",
-            )
+            if process_images:
+                col_images.download_button(
+                    "Download images ZIP",
+                    data=result.images_zip_path.read_bytes(),
+                    file_name=f"{effective_project_id}_images.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    on_click="ignore",
+                )
+            else:
+                col_images.caption("Images ZIP not created because image handling was not selected.")
             col_report.download_button(
                 "Download JSON audit report",
                 data=json.dumps(report_data, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -224,20 +246,30 @@ st.divider()
 with st.expander("What the app checks"):
     st.markdown(
         """
-1. Removes bold only when an entire Question, Choices or Solution block is bold; selective bold emphasis is preserved.
-2. Preserves native Word equations, converts unambiguous radical or simple-fraction assignments, and flags possible equation images or expressions with uncertain mathematical scope.
-3. Preserves author-supplied italics in text and native equations. Authors decide the formatting of variables, geometry labels and units.
-4. Removes completely blank equation objects, blank exponent/subscript templates and repeated spaces.
-5. Normalises spaces around `=`, `+`, `−`, `×` and `÷`.
-6. Adds a space after commas.
-7. Converts slash-style fractions into native stacked Word equations and flags only cases that cannot be transformed safely.
-8. Places labelled answers on separate lines when they are combined in one paragraph.
-9. Normalises top-level subpart labels where the structure is unambiguous.
-10. Checks and normalises Assertion–Reason wording and choice structure without guessing the correct answer.
-11. Preserves table formatting. Authors must identify and bold any header rows or header columns in the source document.
-12. Converts `₹50`, `₹ 50` and similar numeric amounts to `Rs 50`.
-13. Italicises high-confidence variables and geometry labels while protecting articles, option labels and recognised measurement units; uncertain labels are reported.
+**1. Add or repair CMS tags**
 
-The input does not need CMS tags. The app first identifies the question and section structure, then creates or repairs the confirmed CMS markers, sequential question IDs, sequential snippet IDs and required `@e@` delimiters. Metadata and section tag paragraphs are bold, matching the approved CMS document convention; choice markers, `@correct answer@` and `@e@` remain ordinary text. It validates the generated structure afterwards.
+- Identifies plain or already-tagged question records.
+- Creates or repairs CMS metadata, sequential question IDs, sequential snippet IDs, section markers and required `@e@` delimiters.
+- Builds Choices or Answers blocks from unambiguous author input and corrects a clearly mismatched MCQ/FIB Type tag.
+- Applies bold formatting to CMS metadata and section tags only.
+
+**2. Handle images and Alt Text**
+
+- Extracts question, choice and solution images into GIF files.
+- Applies the agreed CMS filename and Word Alt Text conventions.
+- Reuses the first filename when the same image occurs more than once in the same CMS image area.
+- Flags unassigned images and images in an FIB Answers block for manual review.
+
+**3. Check Math format and document structure**
+
+- Preserves existing native Word equations and converts unambiguous fractions, radicals, exponents and equations into native Word equations.
+- Places visible spacing correctly at prose-to-equation boundaries and preserves surrounding text.
+- Italicises high-confidence variables and geometry labels while protecting articles, option labels and recognised units.
+- Removes blank equation or exponent templates, repairs deterministic spacing, and converts numeric rupee amounts to `Rs`.
+- Removes bold only when an entire Question, Choices or Solution block is bold; selective emphasis is preserved.
+- Normalises unambiguous answer lines, subpart labels and Assertion–Reason structure, while preserving table formatting.
+- Leaves expressions whose mathematical meaning is uncertain unchanged and lists them under Action required.
+
+Only the selected sections change the document. The verification report records every applied fix and every unresolved manual check.
 """
     )

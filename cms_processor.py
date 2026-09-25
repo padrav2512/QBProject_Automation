@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import uuid
+import zipfile
 from copy import deepcopy
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -20,11 +21,11 @@ from docx.oxml.ns import qn
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 
-from image_pipeline import process_document_images
+from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-authoring-rules-v12.1"
+PROCESSOR_BUILD_ID = "2026.09.25-processing-sections-v13"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -100,6 +101,9 @@ class ProcessorOptions:
     default_objective: str = "Application"
     replace_existing_ids: bool = True
     processing_mode: str = "full"
+    add_cms_tags: bool | None = None
+    process_images: bool | None = None
+    format_math_structure: bool | None = None
 
 
 @dataclass
@@ -409,7 +413,7 @@ def _audit_question_types(doc: _Document, findings: list[Finding], *, fix_mismat
             _set_text_preserving_run_format(type_paragraph, f"@Type: {expected_type}@")
             findings.append(Finding(12, "fixed", f"Changed @Type: {declared_type}@ to @Type: {expected_type}@ because the record contains {structure_description}.", question_number))
         else:
-            findings.append(Finding(12, "manual_review", f"The Type tag says {declared_type}, but the structure indicates {expected_type} because the record contains {structure_description}. Images and Alt Text only mode preserved the tag unchanged.", question_number))
+            findings.append(Finding(12, "manual_review", f"The Type tag says {declared_type}, but the structure indicates {expected_type} because the record contains {structure_description}. The selected processing sections preserved the tag unchanged.", question_number))
 
     if checked and not issues:
         findings.append(Finding(12, "passed", f"Question Type tags matched the detected Answers/Choices structure in {checked} record(s)."))
@@ -1706,6 +1710,59 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
         findings.append(Finding(0, "fixed", f"Normalised {changed} MCQ option marker(s)."))
 
 
+def _selected_processing_sections(options: ProcessorOptions) -> tuple[bool, bool, bool]:
+    """Resolve the new independent switches while retaining old API callers."""
+    if any(
+        value is not None
+        for value in (options.add_cms_tags, options.process_images, options.format_math_structure)
+    ):
+        return (
+            bool(options.add_cms_tags),
+            bool(options.process_images),
+            bool(options.format_math_structure),
+        )
+    legacy = {
+        "full": (True, True, True),
+        "images_only": (False, True, False),
+        "images_math": (False, True, True),
+    }
+    try:
+        return legacy[options.processing_mode]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported processing mode: {options.processing_mode!r}") from exc
+
+
+def _output_suffix(add_cms_tags: bool, process_images: bool, format_math_structure: bool) -> str:
+    selected = (add_cms_tags, process_images, format_math_structure)
+    known = {
+        (True, True, True): "CMS_Verification_Ready",
+        (True, False, False): "CMS_Tags_Ready",
+        (False, True, False): "Images_Alt_Text_Ready",
+        (False, False, True): "Math_Structure_Ready",
+        (True, True, False): "CMS_Tags_Images_Ready",
+        (True, False, True): "CMS_Tags_Math_Ready",
+        (False, True, True): "Images_Alt_Text_Math_Ready",
+    }
+    if selected == (False, False, False):
+        raise ValueError("Select at least one processing section.")
+    return known[selected]
+
+
+def _empty_image_result(run_images_dir: Path, images_zip_path: Path) -> ImagePipelineResult:
+    """Create stable empty image artifacts when image handling is not selected."""
+    run_images_dir.mkdir(parents=True, exist_ok=True)
+    manifest_json = run_images_dir / "image_manifest.json"
+    manifest_csv = run_images_dir / "image_manifest.csv"
+    manifest_json.write_text(json.dumps({"images": [], "warnings": []}, indent=2), encoding="utf-8")
+    manifest_csv.write_text(
+        "question,section,choice,section_index,filename,original_part,width_px,height_px,sha256,visual_sha256,duplicate_of,alt_text_written\n",
+        encoding="utf-8",
+    )
+    with zipfile.ZipFile(images_zip_path, "w", compression=zipfile.ZIP_DEFLATED):
+        pass
+    return ImagePipelineResult([], [], manifest_json, manifest_csv, images_zip_path)
+
+
 def process_docx(
     source: bytes | str | Path,
     original_filename: str,
@@ -1736,14 +1793,18 @@ def process_docx(
     doc = Document(original_path)
     original_equations = _equation_inventory(doc)
     findings: list[Finding] = []
-    preserve_cms_mode = options.processing_mode in {"images_only", "images_math"}
-    if preserve_cms_mode:
+    add_cms_tags, process_images, format_math_structure = _selected_processing_sections(options)
+    suffix = _output_suffix(add_cms_tags, process_images, format_math_structure)
+    preserve_cms_mode = not add_cms_tags
+
+    if add_cms_tags:
+        question_count = _ensure_cms_records(doc, options, findings)
+        _audit_question_types(doc, findings, fix_mismatches=True)
+        _normalise_choices(doc, findings)
+    else:
         question_count = len(_question_starts(doc))
         if question_count:
-            if options.processing_mode == "images_only":
-                findings.append(Finding(0, "passed", "Images-only mode preserved the existing document text, CMS tags, metadata and formatting."))
-            else:
-                findings.append(Finding(0, "passed", "Safe-Math image mode preserved existing question IDs, snippet IDs and document structure; only a deterministically mismatched Type tag may be corrected."))
+            findings.append(Finding(0, "passed", "CMS tag insertion was not selected; existing question IDs, snippet IDs and CMS record structure were preserved."))
             for paragraph, number in _question_starts(doc):
                 suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
                 if suffix_match:
@@ -1751,26 +1812,15 @@ def process_docx(
                         Finding(
                             0,
                             "manual_review",
-                            f"The question heading contains text after its closing tag: {suffix_match.group(2).strip()!r}. It was counted as a question and preserved in the selected existing-CMS mode; move the text into the Question block before CMS upload.",
+                            f"The question heading contains text after its closing tag: {suffix_match.group(2).strip()!r}. It was counted as a question and preserved because CMS tag insertion was not selected; move the text into the Question block before CMS upload.",
                             number,
                         )
                     )
         else:
-            findings.append(Finding(0, "manual_review", "No @Question: n@ records were detected. Images cannot be assigned reliable CMS filenames without existing question tags."))
-        _audit_question_types(doc, findings, fix_mismatches=options.processing_mode == "images_math")
-        if options.processing_mode == "images_math":
-            _remove_empty_scripts(doc, findings)
-            _convert_rupee_symbols(doc, findings)
-            _repair_spacing(doc, findings)
-            _convert_explicit_math(doc, findings)
-            _normalise_native_equation_boundaries(doc, findings)
-            _repair_italics(doc, findings)
-            _equation_and_fraction_audit(doc, findings)
-            _preserve_table_formatting(doc, findings)
-    else:
-        question_count = _ensure_cms_records(doc, options, findings)
-        _audit_question_types(doc, findings, fix_mismatches=True)
-        _normalise_choices(doc, findings)
+            findings.append(Finding(0, "manual_review", "No tagged or standard plain-text question headings were detected."))
+        _audit_question_types(doc, findings, fix_mismatches=format_math_structure)
+
+    if format_math_structure:
         _remove_bold_from_questions_and_solutions(doc, findings)
         _remove_empty_scripts(doc, findings)
         _convert_rupee_symbols(doc, findings)
@@ -1783,6 +1833,8 @@ def process_docx(
         _equation_and_fraction_audit(doc, findings)
         _audit_assertion_reason(doc, findings)
         _preserve_table_formatting(doc, findings)
+
+    if add_cms_tags:
         _bold_cms_tags(doc, findings)
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
@@ -1800,21 +1852,20 @@ def process_docx(
             findings.append(Finding(0, "passed", f"No project ID could be derived from existing Question id tags; used fallback Project ID {project_id}."))
     run_images_dir = images_root / run_id
     images_zip_path = packages / f"{run_id}_{project_id}_images.zip"
-    image_result = process_document_images(doc, project_id, run_images_dir, images_zip_path)
-    for warning in image_result.warnings:
-        findings.append(Finding(0, "manual_review", warning))
-    if image_result.artifacts:
-        duplicate_count = sum(bool(item.duplicate_of) for item in image_result.artifacts)
-        duplicate_note = f" Reused canonical filenames for {duplicate_count} exact duplicate occurrence(s)." if duplicate_count else ""
-        findings.append(Finding(0, "fixed", f"Extracted {len(image_result.artifacts)} image occurrence(s), applied CMS filenames and wrote resolved filenames into Word Alt Text.{duplicate_note}"))
+    if process_images:
+        image_result = process_document_images(doc, project_id, run_images_dir, images_zip_path)
+        for warning in image_result.warnings:
+            findings.append(Finding(0, "manual_review", warning))
+        if image_result.artifacts:
+            duplicate_count = sum(bool(item.duplicate_of) for item in image_result.artifacts)
+            duplicate_note = f" Reused canonical filenames for {duplicate_count} exact duplicate occurrence(s)." if duplicate_count else ""
+            findings.append(Finding(0, "fixed", f"Extracted {len(image_result.artifacts)} image occurrence(s), applied CMS filenames and wrote resolved filenames into Word Alt Text.{duplicate_note}"))
+        else:
+            findings.append(Finding(0, "passed", "No embedded images were detected."))
     else:
-        findings.append(Finding(0, "passed", "No embedded images were detected."))
+        image_result = _empty_image_result(run_images_dir, images_zip_path)
+        findings.append(Finding(0, "passed", "Image handling was not selected; embedded images and existing Alt Text were preserved unchanged."))
 
-    suffix = {
-        "images_only": "Images_Alt_Text_Ready",
-        "images_math": "Images_Alt_Text_Math_Ready",
-        "full": "CMS_Verification_Ready",
-    }[options.processing_mode]
     output_name = f"{Path(safe_name).stem}_{suffix}.docx"
     output_path = processed / f"{run_id}_{output_name}"
     doc.core_properties.title = f"{Path(safe_name).stem} - CMS Verification Ready"
@@ -1839,6 +1890,11 @@ def process_docx(
         "manual_review_count": manual_review_count,
         "verification_status": verification_status,
         "options": asdict(options),
+        "selected_processing_sections": {
+            "add_cms_tags": add_cms_tags,
+            "process_images": process_images,
+            "format_math_structure": format_math_structure,
+        },
         "effective_project_id": project_id,
         "findings": [asdict(f) for f in findings],
     }
