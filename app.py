@@ -12,7 +12,7 @@ import cms_processor as _cms_processor
 from heymath_cms_mapper import HeyMathCmsMapper
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-mapping-workflow-v14"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-regression-fixes-v14.1"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:

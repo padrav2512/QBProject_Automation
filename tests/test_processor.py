@@ -59,7 +59,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-mapping-workflow-v14"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-regression-fixes-v14.1"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -151,22 +151,22 @@ def test_v12_inline_equation_spacing_superscript_and_variable_style(tmp_path: Pa
     out = Document(result.output_path)
 
     equation_paragraph = next(p for p in out.paragraphs if "Find the roots" in p.text)
-    x_styles = [
-        node.get(qn("m:val"))
-        for node in equation_paragraph._p.xpath(".//m:r[m:t='x']/m:rPr/m:sty")
-    ]
-    assert x_styles == ["i"]
+    assert not equation_paragraph._p.xpath(".//m:oMath")
+    x_runs = [run for run in equation_paragraph.runs if "x" in run.text]
+    assert x_runs and all(run.italic is True for run in x_runs)
 
     fraction_paragraph = next(p for p in out.paragraphs if "Riya drank" in p.text)
     fraction_equations = fraction_paragraph._p.xpath(".//m:oMath[m:f]")
     assert len(fraction_equations) == 2
     for equation in fraction_equations:
-        direct_text = [
-            run.find(qn("m:t")).text
+        direct_nodes = [
+            run.find(qn("m:t"))
             for run in equation.findall(qn("m:r"))
             if run.find(qn("m:t")) is not None
         ]
-        assert direct_text[0] == " " and direct_text[-1] == " "
+        assert direct_nodes[0].text == " " and direct_nodes[-1].text == " "
+        assert direct_nodes[0].get(qn("xml:space")) == "preserve"
+        assert direct_nodes[-1].get(qn("xml:space")) == "preserve"
 
     radical_paragraph = next(p for p in out.paragraphs if "Find the value of" in p.text)
     assert radical_paragraph._p.xpath(".//m:rad//m:sSup[m:e//m:t='r'][m:sup//m:t='3']")
@@ -174,6 +174,59 @@ def test_v12_inline_equation_spacing_superscript_and_variable_style(tmp_path: Pa
         finding.status == "manual_review" and finding.question == 3 and "radical" in finding.message.lower()
         for finding in result.findings
     )
+
+
+def test_multiline_plain_metadata_is_used_once_and_algebra_stays_as_text(tmp_path: Path):
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    metadata = doc.add_paragraph()
+    metadata.add_run("Difficulty level:").bold = True
+    metadata.add_run(" Easy\n")
+    metadata.add_run("Objective:").bold = True
+    metadata.add_run(" Application\n")
+    metadata.add_run("Question type:").bold = True
+    metadata.add_run(" FIB")
+    doc.add_paragraph("If 3x+5=20, find the value of x.")
+    doc.add_paragraph("Answer: 5")
+    source = tmp_path / "multiline_metadata.docx"
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    output = Document(result.output_path)
+    texts = [paragraph.text for paragraph in output.paragraphs]
+
+    assert texts.count("@Type: FIB@") == 1
+    assert texts.count("@Difficulty level: Easy @") == 1
+    assert texts.count("@Objective: Application @") == 1
+    assert not any(text.startswith(("Difficulty level:", "Objective:", "Question type:")) for text in texts)
+    algebra = next(paragraph for paragraph in output.paragraphs if paragraph.text.startswith("If 3"))
+    assert not algebra._p.xpath(".//m:oMath")
+    x_runs = [run for run in algebra.runs if "x" in run.text]
+    assert x_runs and all(run.italic is True for run in x_runs)
+
+
+def test_assertion_and_reason_labels_are_not_auto_italicised(tmp_path: Path):
+    doc = Document()
+    for text in [
+        "Question 1: Easy, Comprehension",
+        "Question type: FIB",
+        "Assertion (A): 5² = 25.",
+        "Reason (R): The exponent 2 means that 5 is multiplied by itself twice.",
+        "Answer: True",
+    ]:
+        doc.add_paragraph(text)
+    source = tmp_path / "assertion_reason_labels.docx"
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    output = Document(result.output_path)
+    assertion = next(paragraph for paragraph in output.paragraphs if paragraph.text.startswith("Assertion"))
+    reason = next(paragraph for paragraph in output.paragraphs if paragraph.text.startswith("Reason"))
+
+    for paragraph, label in ((assertion, "A"), (reason, "R")):
+        label_runs = [run for run in paragraph.runs if label in run.text]
+        assert label_runs
+        assert all(run.italic is not True for run in label_runs)
 
 
 @pytest.mark.parametrize("all_bold", [False, True])
@@ -990,7 +1043,10 @@ def test_independent_processing_sections_change_only_selected_content(tmp_path: 
         tmp_path / "math_only",
     )
     math_xml = etree.fromstring(ZipFile(math_only.output_path).read("word/document.xml"))
-    assert math_xml.xpath(".//m:oMath", namespaces={"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"})
+    assert not math_xml.xpath(".//m:oMath", namespaces={"m": "http://schemas.openxmlformats.org/officeDocument/2006/math"})
+    math_doc = Document(math_only.output_path)
+    algebra = next(paragraph for paragraph in math_doc.paragraphs if paragraph.text.startswith("Find the roots"))
+    assert all(run.italic is True for run in algebra.runs if "x" in run.text)
     assert math_only.image_count == 0
     assert not math_xml.xpath(
         ".//wp:docPr/@descr",

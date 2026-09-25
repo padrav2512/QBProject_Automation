@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-mapping-workflow-v14"
+PROCESSOR_BUILD_ID = "2026.09.25-regression-fixes-v14.1"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -337,15 +337,24 @@ def _block_paragraphs(start: Paragraph, next_start: Paragraph | None) -> list[Pa
 
 def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
     for p in block:
-        match = KNOWN_METADATA_RE.fullmatch(p.text.strip()) or PLAIN_METADATA_RE.fullmatch(p.text.strip())
-        field_name = match.group(1).casefold() if match else ""
-        if field_name == "difficulty":
-            field_name = "difficulty level"
-        elif field_name == "question type":
-            field_name = "type"
-        if match and field_name == name.casefold():
-            return match.group(2).strip()
+        for line in p.text.replace("\u00a0", " ").splitlines():
+            match = KNOWN_METADATA_RE.fullmatch(line.strip()) or PLAIN_METADATA_RE.fullmatch(line.strip())
+            field_name = match.group(1).casefold() if match else ""
+            if field_name == "difficulty":
+                field_name = "difficulty level"
+            elif field_name == "question type":
+                field_name = "type"
+            if match and field_name == name.casefold():
+                return match.group(2).strip()
     return None
+
+
+def _contains_only_metadata(paragraph: Paragraph) -> bool:
+    lines = [line.strip() for line in paragraph.text.replace("\u00a0", " ").splitlines() if line.strip()]
+    return bool(lines) and all(
+        KNOWN_METADATA_RE.fullmatch(line) or PLAIN_METADATA_RE.fullmatch(line)
+        for line in lines
+    )
 
 
 def _set_text_preserving_run_format(paragraph: Paragraph, text: str) -> None:
@@ -636,7 +645,7 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         snippet = str(options.start_snippet_id + ordinal) if options.replace_existing_ids or not existing_snippet else existing_snippet
 
         for paragraph in list(block[1:]):
-            if KNOWN_METADATA_RE.fullmatch(paragraph.text.strip()) or PLAIN_METADATA_RE.fullmatch(paragraph.text.strip()):
+            if _contains_only_metadata(paragraph):
                 _remove_paragraph(paragraph)
 
         cursor = start
@@ -984,6 +993,7 @@ VARIABLE_CUE_RE = re.compile(
     r"\b(?i:let|variable|value\s+of|solve\s+for|find|where|radius|diameter|length|breadth|height|distance|speed|time|mass)\s+([A-Za-z])\b",
 )
 PROTECTED_LABEL_RE = re.compile(r"\b(?i:option|choice|part|class)\s+([A-Da-d])\b")
+ASSERTION_REASON_LABEL_RE = re.compile(r"\b(?i:Assertion|Reason)\s*\(\s*([AR])\s*\)")
 UNIT_TOKENS = {"mm", "cm", "m", "km", "mg", "g", "kg", "ml", "l", "s", "min", "h"}
 
 
@@ -1093,8 +1103,11 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
         # A single letter touching a mathematical operator, digit or explicit
         # superscript is a high-confidence variable even when prose separates
         # it from cues such as "the equation".
+        protected_labels = [match.span(1) for match in ASSERTION_REASON_LABEL_RE.finditer(text)]
         for match in re.finditer(r"(?<![A-Za-z])([A-Za-z])(?![A-Za-z])", text):
             start, end = match.span(1)
+            if _range_contains(protected_labels, start, end):
+                continue
             left = text[start - 1:start]
             right = text[end:end + 1]
             math_adjacent = (
@@ -1127,6 +1140,7 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
             continue
         spans = list(direct_spans.get(paragraph._p, []))
         protected = [match.span(1) for match in PROTECTED_LABEL_RE.finditer(text)]
+        protected.extend(match.span(1) for match in ASSERTION_REASON_LABEL_RE.finditer(text))
         protected.extend(_measurement_unit_ranges(text, paragraph))
         choice_label = re.match(r"^\s*([a-dA-D])(?:[.)]|\s*@)", text)
         if choice_label:
@@ -1426,10 +1440,7 @@ def _convert_explicit_math(doc: _Document, findings: list[Finding]) -> None:
                             spans.append(candidate)
         else:
             spans = [m.span() for m in assignment.finditer(text)]
-            for equality_span in _inline_equality_spans(text):
-                if not _overlaps(equality_span, spans):
-                    spans.append(equality_span)
-            if not spans and re.fullmatch(r"\s*(?:\([a-z]\)\s*)?[\dA-Za-z²³√=+−\-×*÷/()^ .]+\s*", text) and not re.search(r"[A-Za-z]{2}", text) and re.search(r"[²³√=+−×÷/]", text):
+            if not spans and "=" not in text and re.fullmatch(r"\s*(?:\([a-z]\)\s*)?[\dA-Za-z²³√=+−\-×*÷/()^ .]+\s*", text) and not re.search(r"[A-Za-z]{2}", text) and re.search(r"[²³√=+−×÷/]", text):
                 start = re.match(r"\s*(?:\([a-z]\)\s*)?", text).end()
                 spans = [(start, len(text.rstrip()))]
             for radical_span in _inline_radical_spans(text):
