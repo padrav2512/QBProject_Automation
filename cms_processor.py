@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-block-numbering-errors-v14.6"
+PROCESSOR_BUILD_ID = "2026.09.25-preserve-existing-snippets-v14.7"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -41,11 +41,11 @@ PLAIN_QUESTION_START_RE = re.compile(
     re.I,
 )
 KNOWN_METADATA_RE = re.compile(
-    r"^@(Type|Question id|New snippet id|Difficulty level|Objective):\s*(.*?)\s*@$",
+    r"^@(Type|Question id|New snippet id|Snippet id|Difficulty level|Objective):\s*(.*?)\s*@$",
     re.I,
 )
 PLAIN_METADATA_RE = re.compile(
-    r"^(Type|Question type|Question id|New snippet id|Difficulty(?: level)?|Objective):\s*(.*?)\s*$",
+    r"^(Type|Question type|Question id|New snippet id|Snippet id|Difficulty(?: level)?|Objective):\s*(.*?)\s*$",
     re.I,
 )
 PLAIN_QUESTION_START_WITH_SUFFIX_RE = re.compile(
@@ -88,7 +88,7 @@ MCQ_ANSWER_RE = re.compile(
     re.I,
 )
 MAPPING_LABEL_RE = re.compile(r"^(Curriculum|Taxonomy)\s*:\s*(.*?)\s*$", re.I)
-SNIPPET_ID_RE = re.compile(r"^@?New snippet id\s*:\s*(\d+)\s*@?$", re.I)
+SNIPPET_ID_RE = re.compile(r"^@?(?:New snippet id|Snippet id)\s*:\s*(\d+)\s*@?$", re.I)
 DIFFICULTY_ALIASES = {
     "easy": "Easy",
     "medium": "Average",
@@ -411,9 +411,25 @@ def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
                 field_name = "difficulty level"
             elif field_name == "question type":
                 field_name = "type"
+            elif field_name == "snippet id":
+                field_name = "new snippet id"
             if match and field_name == name.casefold():
                 return match.group(2).strip()
     return None
+
+
+def document_has_complete_snippet_ids(data: bytes) -> bool:
+    """Return true when every detected source question already has a positive snippet ID."""
+    doc = Document(io.BytesIO(data))
+    starts = _question_starts(doc)
+    if not starts:
+        return False
+    for ordinal, (start, _) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        value = _metadata_value(_block_paragraphs(start, next_start), "New snippet id")
+        if not value or not value.isdigit() or int(value) <= 0:
+            return False
+    return True
 
 
 def _contains_only_metadata(paragraph: Paragraph) -> bool:

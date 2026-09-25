@@ -13,7 +13,7 @@ from heymath_cms_mapper import HeyMathCmsMapper
 from mapping_input import read_mapping_table, xlsx_sheet_names
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-block-numbering-errors-v14.6"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-preserve-existing-snippets-v14.7"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -22,6 +22,7 @@ if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUI
 
 ProcessorOptions = _cms_processor.ProcessorOptions
 process_docx_bytes = _cms_processor.process_docx_bytes
+document_has_complete_snippet_ids = _cms_processor.document_has_complete_snippet_ids
 
 
 @st.cache_resource
@@ -64,9 +65,14 @@ with st.sidebar:
 
     if add_cms_tags:
         start_question = st.number_input("First question number", min_value=1, value=1, step=1)
-        start_snippet_text = st.text_input("First snippet ID", value="", placeholder="Enter the first snippet ID")
+        start_snippet_text = st.text_input(
+            "First snippet ID",
+            value="",
+            placeholder="Needed only when snippet IDs must be generated",
+            help="Leave blank to preserve valid snippet IDs already present in every question. Enter a starting ID when IDs are missing or when replacement is selected.",
+        )
         with st.expander("ID replacement and missing-metadata defaults"):
-            replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
+            replace_ids = st.checkbox("Replace existing question and snippet IDs", value=False)
             default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
             default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
             default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
@@ -159,8 +165,16 @@ if uploaded is not None:
             st.stop()
         start_snippet = int(start_snippet_text.strip()) if start_snippet_text.strip().isdigit() and int(start_snippet_text.strip()) > 0 else None
         if add_cms_tags and start_snippet is None:
-            st.error("Enter a valid positive First snippet ID before processing the document.")
-            st.stop()
+            if replace_ids:
+                st.error("Enter a valid positive First snippet ID because replacement of existing IDs is selected.")
+                st.stop()
+            try:
+                complete_existing_snippets = document_has_complete_snippet_ids(uploaded.getvalue())
+            except Exception:
+                complete_existing_snippets = False
+            if not complete_existing_snippets:
+                st.error("Enter a valid positive First snippet ID because one or more questions do not contain an existing New snippet id or Snippet id.")
+                st.stop()
         options = ProcessorOptions(
             project_question_prefix=f"{project_id.strip().removesuffix('_q')}_q",
             start_question_number=int(start_question),

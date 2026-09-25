@@ -16,6 +16,10 @@ def test_app_renders_five_processing_sections_and_mapping_stage():
         "5. Prepare curriculum and taxonomy mapping data",
     ]
     assert all(checkbox.value for checkbox in app.sidebar.checkbox[:5])
+    assert any(
+        checkbox.label == "Replace existing question and snippet IDs" and checkbox.value is False
+        for checkbox in app.sidebar.checkbox
+    )
     assert [header.value for header in app.sidebar.header[:2]] == [
         "1. Choose processing",
         "2. CMS and image naming",

@@ -1,6 +1,7 @@
 from pathlib import Path
 from zipfile import ZipFile
 import csv
+import io
 import json
 
 from docx import Document
@@ -10,7 +11,7 @@ from lxml import etree
 from PIL import Image
 import pytest
 
-from cms_processor import PROCESSOR_BUILD_ID, ProcessorOptions, process_docx
+from cms_processor import PROCESSOR_BUILD_ID, ProcessorOptions, document_has_complete_snippet_ids, process_docx
 
 
 def add_radical_answer(paragraph):
@@ -23,6 +24,45 @@ def add_radical_answer(paragraph):
 
 def italicised_text(paragraph):
     return [(run.text, run.italic is True) for run in paragraph.runs if run.text]
+
+
+def test_plain_snippet_id_alias_is_detected_and_preserved(tmp_path: Path):
+    doc = Document()
+    doc.add_paragraph("Question 1: Easy, Application")
+    doc.add_paragraph("Question id: project10433_q1")
+    doc.add_paragraph("Snippet id: 219263")
+    doc.add_paragraph("Question type: FIB")
+    doc.add_paragraph("What is 2 + 3?")
+    doc.add_paragraph("Answer: 5")
+    buffer = io.BytesIO()
+    doc.save(buffer)
+
+    assert document_has_complete_snippet_ids(buffer.getvalue()) is True
+
+    source = tmp_path / "existing_snippet_alias.docx"
+    source.write_bytes(buffer.getvalue())
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(replace_existing_ids=False, start_snippet_id=1),
+        tmp_path / "storage",
+    )
+    output_texts = [paragraph.text for paragraph in Document(result.output_path).paragraphs]
+
+    assert "@New snippet id: 219263 @" in output_texts
+    assert "@Question id: project10433_q1 @" in output_texts
+
+
+def test_existing_snippet_preflight_rejects_a_question_without_an_id():
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    doc.add_paragraph("Snippet id: 219263")
+    doc.add_paragraph("Question 2")
+    doc.add_paragraph("What is 4 + 5?")
+    buffer = io.BytesIO()
+    doc.save(buffer)
+
+    assert document_has_complete_snippet_ids(buffer.getvalue()) is False
 
 
 def test_v12_authoring_rules(tmp_path: Path):
@@ -60,7 +100,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-block-numbering-errors-v14.6"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-preserve-existing-snippets-v14.7"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
