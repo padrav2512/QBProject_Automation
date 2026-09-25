@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-question-heading-notes-v14.5"
+PROCESSOR_BUILD_ID = "2026.09.25-block-numbering-errors-v14.6"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -314,11 +314,67 @@ def _question_starts(doc: _Document) -> list[tuple[Paragraph, int]]:
         if match is None:
             suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
             next_paragraph = next((candidate for candidate in paragraphs[index + 1 :] if candidate.text.strip()), None)
-            if suffix_match and next_paragraph is not None and _contains_only_metadata(next_paragraph):
+            if suffix_match and next_paragraph is not None and _metadata_prefix_length(next_paragraph.text) > 0:
                 match = suffix_match
         if match:
             starts.append((paragraph, int(match.group(1))))
     return starts
+
+
+def _audit_source_question_numbering(
+    doc: _Document,
+    starts: list[tuple[Paragraph, int]],
+    findings: list[Finding],
+) -> None:
+    """Block CMS-ready outputs when author question headings are not sequential."""
+    if not starts:
+        return
+    occurrences: dict[int, list[int]] = {}
+    source_numbers: list[int] = []
+    for detected_position, (_paragraph, number) in enumerate(starts, 1):
+        source_numbers.append(number)
+        occurrences.setdefault(number, []).append(detected_position)
+
+    errors = 0
+    for number, positions in sorted(occurrences.items()):
+        if len(positions) < 2:
+            continue
+        errors += 1
+        locations = ", ".join(str(value) for value in positions)
+        findings.append(
+            Finding(
+                15,
+                "manual_review",
+                f"Duplicate source question number {number} appears {len(positions)} times at detected question positions {locations}. Correct the source headings and reprocess; CMS-ready document, image and mapping downloads are blocked.",
+                number,
+            )
+        )
+
+    unique_numbers = sorted(occurrences)
+    if unique_numbers:
+        missing = [number for number in range(unique_numbers[0], unique_numbers[-1] + 1) if number not in occurrences]
+        if missing:
+            errors += 1
+            findings.append(
+                Finding(
+                    15,
+                    "manual_review",
+                    f"Source question numbering has a gap. Missing question number(s): {', '.join(map(str, missing))}. Correct the source headings and reprocess; CMS-ready downloads are blocked.",
+                )
+            )
+
+    if any(current < previous for previous, current in zip(source_numbers, source_numbers[1:])):
+        errors += 1
+        findings.append(
+            Finding(
+                15,
+                "manual_review",
+                f"Source question headings are out of order: {', '.join(map(str, source_numbers))}. Correct their order and reprocess; CMS-ready downloads are blocked.",
+            )
+        )
+
+    if not errors:
+        findings.append(Finding(15, "passed", "Source question headings are unique, sequential and in ascending order."))
 
 
 def _canonicalise_section_labels(doc: _Document, findings: list[Finding]) -> None:
@@ -366,6 +422,37 @@ def _contains_only_metadata(paragraph: Paragraph) -> bool:
         KNOWN_METADATA_RE.fullmatch(line) or PLAIN_METADATA_RE.fullmatch(line)
         for line in lines
     )
+
+
+def _metadata_prefix_length(text: str) -> int:
+    """Return the character length of consecutive metadata lines at a paragraph's start."""
+    consumed = 0
+    found = False
+    for line in text.replace("\u00a0", " ").splitlines(keepends=True):
+        stripped = line.rstrip("\r\n").strip()
+        if stripped and (KNOWN_METADATA_RE.fullmatch(stripped) or PLAIN_METADATA_RE.fullmatch(stripped)):
+            consumed += len(line)
+            found = True
+            continue
+        break
+    return consumed if found else 0
+
+
+def _remove_run_text_prefix(paragraph: Paragraph, length: int) -> None:
+    """Remove a text prefix across Word runs, including manual line-break runs."""
+    remaining = length
+    for run in list(paragraph.runs):
+        if remaining <= 0:
+            break
+        run_text = run.text
+        if len(run_text) <= remaining:
+            remaining -= len(run_text)
+            run._r.getparent().remove(run._r)
+        else:
+            run.text = run_text[remaining:]
+            remaining = 0
+    if remaining:
+        raise ValueError("Cannot safely separate metadata from question content in this Word paragraph.")
 
 
 def _set_text_preserving_run_format(paragraph: Paragraph, text: str) -> None:
@@ -628,6 +715,7 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
     _infer_untagged_mcq_sections(doc, findings)
     _infer_untagged_fib_sections(doc, findings)
     starts = _question_starts(doc)
+    _audit_source_question_numbering(doc, starts, findings)
     if not starts:
         findings.append(Finding(0, "manual_review", "No question headings were detected. Use @Question: n@ or a standalone heading such as Question 1."))
         return 0
@@ -661,6 +749,11 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         for paragraph in list(block[1:]):
             if _contains_only_metadata(paragraph):
                 _remove_paragraph(paragraph)
+                continue
+            metadata_prefix = _metadata_prefix_length(paragraph.text)
+            if metadata_prefix:
+                _remove_run_text_prefix(paragraph, metadata_prefix)
+                findings.append(Finding(0, "fixed", "Separated leading metadata lines from question content stored in the same Word paragraph.", assigned_number))
 
         cursor = start
         metadata = [
@@ -2092,7 +2185,14 @@ def process_docx(
 
     report_path = reports / f"{run_id}_{Path(safe_name).stem}_report.json"
     manual_review_count = sum(f.status == "manual_review" for f in findings)
-    verification_status = "PENDING_MANUAL_REVIEW" if manual_review_count else "READY_FOR_VERIFICATION"
+    numbering_error_count = sum(f.rule == 15 and f.status == "manual_review" for f in findings)
+    verification_status = (
+        "BLOCKED_NUMBERING_ERROR"
+        if numbering_error_count
+        else "PENDING_MANUAL_REVIEW"
+        if manual_review_count
+        else "READY_FOR_VERIFICATION"
+    )
     report = {
         "processor_build_id": PROCESSOR_BUILD_ID,
         "run_id": run_id,
@@ -2106,6 +2206,7 @@ def process_docx(
         "images_zip": str(images_zip_path),
         "fixed_count": sum(f.status == "fixed" for f in findings),
         "manual_review_count": manual_review_count,
+        "numbering_error_count": numbering_error_count,
         "verification_status": verification_status,
         "options": asdict(options),
         "selected_processing_sections": {
@@ -2139,6 +2240,7 @@ def process_docx(
         "mapping_csv": str(mapping_csv_path),
         "mapping_count": len(mapping_instructions),
         "manual_review_count": manual_review_count,
+        "numbering_error_count": numbering_error_count,
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 

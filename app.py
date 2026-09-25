@@ -12,7 +12,7 @@ import cms_processor as _cms_processor
 from heymath_cms_mapper import HeyMathCmsMapper
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-question-heading-notes-v14.5"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-block-numbering-errors-v14.6"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -114,6 +114,7 @@ if add_cms_tags:
         st.write("Use ordinary text in Word. Put each heading, option and answer on its own paragraph (Enter). The app adds CMS tags to the output automatically.")
         st.info("You may add information after the question number on the same heading line. Everything up to Enter is retained on the generated question-tag line.")
         st.code("Question: 3 Case study\n→  @Question: 3@ Case study", language=None)
+        st.warning("Source question numbers must be unique, sequential and in ascending order. Duplicate, missing or out-of-order numbers block CMS-ready downloads until the source is corrected.")
         st.code("""Question 26: Average, Comprehension
 Which congruence criterion applies?
 a) ASA
@@ -180,7 +181,12 @@ if uploaded is not None:
         except Exception as exc:
             st.exception(exc)
         else:
-            if result.question_count:
+            numbering_errors = [
+                finding for finding in result.findings
+                if finding.rule == 15 and finding.status == "manual_review"
+            ]
+            downloads_blocked = bool(numbering_errors)
+            if result.question_count and not downloads_blocked:
                 completed_sections = []
                 if add_cms_tags:
                     completed_sections.append("CMS tags")
@@ -193,6 +199,8 @@ if uploaded is not None:
                 if prepare_mappings:
                     completed_sections.append("mapping data")
                 st.success(f"Processing is complete for: {', '.join(completed_sections)}. Download the available outputs below.")
+            elif downloads_blocked:
+                st.warning("The document was analysed, but CMS-ready outputs were not released because the source question numbering must be corrected.")
             else:
                 st.error("No question headings were detected, so CMS records and tags were not created. Review the verification report and correct the question-heading format before downloading a CMS-ready document.")
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -202,7 +210,12 @@ if uploaded is not None:
             col4.metric("Image occurrences", result.image_count)
             col5.metric("Mappings prepared", result.mapping_count)
 
-            if result.manual_review_count:
+            if numbering_errors:
+                st.error("Numbering error: CMS-ready downloads are blocked. Correct the source question headings and process the document again.")
+                for finding in numbering_errors:
+                    st.markdown(f"- {finding.message}")
+                st.caption("Verification queue status: BLOCKED_NUMBERING_ERROR")
+            elif result.manual_review_count:
                 st.warning(f"Action required: complete {result.manual_review_count} manual check(s) before final CMS upload. The app does not guess when a change could alter mathematical meaning.")
                 st.caption("Verification queue status: PENDING_MANUAL_REVIEW")
             else:
@@ -213,7 +226,7 @@ if uploaded is not None:
             effective_project_id = report_data.get("effective_project_id") or project_id.strip() or "project"
             output_download_name = report_data.get("download_filename") or f"{Path(uploaded.name).stem}_Processed.docx"
             col_doc, col_images, col_mapping, col_report = st.columns(4)
-            if result.question_count:
+            if result.question_count and not downloads_blocked:
                 col_doc.download_button(
                     "Download processed DOCX",
                     data=result.output_path.read_bytes(),
@@ -222,9 +235,11 @@ if uploaded is not None:
                     use_container_width=True,
                     on_click="ignore",
                 )
+            elif downloads_blocked:
+                col_doc.caption("Processed DOCX withheld until source numbering is corrected.")
             else:
                 col_doc.caption("Processed DOCX unavailable because no questions were detected.")
-            if process_images:
+            if process_images and not downloads_blocked:
                 col_images.download_button(
                     "Download images ZIP",
                     data=result.images_zip_path.read_bytes(),
@@ -233,9 +248,11 @@ if uploaded is not None:
                     use_container_width=True,
                     on_click="ignore",
                 )
+            elif downloads_blocked:
+                col_images.caption("Images ZIP withheld until source numbering is corrected.")
             else:
                 col_images.caption("Images ZIP not created because image handling was not selected.")
-            if prepare_mappings:
+            if prepare_mappings and not downloads_blocked:
                 col_mapping.download_button(
                     "Download mapping CSV",
                     data=result.mapping_csv_path.read_bytes(),
@@ -244,6 +261,8 @@ if uploaded is not None:
                     use_container_width=True,
                     on_click="ignore",
                 )
+            elif downloads_blocked:
+                col_mapping.caption("Mapping CSV withheld until source numbering is corrected.")
             else:
                 col_mapping.caption("Mapping CSV not created because mapping preparation was not selected.")
             col_report.download_button(
@@ -445,6 +464,7 @@ with st.expander("What the app checks"):
 
 - Identifies plain or already-tagged question records.
 - Retains author notes written after the question number on the same heading line, such as `@Question: 3@ Case study`.
+- Checks source headings for duplicate, missing or out-of-order question numbers before assigning CMS IDs; numbering errors block CMS-ready downloads.
 - Creates or repairs CMS metadata, sequential question IDs, sequential snippet IDs, section markers and required `@e@` delimiters.
 - Builds Choices or Answers blocks from unambiguous author input and corrects a clearly mismatched MCQ/FIB Type tag.
 - Applies bold formatting to CMS metadata and section tags only.

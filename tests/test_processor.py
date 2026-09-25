@@ -1,6 +1,7 @@
 from pathlib import Path
 from zipfile import ZipFile
 import csv
+import json
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -59,7 +60,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-question-heading-notes-v14.5"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-block-numbering-errors-v14.6"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -709,6 +710,41 @@ def test_plain_case_study_heading_and_stray_interquestion_text(tmp_path: Path):
     assert "@1@ Both Assertion (A) and Reason (R) are true and Reason (R) is the correct explanation of Assertion (A) @correct answer@" in texts
     assert not any("question heading" in finding.message.lower() and finding.status == "manual_review" for finding in result.findings)
     assert any("outside a recognised" in finding.message and "Inserting text on purpose" in finding.message for finding in result.findings)
+
+
+def test_duplicate_source_question_number_blocks_verification(tmp_path: Path):
+    source = tmp_path / "duplicate_question_numbers.docx"
+    doc = Document()
+    for index, number in enumerate((15, 16, 16, 17), 1):
+        for text in [
+            f"Question {number}",
+            "Difficulty level: Easy",
+            "Objective: Knowledge",
+            "Question type: FIB",
+            f"Find {index} + 1.",
+            f"Answer: {index + 1}",
+        ]:
+            doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=15),
+        tmp_path / "storage",
+    )
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    numbering_findings = [
+        finding for finding in result.findings
+        if finding.rule == 15 and finding.status == "manual_review"
+    ]
+
+    assert result.question_count == 4
+    assert report["verification_status"] == "BLOCKED_NUMBERING_ERROR"
+    assert report["numbering_error_count"] == 1
+    assert len(numbering_findings) == 1
+    assert "Duplicate source question number 16 appears 2 times" in numbering_findings[0].message
+    assert "CMS-ready document, image and mapping downloads are blocked" in numbering_findings[0].message
 
 
 def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):
