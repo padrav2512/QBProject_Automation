@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-regression-fixes-v14.1"
+PROCESSOR_BUILD_ID = "2026.09.25-visible-equation-spacing-v14.2"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -1341,21 +1341,14 @@ def _replace_inline_math_with_spacing(
     equation: OxmlElement,
 ) -> None:
     """Replace an inline expression and preserve one visible prose boundary space."""
-    replace_start, replace_end = start, end
-    add_before = start > 0 and text[start - 1] in {" ", "\u00a0", "\t"}
-    add_after = end < len(text) and text[end] in {" ", "\u00a0", "\t"}
-    prefix_without_space = text[:start].rstrip()
-    if re.search(r"(?:@[1-4]@|\([a-zivx]+\))$", prefix_without_space, re.I):
-        add_before = False
-    if add_before:
-        while replace_start > 0 and text[replace_start - 1] in {" ", "\u00a0", "\t"}:
-            replace_start -= 1
-        equation.insert(0, _math_run(" "))
-    if add_after:
-        while replace_end < len(text) and text[replace_end] in {" ", "\u00a0", "\t"}:
-            replace_end += 1
-        equation.append(_math_run(" "))
-    replace_math_span(paragraph, replace_start, replace_end, equation)
+    # Keep the author's surrounding prose spaces outside the OMML object.
+    # Word suppresses ordinary spaces stored inside an inline equation, even
+    # when m:t carries xml:space="preserve".  The boundary pass below turns
+    # these prose spaces into visible non-breaking spaces.
+    replace_math_span(paragraph, start, end, equation)
+
+
+VISIBLE_EQUATION_SPACE = "\u2002"  # En space: Word renders it reliably beside OMML objects.
 
 
 def _normalise_native_equation_boundaries(doc: _Document, findings: list[Finding]) -> None:
@@ -1366,10 +1359,6 @@ def _normalise_native_equation_boundaries(doc: _Document, findings: list[Finding
         for index, equation in enumerate(children):
             if equation.tag != qn("m:oMath"):
                 continue
-            direct_math_runs = equation.findall(qn("m:r"))
-            first_math_text = next((r.find(qn("m:t")) for r in direct_math_runs if r.find(qn("m:t")) is not None), None)
-            last_math_text = next((r.find(qn("m:t")) for r in reversed(direct_math_runs) if r.find(qn("m:t")) is not None), None)
-
             previous = children[index - 1] if index > 0 and children[index - 1].tag == qn("w:r") else None
             following = children[index + 1] if index + 1 < len(children) and children[index + 1].tag == qn("w:r") else None
             previous_text_nodes = list(previous.iter(qn("w:t"))) if previous is not None else []
@@ -1380,20 +1369,22 @@ def _normalise_native_equation_boundaries(doc: _Document, findings: list[Finding
                 prefix = "".join((node.text or "") for child in children[:index] for node in child.iter(qn("w:t")))
                 label_prefix = bool(re.search(r"(?:@[1-4]@|\([a-zivx]+\))\s*$", prefix, re.I))
                 needs_space = bool(previous_value) and (previous_value[-1].isspace() or previous_value[-1].isalnum())
-                already_padded = first_math_text is not None and (first_math_text.text or "").startswith(" ")
-                if needs_space and not label_prefix and not already_padded:
-                    previous_text_nodes[-1].text = previous_value.rstrip(" \u00a0\t")
-                    equation.insert(0, _math_run(" "))
-                    changed += 1
+                if needs_space and not label_prefix:
+                    visible_value = previous_value.rstrip(" \u00a0\u2002\t") + VISIBLE_EQUATION_SPACE
+                    if visible_value != previous_value:
+                        previous_text_nodes[-1].text = visible_value
+                        previous_text_nodes[-1].set(qn("xml:space"), "preserve")
+                        changed += 1
 
             if following_text_nodes:
                 following_value = following_text_nodes[0].text or ""
                 needs_space = bool(following_value) and (following_value[0].isspace() or following_value[0].isalnum())
-                already_padded = last_math_text is not None and (last_math_text.text or "").endswith(" ")
-                if needs_space and not already_padded:
-                    following_text_nodes[0].text = following_value.lstrip(" \u00a0\t")
-                    equation.append(_math_run(" "))
-                    changed += 1
+                if needs_space:
+                    visible_value = VISIBLE_EQUATION_SPACE + following_value.lstrip(" \u00a0\u2002\t")
+                    if visible_value != following_value:
+                        following_text_nodes[0].text = visible_value
+                        following_text_nodes[0].set(qn("xml:space"), "preserve")
+                        changed += 1
     if changed:
         findings.append(Finding(4, "fixed", f"Normalised {changed} prose-to-equation boundary space(s)."))
 

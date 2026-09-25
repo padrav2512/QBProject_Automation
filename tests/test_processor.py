@@ -59,7 +59,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-regression-fixes-v14.1"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-visible-equation-spacing-v14.2"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -159,14 +159,12 @@ def test_v12_inline_equation_spacing_superscript_and_variable_style(tmp_path: Pa
     fraction_equations = fraction_paragraph._p.xpath(".//m:oMath[m:f]")
     assert len(fraction_equations) == 2
     for equation in fraction_equations:
-        direct_nodes = [
-            run.find(qn("m:t"))
-            for run in equation.findall(qn("m:r"))
-            if run.find(qn("m:t")) is not None
-        ]
-        assert direct_nodes[0].text == " " and direct_nodes[-1].text == " "
-        assert direct_nodes[0].get(qn("xml:space")) == "preserve"
-        assert direct_nodes[-1].get(qn("xml:space")) == "preserve"
+        previous_text = equation.getprevious().find(qn("w:t"))
+        following_text = equation.getnext().find(qn("w:t"))
+        assert previous_text.text.endswith("\u2002")
+        assert following_text.text.startswith("\u2002")
+        assert previous_text.get(qn("xml:space")) == "preserve"
+        assert following_text.get(qn("xml:space")) == "preserve"
 
     radical_paragraph = next(p for p in out.paragraphs if "Find the value of" in p.text)
     assert radical_paragraph._p.xpath(".//m:rad//m:sSup[m:e//m:t='r'][m:sup//m:t='3']")
