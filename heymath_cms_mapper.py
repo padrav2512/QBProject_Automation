@@ -7,6 +7,7 @@ it never removes or replaces mappings already present in CMS.
 from __future__ import annotations
 
 import html as _html
+import logging
 import re
 import threading
 import time
@@ -15,6 +16,8 @@ from typing import Iterable
 
 import requests
 
+
+log = logging.getLogger("heymath_cms_mapper")
 
 SEP = " >> "
 TREE_CACHE_SECONDS = 6 * 60 * 60
@@ -45,6 +48,11 @@ class MappingResult:
     @property
     def success(self) -> bool:
         return not self.errors
+
+    def summary(self) -> str:
+        name = f" ({self.question_name})" if self.question_name else ""
+        status = "OK" if self.success else "FAILED: " + "; ".join(self.errors)
+        return f"Snippet {self.snippet_id}{name} {status} | added={self.added} | already={self.already_present}"
 
 
 class HeyMathCmsMapper:
@@ -140,6 +148,7 @@ class HeyMathCmsMapper:
             for path in page["taxonomy"]:
                 if path not in after["taxonomy"]:
                     result.errors.append(f"Existing taxonomy mapping disappeared: {path}")
+            log.info(result.summary())
             return result
 
     def validate_path(self, path: str, *, taxonomy: bool = False) -> str | None:
@@ -167,11 +176,27 @@ class HeyMathCmsMapper:
                 "taxonomy": page["taxonomy"],
             }
 
+    def test_connection(self, *, refresh_trees: bool = True) -> dict[str, int]:
+        """Log in and load both mapping trees without changing CMS content."""
+        with self._lock:
+            self._ensure_logged_in()
+            if refresh_trees:
+                self._trees_loaded_at = 0.0
+            self._ensure_trees()
+            return {
+                "curriculum_paths": len(self._curriculum_index or {}),
+                "taxonomy_paths": len(self._taxonomy_index or {}),
+            }
+
+    def refresh_trees(self) -> None:
+        """Reload node trees on the next validation or mapping operation."""
+        self._trees_loaded_at = 0.0
+
     def _load_mapping_page(self, snippet_id: int) -> dict | None:
         text = self._get(f"/question/{int(snippet_id)}/html_curriculum")
         if len(text) < 100 or "Browse Mapping Content" not in text:
             return None
-        title = re.search(r"<title>\s*Html Mapping-\s*(.*?)\s*</title>", text, re.S)
+        title = re.search(r"<title[^>]*>\s*Html Mapping-\s*(.*?)\s*</title>", text, re.S | re.I)
         curriculum_token = self._form_token(text, "/curriculum_trees/add_mapping")
         taxonomy_token = self._form_token(text, "/heymath_taxonomy/add_mapping")
         if not curriculum_token or not taxonomy_token:
@@ -202,13 +227,21 @@ class HeyMathCmsMapper:
 
     @staticmethod
     def _form_token(text: str, action: str) -> str | None:
-        form = re.search(r'(?is)<form[^>]*action="[^"]*' + re.escape(action) + r'"[^>]*>(.*?)</form>', text)
+        form = re.search(
+            r"""(?is)<form[^>]*\baction\s*=\s*["'][^"']*"""
+            + re.escape(action)
+            + r"""["'][^>]*>(.*?)</form>""",
+            text,
+        )
         if not form:
             return None
-        token_input = re.search(r'(?is)<input[^>]*name="authenticity_token"[^>]*>', form.group(1))
+        token_input = re.search(
+            r"""(?is)<input[^>]*\bname\s*=\s*["']authenticity_token["'][^>]*>""",
+            form.group(1),
+        )
         if not token_input:
             return None
-        value = re.search(r'value="([^"]*)"', token_input.group(0))
+        value = re.search(r"""\bvalue\s*=\s*["']([^"']*)["']""", token_input.group(0))
         return _html.unescape(value.group(1)) if value else None
 
     @staticmethod
@@ -238,6 +271,7 @@ class HeyMathCmsMapper:
         return ids
 
     def _post_form(self, action: str, token: str, snippet_id: int, id_field: str, ids: str, button: str) -> None:
+        referer = f"{self.base_url}/question/{int(snippet_id)}/html_curriculum"
         response = self._session.post(
             self.base_url + action,
             data={
@@ -249,11 +283,13 @@ class HeyMathCmsMapper:
                 id_field: ids,
                 "add_mapping": button,
             },
+            headers={"Referer": referer},
             timeout=TIMEOUT,
             allow_redirects=True,
         )
         if response.status_code >= 400:
             raise RuntimeError(f"Save failed: HTTP {response.status_code} from {action}")
+        log.info("CMS %s snippet=%s ids=%s -> HTTP %s", action, snippet_id, ids, response.status_code)
 
     def _ensure_trees(self) -> None:
         if self._curriculum_index is not None and time.time() - self._trees_loaded_at < TREE_CACHE_SECONDS:
@@ -274,6 +310,7 @@ class HeyMathCmsMapper:
         self._curriculum_index = curriculum
         self._taxonomy_index = taxonomy
         self._trees_loaded_at = time.time()
+        log.info("CMS trees loaded: %d curriculum paths, %d taxonomy paths", len(curriculum), len(taxonomy))
 
     @staticmethod
     def _index(node: dict, prefix: str, output: dict[str, list[str]]) -> None:

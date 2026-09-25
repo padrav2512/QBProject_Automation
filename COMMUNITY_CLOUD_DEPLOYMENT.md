@@ -42,6 +42,8 @@ login = "shared-mapping-account"
 password = "the-shared-account-password"
 ```
 
+After saving the secret, reopen the app, expand **Apply mappings to CMS after Anand’s upload**, and select **Test CMS connection (read only)**. A successful test signs in and loads the Curriculum and Taxonomy trees without changing any CMS content.
+
 The mapper validates every snippet and path before saving. It only adds missing Curriculum and Taxonomy mappings; existing mappings are retained and are never removed or replaced.
 
 Because the current deployment is public, do not add the shared CMS credentials until access to the app is restricted to the team. Otherwise, anyone with the app URL could attempt a CMS mapping operation with the shared account.

@@ -341,6 +341,30 @@ with st.expander("Apply mappings to CMS after Anand’s upload", expanded=False)
 
     if missing_secret:
         st.caption("CMS mapping is not yet configured on this server. Add the shared CMS account under `[heymath_cms]` in Streamlit secrets.")
+    else:
+        st.success("CMS secrets are configured. Test the connection before applying the first mapping file.")
+        if st.button("Test CMS connection (read only)", use_container_width=True):
+            mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"])
+            try:
+                with st.spinner("Signing in and loading the Curriculum and Taxonomy trees…"):
+                    connection_result = mapper.test_connection(refresh_trees=True)
+            except Exception as exc:
+                st.session_state["cms_connection_test"] = {"ok": False, "message": str(exc)}
+            else:
+                st.session_state["cms_connection_test"] = {
+                    "ok": True,
+                    "message": (
+                        f"Connection successful. Loaded {connection_result['curriculum_paths']} Curriculum paths "
+                        f"and {connection_result['taxonomy_paths']} Taxonomy paths. No CMS content was changed."
+                    ),
+                }
+
+        connection_test = st.session_state.get("cms_connection_test")
+        if connection_test:
+            if connection_test["ok"]:
+                st.success(connection_test["message"])
+            else:
+                st.error(f"CMS connection test failed: {connection_test['message']}")
 
     can_apply = mapping_frame is not None and mapping_problem is None and not missing_secret and not mapping_frame.empty
     if st.button("Validate and apply mappings to CMS", type="primary", disabled=not can_apply, use_container_width=True):
