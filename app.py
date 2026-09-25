@@ -36,43 +36,23 @@ st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
 st.caption("Choose the processing sections you need. Mathematical changes remain conservative: clear expressions are converted and ambiguous cases are preserved for review.")
 
 with st.sidebar:
-    st.header("Processing sections")
-    with st.container(border=True):
-        add_cms_tags = st.checkbox("1. CMS tags and question structure", value=True)
-        with st.expander("What this covers · example"):
-            st.write("Creates or repairs question records, metadata, IDs, snippet IDs, Choices/Answers/Solution sections and required `@e@` markers.")
-            st.code("Question 1: Easy, Knowledge\n...\nAnswer: b", language=None)
-    with st.container(border=True):
-        process_images = st.checkbox("2. Handle images and Alt Text", value=True)
-        with st.expander("What this covers · example"):
-            st.write("Extracts images, assigns CMS filenames, reuses filenames for exact duplicates, writes Word Alt Text and creates the images ZIP.")
-            st.code("project10436_q8_1.gif", language=None)
-    with st.container(border=True):
-        format_math = st.checkbox("3. Apply safe mathematical formatting", value=True)
-        with st.expander("What this covers · example"):
-            st.write("Creates native Word equations for unambiguous fractions, radicals, exponents and equations; applies high-confidence variable italics and reports uncertain expressions.")
-            st.code("x = √144  →  native Word equation\n1/4  →  stacked fraction", language=None)
-    with st.container(border=True):
-        normalize_text_structure = st.checkbox("4. Normalize text and document formatting", value=True)
-        with st.expander("What this covers · example"):
-            st.write("Repairs deterministic spacing, converts numeric rupee amounts, removes whole-block bold, and normalises answer lines, subparts and Assertion–Reason structure.")
-            st.code("₹ 1,250  →  Rs 1,250\nword  ?  →  word?", language=None)
-    with st.container(border=True):
-        prepare_mappings = st.checkbox("5. Prepare curriculum and taxonomy mapping data", value=True)
-        with st.expander("What this covers · example"):
-            st.write("Collects per-question mapping paths, normalises spacing around `>>`, removes these author-only lines from the CMS-ready DOCX and creates a mapping CSV for use after Anand’s upload.")
-            st.code(
-                "Curriculum: CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length >> Metres and Centimetres\n"
-                "India >> Class 4 >> Mathematics >> Measurement\n"
-                "Taxonomy: Mathematics >> Measurement >> Length",
-                language=None,
-            )
+    st.header("1. Choose processing")
+    st.caption("All sections are selected by default. Clear only the sections you do not want the app to change.")
+    add_cms_tags = st.checkbox("1. CMS tags and question structure", value=True)
+    process_images = st.checkbox("2. Handle images and Alt Text", value=True)
+    format_math = st.checkbox("3. Apply safe mathematical formatting", value=True)
+    normalize_text_structure = st.checkbox("4. Normalize text and document formatting", value=True)
+    prepare_mappings = st.checkbox("5. Prepare curriculum and taxonomy mapping data", value=True)
+
+    if add_cms_tags:
+        st.caption("Heading notes are allowed: `Question: 3 Case study` → `@Question: 3@ Case study`. Text up to Enter stays on that line.")
 
     if not any((add_cms_tags, process_images, format_math, normalize_text_structure, prepare_mappings)):
         st.warning("Select at least one processing section.")
 
+    st.divider()
     if add_cms_tags or process_images:
-        st.header("CMS and image naming")
+        st.header("2. CMS and image naming")
         project_id = st.text_input(
             "Project ID",
             value="project",
@@ -82,14 +62,13 @@ with st.sidebar:
         project_id = "project"
 
     if add_cms_tags:
-        st.subheader("Question and snippet numbering")
         start_question = st.number_input("First question number", min_value=1, value=1, step=1)
         start_snippet_text = st.text_input("First snippet ID", value="", placeholder="Enter the first snippet ID")
-        replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
-        st.subheader("Defaults for missing metadata")
-        default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
-        default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
-        default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
+        with st.expander("ID replacement and missing-metadata defaults"):
+            replace_ids = st.checkbox("Replace existing question and snippet IDs", value=True)
+            default_type = st.selectbox("Question type", ["FIB", "MCQ"], index=0)
+            default_difficulty = st.selectbox("Difficulty", ["Easy", "Average", "Challenging"], index=1)
+            default_objective = st.selectbox("Objective", ["Knowledge", "Comprehension", "Application", "Analysis"], index=2)
     else:
         start_question = 1
         start_snippet_text = ""
@@ -98,12 +77,32 @@ with st.sidebar:
         default_difficulty = "Average"
         default_objective = "Application"
 
+    with st.expander("What each section changes"):
+        st.markdown(
+            """
+**1. CMS tags and structure** — Adds or repairs CMS metadata, IDs, Choices/Answers/Solution blocks and `@e@` markers.
+
+**2. Images and Alt Text** — Extracts images, assigns CMS filenames, reuses exact duplicates and creates the images ZIP.
+
+**3. Safe Math formatting** — Converts clear fractions and radicals, preserves valid native equations, italicises high-confidence variables and reports genuinely ambiguous scope.
+
+**4. Text and document formatting** — Repairs spacing, rupee notation, whole-block bold, answer layout, subparts and Assertion–Reason structure.
+
+**5. Mapping data** — Reads per-question Curriculum and Taxonomy paths and creates the mapping CSV for use after Anand’s upload.
+"""
+        )
+
+    selection_notes = []
     if not add_cms_tags and process_images:
-        st.info("Existing CMS tags and IDs will be preserved. A project ID found in existing Question id tags takes priority over the Project ID entered above.")
+        selection_notes.append("Existing CMS tags and IDs will be preserved; a Project ID in the document takes priority.")
     if not format_math:
-        st.info("Mathematical-formatting changes are off. Existing equations, mathematical text and mathematical italics will be preserved.")
+        selection_notes.append("Mathematical formatting is off; existing equations, mathematical text and italics will be preserved.")
     if not normalize_text_structure:
-        st.info("Text and document-formatting changes are off. Existing prose spacing, bold text, subparts and answer layout will be preserved.")
+        selection_notes.append("Text formatting is off; existing spacing, bold text, subparts and answer layout will be preserved.")
+    if selection_notes:
+        with st.expander("Effect of current selections", expanded=True):
+            for note in selection_notes:
+                st.write(f"• {note}")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
 st.info("Upload a quality-checked DOCX, process it, and download the available outputs before closing the page.")
@@ -113,6 +112,8 @@ uploaded = st.file_uploader("Upload a Word document", type=["docx"], accept_mult
 if add_cms_tags:
     with st.expander("Input format — no CMS tags needed"):
         st.write("Use ordinary text in Word. Put each heading, option and answer on its own paragraph (Enter). The app adds CMS tags to the output automatically.")
+        st.info("You may add information after the question number on the same heading line. Everything up to Enter is retained on the generated question-tag line.")
+        st.code("Question: 3 Case study\n→  @Question: 3@ Case study", language=None)
         st.code("""Question 26: Average, Comprehension
 Which congruence criterion applies?
 a) ASA
@@ -419,6 +420,7 @@ with st.expander("What the app checks"):
 **1. CMS tags and question structure**
 
 - Identifies plain or already-tagged question records.
+- Retains author notes written after the question number on the same heading line, such as `@Question: 3@ Case study`.
 - Creates or repairs CMS metadata, sequential question IDs, sequential snippet IDs, section markers and required `@e@` delimiters.
 - Builds Choices or Answers blocks from unambiguous author input and corrects a clearly mismatched MCQ/FIB Type tag.
 - Applies bold formatting to CMS metadata and section tags only.
@@ -432,7 +434,8 @@ with st.expander("What the app checks"):
 
 **3. Apply safe mathematical formatting**
 
-- Preserves existing native Word equations and converts unambiguous fractions, radicals, exponents and equations into native Word equations.
+- Preserves existing native Word equations and converts unambiguous fractions and clearly scoped radicals into native Word equations.
+- Allows properly spaced equations to remain ordinary Word text when their variables are correctly italicised.
 - Places visible spacing correctly at prose-to-equation boundaries and preserves surrounding text.
 - Italicises high-confidence variables and geometry labels while protecting articles, option labels and recognised units.
 - Removes blank equation or exponent templates.
