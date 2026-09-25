@@ -36,7 +36,9 @@ def test_case_study_and_inline_expression(tmp_path):
     assert len(out.element.xpath('.//m:rad')) == 3
     assert len(out.element.xpath('.//m:f')) == 1
     reason = next(p for p in out.paragraphs if p.text.startswith('Reason'))
-    assert reason.text == 'Reason (R): radius r, chord length c, and distance d are related by .'
+    assert reason.text == 'Reason (R): radius r, chord length c, and distance d are related by.'
+    reason_equation = reason._p.xpath('.//m:oMath')[0]
+    assert reason_equation.find(qn('m:r')).find(qn('m:t')).text == ' '
     choices = [p for p in out.paragraphs if p.text.startswith(('@1@', '@2@', '@3@', '@4@'))]
     assert len(choices) == 4
     assert all('units' in p.text and p._p.xpath('.//m:oMath') for p in choices)

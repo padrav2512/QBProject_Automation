@@ -58,7 +58,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID.endswith("v12")
+    assert PROCESSOR_BUILD_ID.startswith("2026.09.25-authoring-rules-v12")
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -115,6 +115,64 @@ def test_v12_rupee_conversion_and_conflicting_mcq_key(tmp_path: Path):
     assert "₹" not in combined
     assert "Rs 50" in combined and "Rs 1,250.50" in combined and "Rs 1,350.50" in combined
     assert any(f.status == "manual_review" and "does not match" in f.message and f.question == 2 for f in result.findings)
+
+
+def test_v12_inline_equation_spacing_superscript_and_variable_style(tmp_path: Path):
+    from cms_processor import _math_fraction
+
+    doc = Document()
+    doc.add_paragraph("Question 1")
+    doc.add_paragraph("Question type: FIB")
+    doc.add_paragraph("Find the roots of the equation x²−25=0.")
+    doc.add_paragraph("Answer: 5, -5")
+
+    doc.add_paragraph("Question 2")
+    doc.add_paragraph("Question type: FIB")
+    fraction_question = doc.add_paragraph("Riya drank ")
+    existing_fraction = OxmlElement("m:oMath")
+    existing_fraction.append(_math_fraction("1", "3"))
+    fraction_question._p.append(existing_fraction)
+    fraction_question.add_run(" litres in the morning and 1/4 litres in the evening.")
+    doc.add_paragraph("Answer: 7/12 litres")
+
+    doc.add_paragraph("Question 3")
+    doc.add_paragraph("Question type: FIB")
+    radical = doc.add_paragraph()
+    radical.add_run("Find the value of √(144-r")
+    exponent = radical.add_run("3")
+    exponent.font.superscript = True
+    radical.add_run(").")
+    doc.add_paragraph("Answer: 12")
+
+    source = tmp_path / "inline_math_boundaries.docx"
+    doc.save(source)
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    out = Document(result.output_path)
+
+    equation_paragraph = next(p for p in out.paragraphs if "Find the roots" in p.text)
+    x_styles = [
+        node.get(qn("m:val"))
+        for node in equation_paragraph._p.xpath(".//m:r[m:t='x']/m:rPr/m:sty")
+    ]
+    assert x_styles == ["i"]
+
+    fraction_paragraph = next(p for p in out.paragraphs if "Riya drank" in p.text)
+    fraction_equations = fraction_paragraph._p.xpath(".//m:oMath[m:f]")
+    assert len(fraction_equations) == 2
+    for equation in fraction_equations:
+        direct_text = [
+            run.find(qn("m:t")).text
+            for run in equation.findall(qn("m:r"))
+            if run.find(qn("m:t")) is not None
+        ]
+        assert direct_text[0] == " " and direct_text[-1] == " "
+
+    radical_paragraph = next(p for p in out.paragraphs if "Find the value of" in p.text)
+    assert radical_paragraph._p.xpath(".//m:rad//m:sSup[m:e//m:t='r'][m:sup//m:t='3']")
+    assert not any(
+        finding.status == "manual_review" and finding.question == 3 and "radical" in finding.message.lower()
+        for finding in result.findings
+    )
 
 
 @pytest.mark.parametrize("all_bold", [False, True])
@@ -210,7 +268,7 @@ def test_native_equation_fib_answer_survives(tmp_path: Path, units):
     out = Document(result.output_path)
     texts = [p.text for p in out.paragraphs]
     answer_out = out.paragraphs[texts.index("@Answers:@") + 1]
-    assert [n.text for n in answer_out._p.xpath(".//m:t")] == ["2", "13"]
+    assert [n.text for n in answer_out._p.xpath(".//m:t") if (n.text or "").strip()] == ["2", "13"]
     assert len(answer_out._p.xpath(".//m:rad")) == 1
     assert answer_out.text.strip() == units.strip()
 

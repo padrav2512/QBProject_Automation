@@ -11,7 +11,7 @@ import streamlit as st
 import cms_processor as _cms_processor
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-authoring-rules-v12"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-authoring-rules-v12.1"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -138,24 +138,11 @@ if uploaded is not None:
             col4.metric("Image occurrences", result.image_count)
 
             if result.manual_review_count:
-                st.warning("Complete the listed manual checks before final CMS upload. The app does not guess when a change could alter mathematical meaning.")
+                st.warning(f"Action required: complete {result.manual_review_count} manual check(s) before final CMS upload. The app does not guess when a change could alter mathematical meaning.")
                 st.caption("Verification queue status: PENDING_MANUAL_REVIEW")
             else:
                 st.success("No unresolved manual-review findings were detected.")
                 st.caption("Verification queue status: READY_FOR_VERIFICATION")
-
-            rows = [
-                {
-                    "Rule": f.rule,
-                    "Status": f.status.replace("_", " ").title(),
-                    "Question": f.question or "—",
-                    "Paragraph": f.paragraph or "—",
-                    "Finding": f.message,
-                }
-                for f in result.findings
-            ]
-            st.subheader("Verification report")
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             report_data = json.loads(result.report_path.read_text(encoding="utf-8"))
             effective_project_id = report_data.get("effective_project_id") or project_id.strip() or "project"
@@ -193,6 +180,43 @@ if uploaded is not None:
                 use_container_width=True,
                 on_click="ignore",
             )
+
+            manual_rows = [
+                {
+                    "Question": f.question or "Document",
+                    "Paragraph": f.paragraph or "—",
+                    "Action needed": f.message,
+                }
+                for f in result.findings
+                if f.status == "manual_review"
+            ]
+            if manual_rows:
+                st.subheader("Action required before CMS upload")
+                st.caption("Work through this shorter list first. Each row is an unresolved check that needs a person to review the source or processed document.")
+                st.dataframe(
+                    pd.DataFrame(manual_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Question": st.column_config.TextColumn(width="small"),
+                        "Paragraph": st.column_config.TextColumn(width="small"),
+                        "Action needed": st.column_config.TextColumn(width="large"),
+                    },
+                )
+
+            rows = [
+                {
+                    "Rule": f.rule,
+                    "Status": f.status.replace("_", " ").title(),
+                    "Question": f.question or "—",
+                    "Paragraph": f.paragraph or "—",
+                    "Finding": f.message,
+                }
+                for f in result.findings
+            ]
+            st.subheader("Verification report")
+            st.caption("Complete record of passed checks, automatic fixes and manual-review findings.")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             st.caption(f"Processing reference: {result.run_id}")
 
