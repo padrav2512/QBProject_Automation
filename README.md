@@ -6,7 +6,7 @@ For the team's Streamlit Community Cloud deployment, follow [COMMUNITY_CLOUD_DEP
 
 The app provides five independent processing sections: CMS tags and question structure; images and Alt Text; safe mathematical formatting; text and document formatting; and Curriculum/Taxonomy mapping-data preparation. All are selected by default and can be turned off separately. Existing native equations are preserved, and expressions with uncertain exponent or radical scope are left unchanged and reported for review.
 
-Mapping preparation reads per-question `Curriculum:` and `Taxonomy:` blocks, removes those author-only lines from the processed DOCX and creates a mapping CSV. After Anand's population tool creates the snippets in CMS, the CSV can be uploaded in the app's **Apply mappings to CMS** area. The mapper only adds missing paths; existing mappings are retained and never removed or replaced.
+Mapping preparation reads per-question `Curriculum:` and `Taxonomy:` blocks, removes those author-only lines from the processed DOCX and creates a mapping CSV. After the snippets exist in CMS, that CSV can be uploaded in the app's **Apply mappings to CMS** area. A separate mapping-only task can also use a CSV or XLSX with the columns `Question`, `Snippet ID`, `Mapping Type`, and `Path`; when an XLSX has several worksheets, the user selects the worksheet containing the mapping rows. The mapper only adds missing paths; existing mappings are retained and never removed or replaced.
 
 Full preparation accepts plain headings that include both difficulty and objective, such as `Question 44: Easy, Comprehension`. Image extraction supports modern DrawingML pictures and legacy Word VML picture containers.
 

@@ -10,6 +10,7 @@ import streamlit as st
 
 import cms_processor as _cms_processor
 from heymath_cms_mapper import HeyMathCmsMapper
+from mapping_input import read_mapping_table, xlsx_sheet_names
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-block-numbering-errors-v14.6"
@@ -314,23 +315,36 @@ if uploaded is not None:
             st.caption(f"Processing reference: {result.run_id}")
 
 st.divider()
-with st.expander("Apply mappings to CMS after Anand’s upload", expanded=False):
-    st.write("Use this only after Anand’s tool has created the questions in CMS. Upload the mapping CSV generated above, review it, and then apply the mappings.")
+with st.expander("Apply mappings to CMS", expanded=False):
+    st.write("Use this after the questions exist in CMS, whether they were created by Anand’s tool or were already present. Upload a mapping CSV or XLSX, review it, and then apply the mappings.")
     st.info("Existing Curriculum and Taxonomy mappings are retained. This tool only adds missing mappings; it never removes or replaces an existing mapping.")
-    mapping_upload = st.file_uploader("Upload mapping CSV", type=["csv"], key="mapping_csv_upload")
+    st.caption("Required columns: Question, Snippet ID, Mapping Type, Path. Use one Curriculum or Taxonomy path per row.")
+    mapping_upload = st.file_uploader("Upload mapping CSV or XLSX", type=["csv", "xlsx"], key="mapping_file_upload")
     mapping_frame = None
     mapping_problem = None
     if mapping_upload is not None:
+        mapping_bytes = mapping_upload.getvalue()
+        selected_sheet = None
         try:
-            mapping_frame = pd.read_csv(mapping_upload, dtype=str).fillna("")
-            mapping_frame.columns = [str(column).strip() for column in mapping_frame.columns]
+            if Path(mapping_upload.name).suffix.lower() == ".xlsx":
+                sheet_names = xlsx_sheet_names(mapping_bytes)
+                if len(sheet_names) > 1:
+                    selected_sheet = st.selectbox(
+                        "Worksheet containing the mappings",
+                        sheet_names,
+                        key=f"mapping_sheet_{mapping_upload.name}_{len(mapping_bytes)}",
+                    )
+                elif sheet_names:
+                    selected_sheet = sheet_names[0]
+                    st.caption(f"Using worksheet: {selected_sheet}")
+            mapping_frame = read_mapping_table(mapping_bytes, mapping_upload.name, selected_sheet)
         except Exception as exc:
-            mapping_problem = f"The mapping CSV could not be read: {exc}"
+            mapping_problem = f"The mapping file could not be read: {exc}"
         else:
             required_columns = {"Question", "Snippet ID", "Mapping Type", "Path"}
             missing_columns = required_columns - set(mapping_frame.columns)
             if missing_columns:
-                mapping_problem = "The mapping CSV is missing: " + ", ".join(sorted(missing_columns))
+                mapping_problem = "The mapping file is missing: " + ", ".join(sorted(missing_columns))
             else:
                 mapping_frame = mapping_frame[["Question", "Snippet ID", "Mapping Type", "Path"]].copy()
                 mapping_frame["Mapping Type"] = mapping_frame["Mapping Type"].str.strip().str.title()

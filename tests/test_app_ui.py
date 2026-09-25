@@ -25,3 +25,4 @@ def test_app_renders_five_processing_sections_and_mapping_stage():
         for caption in app.sidebar.caption
     )
     assert "Validate and apply mappings to CMS" in [button.label for button in app.button]
+    assert "Apply mappings to CMS" in [expander.label for expander in app.expander]
