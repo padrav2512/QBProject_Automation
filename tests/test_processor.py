@@ -59,7 +59,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-visible-equation-spacing-v14.2"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-focused-math-audit-v14.3"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -201,6 +201,31 @@ def test_multiline_plain_metadata_is_used_once_and_algebra_stays_as_text(tmp_pat
     assert not algebra._p.xpath(".//m:oMath")
     x_runs = [run for run in algebra.runs if "x" in run.text]
     assert x_runs and all(run.italic is True for run in x_runs)
+    assert not any("ordinary text" in finding.message for finding in result.findings)
+
+
+def test_clear_unicode_exponent_in_prose_is_not_flagged_as_ambiguous(tmp_path: Path):
+    doc = Document()
+    for text in [
+        "Question 1: Easy, Knowledge",
+        "Question type: MCQ",
+        "In the number 7³, what is the base?",
+        "a) 3",
+        "b) 7",
+        "c) 21",
+        "d) 343",
+        "Answer: b",
+    ]:
+        doc.add_paragraph(text)
+    source = tmp_path / "clear_exponent.docx"
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+
+    assert not any(
+        finding.status == "manual_review" and "ambiguous scope" in finding.message
+        for finding in result.findings
+    )
 
 
 def test_assertion_and_reason_labels_are_not_auto_italicised(tmp_path: Path):

@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-visible-equation-spacing-v14.2"
+PROCESSOR_BUILD_ID = "2026.09.25-focused-math-audit-v14.3"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -1187,43 +1187,38 @@ def _equation_and_fraction_audit(doc: _Document, findings: list[Finding]) -> Non
     context = _section_for_paragraphs(doc)
     fraction_hits = 0
     image_hits = 0
-    math_text_hits = 0
     ambiguous_scope_hits = 0
     for index, paragraph in enumerate(body_paragraphs(doc), 1):
         section, question = context.get(paragraph._p, (None, None))
         if section not in {"@Question:@", "@Solution:@", "@Answers:@", "@Choices:@"}:
             continue
         text = paragraph.text
-        # Any radical left in ordinary text was not converted by the conservative
-        # parser and therefore requires an author to confirm its scope.
-        ambiguous_scope = "√" in text or bool(re.search(r"[\^⁰¹²³⁴⁵⁶⁷⁸⁹]", text))
+        # A radical or caret expression left in ordinary text was rejected by
+        # the conservative parser and requires an author to confirm its scope.
+        # Unicode superscripts such as 7³ and x² have an explicit single base
+        # and are valid ordinary Word text, so they are not warnings.
+        ambiguous_scope = "√" in text or "^" in text
         if SIMPLE_FRACTION_RE.search(text) and not ambiguous_scope:
             fraction_hits += 1
             findings.append(Finding(7, "manual_review", f"Slash-style fraction requires conversion to a stacked Word equation: {text.strip()!r}", question, index))
         if paragraph._p.xpath(".//w:drawing | .//w:pict"):
             image_hits += 1
             findings.append(Finding(2, "manual_review", "An embedded image occurs in mathematical content. Verify that it is a diagram, not an equation screenshot.", question, index))
-        if not paragraph._p.xpath(".//m:oMath") and (
-            re.fullmatch(r"\s*[A-Za-z0-9().,]+(?:\s*[=+×÷−]\s*[A-Za-z0-9().,]+)+\s*", text)
-            or INLINE_EQUATION_RE.search(text)
-        ):
-            math_text_hits += 1
-            findings.append(Finding(2, "manual_review", f"A math-like expression is ordinary text and should be recreated with Insert → Equation: {text.strip()!r}", question, index))
         if ambiguous_scope:
             ambiguous_scope_hits += 1
             findings.append(
                 Finding(
                     2,
                     "manual_review",
-                    f"An exponent or radical expression has potentially ambiguous scope and was not changed automatically: {text.strip()!r}",
+                    f"A radical or caret expression has potentially ambiguous scope and was left unchanged: {text.strip()!r}",
                     question,
                     index,
                 )
             )
     if not fraction_hits:
         findings.append(Finding(7, "passed", "No slash-style fractions were detected in student-facing content."))
-    if not image_hits and not math_text_hits and not ambiguous_scope_hits:
-        findings.append(Finding(2, "passed", "No likely equation screenshots or ordinary-text equations were detected."))
+    if not image_hits and not ambiguous_scope_hits:
+        findings.append(Finding(2, "passed", "No likely equation screenshots or genuinely ambiguous radical/caret expressions were detected."))
 
 
 def _math_run(text: str) -> OxmlElement:
