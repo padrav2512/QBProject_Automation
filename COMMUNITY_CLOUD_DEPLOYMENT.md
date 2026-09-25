@@ -24,16 +24,31 @@ The app URL remains fixed. Updating files in the GitHub repository updates the d
 ## Team workflow
 
 1. Open the shared app URL in a browser.
-2. Enter the project ID, first question number and first snippet ID.
-3. Upload the quality-checked DOCX.
-4. Select **Process document**.
-5. Review any manual-check findings.
-6. Download the processed DOCX, images ZIP and JSON audit report before leaving the page.
-7. Upload the images to CMS manually and pass the processed DOCX to Anand's population tool.
+2. Select the required processing sections; all five are selected by default.
+3. Enter the project ID, first question number and first snippet ID.
+4. Upload the quality-checked DOCX and select **Process document**.
+5. Review any manual-check findings and download the processed DOCX, images ZIP, mapping CSV and JSON audit report.
+6. Upload the images to CMS manually and pass the processed DOCX to Anand's population tool.
+7. After Anand's tool creates the snippets, expand **Apply mappings to CMS after Anand’s upload**, upload the mapping CSV and apply it.
+
+## Shared CMS mapping account
+
+Do not commit the CMS password to GitHub. In the Streamlit Community Cloud app settings, open **Secrets** and add:
+
+```toml
+[heymath_cms]
+base_url = "http://cms.heymath.com"
+login = "shared-mapping-account"
+password = "the-shared-account-password"
+```
+
+The mapper validates every snippet and path before saving. It only adds missing Curriculum and Taxonomy mappings; existing mappings are retained and are never removed or replaced.
+
+Because the current deployment is public, do not add the shared CMS credentials until access to the app is restricted to the team. Otherwise, anyone with the app URL could attempt a CMS mapping operation with the shared account.
 
 ## Storage note
 
-Streamlit Community Cloud is used here as a processor, not as permanent document storage. Users should download the three results after each run. The app's temporary working files may be removed when Streamlit restarts or redeploys the app.
+Streamlit Community Cloud is used here as a processor, not as permanent document storage. Users should download all available results after each run. The app's temporary working files may be removed when Streamlit restarts or redeploys the app.
 
 ## Updating the app
 

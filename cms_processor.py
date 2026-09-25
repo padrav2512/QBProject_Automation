@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import csv
 import json
 import os
 import re
@@ -25,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-processing-sections-v13"
+PROCESSOR_BUILD_ID = "2026.09.25-mapping-workflow-v14"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -82,6 +83,8 @@ MCQ_ANSWER_RE = re.compile(
     r"^\s*(?:Answer|Correct answer)\s*:?\s*(?:\(?([A-Da-d])\)?|([1-4]))(?:[.)])?(?:\s+(.+?))?\s*$",
     re.I,
 )
+MAPPING_LABEL_RE = re.compile(r"^(Curriculum|Taxonomy)\s*:\s*(.*?)\s*$", re.I)
+SNIPPET_ID_RE = re.compile(r"^@?New snippet id\s*:\s*(\d+)\s*@?$", re.I)
 DIFFICULTY_ALIASES = {
     "easy": "Easy",
     "medium": "Average",
@@ -103,7 +106,10 @@ class ProcessorOptions:
     processing_mode: str = "full"
     add_cms_tags: bool | None = None
     process_images: bool | None = None
-    format_math_structure: bool | None = None
+    format_math: bool | None = None
+    normalize_text_structure: bool | None = None
+    prepare_mappings: bool | None = None
+    format_math_structure: bool | None = None  # Legacy Version 13 switch.
 
 
 @dataclass
@@ -115,6 +121,14 @@ class Finding:
     paragraph: int | None = None
 
 
+@dataclass(frozen=True)
+class MappingInstruction:
+    question: int
+    snippet_id: int | None
+    mapping_type: str
+    path: str
+
+
 @dataclass
 class ProcessResult:
     output_path: Path
@@ -122,10 +136,12 @@ class ProcessResult:
     manifest_path: Path
     image_manifest_path: Path
     images_zip_path: Path
+    mapping_csv_path: Path
     original_path: Path
     run_id: str
     question_count: int
     image_count: int
+    mapping_count: int
     findings: list[Finding]
 
     @property
@@ -1710,21 +1726,151 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
         findings.append(Finding(0, "fixed", f"Normalised {changed} MCQ option marker(s)."))
 
 
-def _selected_processing_sections(options: ProcessorOptions) -> tuple[bool, bool, bool]:
+def _normalise_mapping_path(raw: str) -> str | None:
+    parts = [re.sub(r"\s+", " ", part).strip() for part in raw.split(">>")]
+    if len(parts) < 2 or any(not part for part in parts):
+        return None
+    return " >> ".join(parts)
+
+
+def _extract_mapping_instructions(doc: _Document, findings: list[Finding]) -> list[MappingInstruction]:
+    paragraphs = body_paragraphs(doc)
+    snippet_ids: dict[int, int] = {}
+    current_question: int | None = None
+    for paragraph in paragraphs:
+        text = paragraph.text.strip()
+        question_match = (
+            QUESTION_START_RE.fullmatch(text)
+            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            or PLAIN_QUESTION_START_RE.fullmatch(text)
+        )
+        if question_match:
+            current_question = int(question_match.group(1))
+            continue
+        snippet_match = SNIPPET_ID_RE.fullmatch(text)
+        if current_question is not None and snippet_match:
+            snippet_ids[current_question] = int(snippet_match.group(1))
+
+    instructions: list[MappingInstruction] = []
+    seen: set[tuple[int, str, str]] = set()
+    remove: list[Paragraph] = []
+    active_type: str | None = None
+    active_label: Paragraph | None = None
+    mapping_labels: list[tuple[Paragraph, int | None, str]] = []
+    label_path_counts: dict[int, int] = {}
+    current_question = None
+    questions_with_mappings: set[int] = set()
+
+    def add_path(question: int | None, mapping_type: str, raw_path: str, paragraph: Paragraph) -> bool:
+        if question is None:
+            findings.append(Finding(14, "manual_review", f"A {mapping_type} mapping occurs before an identifiable question: {raw_path!r}."))
+            return False
+        path = _normalise_mapping_path(raw_path)
+        if path is None:
+            findings.append(Finding(14, "manual_review", f"The {mapping_type} path is incomplete or malformed: {raw_path!r}.", question))
+            return False
+        key = (question, mapping_type, path.casefold())
+        if key not in seen:
+            seen.add(key)
+            instructions.append(MappingInstruction(question, snippet_ids.get(question), mapping_type, path))
+            questions_with_mappings.add(question)
+        remove.append(paragraph)
+        return True
+
+    for paragraph in paragraphs:
+        text = paragraph.text.strip()
+        question_match = (
+            QUESTION_START_RE.fullmatch(text)
+            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            or PLAIN_QUESTION_START_RE.fullmatch(text)
+        )
+        if question_match:
+            current_question = int(question_match.group(1))
+            active_type = None
+            active_label = None
+            continue
+        label_match = MAPPING_LABEL_RE.fullmatch(text)
+        if label_match:
+            active_type = label_match.group(1).title()
+            active_label = paragraph
+            mapping_labels.append((paragraph, current_question, active_type))
+            label_path_counts[id(paragraph._p)] = 0
+            remove.append(paragraph)
+            inline_path = label_match.group(2).strip()
+            if inline_path:
+                if add_path(current_question, active_type, inline_path, paragraph):
+                    label_path_counts[id(paragraph._p)] += 1
+            continue
+        if active_type and ">>" in text and not text.startswith("@"):
+            if add_path(current_question, active_type, text, paragraph) and active_label is not None:
+                label_path_counts[id(active_label._p)] += 1
+            continue
+        if text:
+            active_type = None
+            active_label = None
+
+    for label, question, mapping_type in mapping_labels:
+        if label_path_counts[id(label._p)] == 0:
+            findings.append(Finding(14, "manual_review", f"The {mapping_type} mapping block has no valid path.", question))
+
+    removed_nodes: set[int] = set()
+    for paragraph in remove:
+        node_id = id(paragraph._p)
+        if node_id not in removed_nodes:
+            removed_nodes.add(node_id)
+            _remove_paragraph(paragraph)
+
+    missing_snippets = sorted(question for question in questions_with_mappings if question not in snippet_ids)
+    for question in missing_snippets:
+        findings.append(Finding(14, "manual_review", "Mapping paths were prepared, but the question has no usable New snippet id. Add the snippet ID before applying mappings to CMS.", question))
+    if instructions:
+        findings.append(Finding(14, "fixed", f"Prepared {len(instructions)} curriculum/taxonomy mapping path(s) for {len(questions_with_mappings)} question(s) and removed the author-only mapping lines from the CMS-ready document."))
+    else:
+        findings.append(Finding(14, "passed", "No Curriculum or Taxonomy mapping instructions were found."))
+    return instructions
+
+
+def _write_mapping_csv(path: Path, instructions: list[MappingInstruction]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["Question", "Snippet ID", "Mapping Type", "Path"])
+        writer.writeheader()
+        for item in instructions:
+            writer.writerow(
+                {
+                    "Question": item.question,
+                    "Snippet ID": item.snippet_id or "",
+                    "Mapping Type": item.mapping_type,
+                    "Path": item.path,
+                }
+            )
+
+
+def _selected_processing_sections(options: ProcessorOptions) -> tuple[bool, bool, bool, bool, bool]:
     """Resolve the new independent switches while retaining old API callers."""
     if any(
         value is not None
-        for value in (options.add_cms_tags, options.process_images, options.format_math_structure)
+        for value in (
+            options.add_cms_tags,
+            options.process_images,
+            options.format_math,
+            options.normalize_text_structure,
+            options.prepare_mappings,
+            options.format_math_structure,
+        )
     ):
+        legacy_formatting = bool(options.format_math_structure)
         return (
             bool(options.add_cms_tags),
             bool(options.process_images),
-            bool(options.format_math_structure),
+            bool(options.format_math) if options.format_math is not None else legacy_formatting,
+            bool(options.normalize_text_structure) if options.normalize_text_structure is not None else legacy_formatting,
+            bool(options.prepare_mappings),
         )
     legacy = {
-        "full": (True, True, True),
-        "images_only": (False, True, False),
-        "images_math": (False, True, True),
+        "full": (True, True, True, True, False),
+        "images_only": (False, True, False, False, False),
+        "images_math": (False, True, True, True, False),
     }
     try:
         return legacy[options.processing_mode]
@@ -1732,20 +1878,30 @@ def _selected_processing_sections(options: ProcessorOptions) -> tuple[bool, bool
         raise ValueError(f"Unsupported processing mode: {options.processing_mode!r}") from exc
 
 
-def _output_suffix(add_cms_tags: bool, process_images: bool, format_math_structure: bool) -> str:
-    selected = (add_cms_tags, process_images, format_math_structure)
-    known = {
-        (True, True, True): "CMS_Verification_Ready",
-        (True, False, False): "CMS_Tags_Ready",
-        (False, True, False): "Images_Alt_Text_Ready",
-        (False, False, True): "Math_Structure_Ready",
-        (True, True, False): "CMS_Tags_Images_Ready",
-        (True, False, True): "CMS_Tags_Math_Ready",
-        (False, True, True): "Images_Alt_Text_Math_Ready",
-    }
-    if selected == (False, False, False):
+def _output_suffix(
+    add_cms_tags: bool,
+    process_images: bool,
+    format_math: bool,
+    normalize_text_structure: bool,
+    prepare_mappings: bool,
+) -> str:
+    selected = (add_cms_tags, process_images, format_math, normalize_text_structure)
+    if not any(selected) and not prepare_mappings:
         raise ValueError("Select at least one processing section.")
-    return known[selected]
+    if selected == (True, True, True, True):
+        return "CMS_Verification_Ready"
+    parts: list[str] = []
+    if add_cms_tags:
+        parts.append("CMS_Tags")
+    if process_images:
+        parts.append("Images_Alt_Text")
+    if format_math:
+        parts.append("Math")
+    if normalize_text_structure:
+        parts.append("Text_Format")
+    if not parts:
+        parts.append("Mapping_Data")
+    return "_".join(parts) + "_Ready"
 
 
 def _empty_image_result(run_images_dir: Path, images_zip_path: Path) -> ImagePipelineResult:
@@ -1793,9 +1949,23 @@ def process_docx(
     doc = Document(original_path)
     original_equations = _equation_inventory(doc)
     findings: list[Finding] = []
-    add_cms_tags, process_images, format_math_structure = _selected_processing_sections(options)
-    suffix = _output_suffix(add_cms_tags, process_images, format_math_structure)
+    add_cms_tags, process_images, format_math, normalize_text_structure, prepare_mappings = _selected_processing_sections(options)
+    suffix = _output_suffix(add_cms_tags, process_images, format_math, normalize_text_structure, prepare_mappings)
     preserve_cms_mode = not add_cms_tags
+    legacy_type_repair = (
+        options.processing_mode == "images_math"
+        and all(
+            value is None
+            for value in (
+                options.add_cms_tags,
+                options.process_images,
+                options.format_math,
+                options.normalize_text_structure,
+                options.prepare_mappings,
+                options.format_math_structure,
+            )
+        )
+    )
 
     if add_cms_tags:
         question_count = _ensure_cms_records(doc, options, findings)
@@ -1818,19 +1988,33 @@ def process_docx(
                     )
         else:
             findings.append(Finding(0, "manual_review", "No tagged or standard plain-text question headings were detected."))
-        _audit_question_types(doc, findings, fix_mismatches=format_math_structure)
+        _audit_question_types(doc, findings, fix_mismatches=legacy_type_repair)
 
-    if format_math_structure:
+    mapping_instructions: list[MappingInstruction] = []
+    if prepare_mappings:
+        mapping_instructions = _extract_mapping_instructions(doc, findings)
+    else:
+        findings.append(Finding(14, "passed", "Mapping-data preparation was not selected; Curriculum and Taxonomy lines were preserved unchanged."))
+
+    if normalize_text_structure:
         _remove_bold_from_questions_and_solutions(doc, findings)
+
+    if format_math:
         _remove_empty_scripts(doc, findings)
+
+    if normalize_text_structure:
         _convert_rupee_symbols(doc, findings)
         _repair_spacing(doc, findings)
         _split_answers(doc, findings)
         _normalise_subparts(doc, findings)
+
+    if format_math:
         _convert_explicit_math(doc, findings)
         _normalise_native_equation_boundaries(doc, findings)
         _repair_italics(doc, findings)
         _equation_and_fraction_audit(doc, findings)
+
+    if normalize_text_structure:
         _audit_assertion_reason(doc, findings)
         _preserve_table_formatting(doc, findings)
 
@@ -1852,6 +2036,8 @@ def process_docx(
             findings.append(Finding(0, "passed", f"No project ID could be derived from existing Question id tags; used fallback Project ID {project_id}."))
     run_images_dir = images_root / run_id
     images_zip_path = packages / f"{run_id}_{project_id}_images.zip"
+    mapping_csv_path = packages / f"{run_id}_{Path(safe_name).stem}_mapping_data.csv"
+    _write_mapping_csv(mapping_csv_path, mapping_instructions)
     if process_images:
         image_result = process_document_images(doc, project_id, run_images_dir, images_zip_path)
         for warning in image_result.warnings:
@@ -1893,8 +2079,14 @@ def process_docx(
         "selected_processing_sections": {
             "add_cms_tags": add_cms_tags,
             "process_images": process_images,
-            "format_math_structure": format_math_structure,
+            "format_math": format_math,
+            "normalize_text_structure": normalize_text_structure,
+            "prepare_mappings": prepare_mappings,
         },
+        "mapping_count": len(mapping_instructions),
+        "mapping_csv": str(mapping_csv_path),
+        "mappings": [asdict(item) for item in mapping_instructions],
+        "download_filename": output_name,
         "effective_project_id": project_id,
         "findings": [asdict(f) for f in findings],
     }
@@ -1912,6 +2104,8 @@ def process_docx(
         "image_count": len(image_result.artifacts),
         "image_manifest": str(image_result.manifest_json),
         "images_zip": str(images_zip_path),
+        "mapping_csv": str(mapping_csv_path),
+        "mapping_count": len(mapping_instructions),
         "manual_review_count": manual_review_count,
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1922,10 +2116,12 @@ def process_docx(
         manifest_path,
         image_result.manifest_json,
         images_zip_path,
+        mapping_csv_path,
         original_path,
         run_id,
         question_count,
         len(image_result.artifacts),
+        len(mapping_instructions),
         findings,
     )
 

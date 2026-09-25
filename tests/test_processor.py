@@ -1,5 +1,6 @@
 from pathlib import Path
 from zipfile import ZipFile
+import csv
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -58,7 +59,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-processing-sections-v13"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-mapping-workflow-v14"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -961,7 +962,9 @@ def test_independent_processing_sections_change_only_selected_content(tmp_path: 
             processing_mode="custom",
             add_cms_tags=False,
             process_images=True,
-            format_math_structure=False,
+            format_math=False,
+            normalize_text_structure=False,
+            prepare_mappings=False,
             project_question_prefix="fallback_q",
         ),
         tmp_path / "image_only",
@@ -980,7 +983,9 @@ def test_independent_processing_sections_change_only_selected_content(tmp_path: 
             processing_mode="custom",
             add_cms_tags=False,
             process_images=False,
-            format_math_structure=True,
+            format_math=True,
+            normalize_text_structure=False,
+            prepare_mappings=False,
         ),
         tmp_path / "math_only",
     )
@@ -1004,7 +1009,9 @@ def test_independent_processing_sections_change_only_selected_content(tmp_path: 
             processing_mode="custom",
             add_cms_tags=True,
             process_images=False,
-            format_math_structure=False,
+            format_math=False,
+            normalize_text_structure=False,
+            prepare_mappings=False,
             project_question_prefix="project13_q",
             start_snippet_id=13001,
         ),
@@ -1019,8 +1026,55 @@ def test_independent_processing_sections_change_only_selected_content(tmp_path: 
     assert report["selected_processing_sections"] == {
         "add_cms_tags": True,
         "process_images": False,
-        "format_math_structure": False,
+        "format_math": False,
+        "normalize_text_structure": False,
+        "prepare_mappings": False,
     }
+
+
+def test_mapping_blocks_are_extracted_per_question_and_removed_from_docx(tmp_path: Path):
+    source = tmp_path / "mapping_input.docx"
+    doc = Document()
+    for text in [
+        "Question 1: Easy, Knowledge",
+        "Question type: FIB",
+        "Curriculum: CBSE NCERT>>Class 4>>Mathematics>>Measuring Length >> Metres and Centimetres",
+        "India >> Class 4 >> Mathematics >>Measurement",
+        "India >> Class 4 >> Mathematics >> Case Study Based Questions",
+        "Taxonomy: Mathematics>>Measurement>>Length",
+        "How many centimetres are in one metre?",
+        "Answer: 100",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(
+            processing_mode="custom",
+            add_cms_tags=True,
+            process_images=False,
+            format_math=False,
+            normalize_text_structure=False,
+            prepare_mappings=True,
+            project_question_prefix="project14_q",
+            start_snippet_id=14001,
+        ),
+        tmp_path / "mapping_storage",
+    )
+
+    output_text = "\n".join(paragraph.text for paragraph in Document(result.output_path).paragraphs)
+    assert "Curriculum:" not in output_text
+    assert "Taxonomy:" not in output_text
+    assert "Case Study Based Questions" not in output_text
+    assert result.mapping_count == 4
+    with result.mapping_csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["Snippet ID"] for row in rows} == {"14001"}
+    assert [row["Mapping Type"] for row in rows] == ["Curriculum", "Curriculum", "Curriculum", "Taxonomy"]
+    assert rows[0]["Path"] == "CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length >> Metres and Centimetres"
+    assert rows[1]["Path"] == "India >> Class 4 >> Mathematics >> Measurement"
 
 
 def test_legacy_vml_picture_is_extracted_and_receives_alt_text(tmp_path: Path):
