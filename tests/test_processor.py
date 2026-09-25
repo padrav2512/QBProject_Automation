@@ -59,7 +59,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-focused-math-audit-v14.3"
+    assert PROCESSOR_BUILD_ID == "2026.09.25-plain-case-study-heading-v14.4"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -658,6 +658,58 @@ def test_tagged_question_suffix_is_counted_preserved_and_flagged(tmp_path: Path)
     )
     assert image_only.question_count == 1
     assert any(f.status == "manual_review" and "counted as a question" in f.message for f in image_only.findings)
+
+
+def test_plain_case_study_heading_and_stray_interquestion_text(tmp_path: Path):
+    source = tmp_path / "plain_case_study_suffix.docx"
+    doc = Document()
+
+    def add_metadata(difficulty: str, objective: str, question_type: str) -> None:
+        paragraph = doc.add_paragraph()
+        paragraph.add_run("Difficulty level:").bold = True
+        paragraph.add_run(f" {difficulty}\n")
+        paragraph.add_run("Objective:").bold = True
+        paragraph.add_run(f" {objective}\n")
+        paragraph.add_run("Question type:").bold = True
+        paragraph.add_run(f" {question_type}")
+
+    doc.add_paragraph("Question 1")
+    add_metadata("Easy", "Application", "FIB")
+    doc.add_paragraph("If 3x+5=20, find the value of x.")
+    doc.add_paragraph("Answer: 5")
+    doc.add_paragraph("Question 2 Case study")
+    add_metadata("Easy", "Comprehension", "FIB")
+    doc.add_paragraph("Riya drank juice in the morning and 1/4 litres in the evening.")
+    doc.add_paragraph("Answer: 7/12 litres")
+    doc.add_paragraph("Inserting text on purpose")
+    doc.add_paragraph("Question 3")
+    add_metadata("Average", "Comprehension", "MCQ")
+    doc.add_paragraph("Assertion (A): 5² = 25.\nReason (R): The exponent 2 means that 5 is multiplied by itself twice.")
+    for text in [
+        "a) Both Assertion (A) and Reason (R) are true and Reason (R) is the correct explanation of Assertion (A)",
+        "b) Both Assertion (A) and Reason (R) are true and Reason (R) is not the correct explanation of Assertion (A)",
+        "c) Assertion (A) is true but Reason (R) is false",
+        "d) Assertion (A) is false but Reason (R) is true",
+        "Answer: a",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    output = Document(result.output_path)
+    texts = [paragraph.text for paragraph in output.paragraphs]
+
+    assert result.question_count == 3
+    assert [text for text in texts if text.startswith("@Question: ")] == [
+        "@Question: 1@",
+        "@Question: 2@",
+        "@Question: 3@",
+    ]
+    q2_marker = texts.index("@Question:@", texts.index("@Question: 2@"))
+    assert texts[q2_marker + 1] == "Case study"
+    assert "@1@ Both Assertion (A) and Reason (R) are true and Reason (R) is the correct explanation of Assertion (A) @correct answer@" in texts
+    assert any("text after its closing tag" in finding.message and finding.question == 2 for finding in result.findings)
+    assert any("outside a recognised" in finding.message and "Inserting text on purpose" in finding.message for finding in result.findings)
 
 
 def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):

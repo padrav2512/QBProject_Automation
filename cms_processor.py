@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.25-focused-math-audit-v14.3"
+PROCESSOR_BUILD_ID = "2026.09.25-plain-case-study-heading-v14.4"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -46,6 +46,10 @@ KNOWN_METADATA_RE = re.compile(
 )
 PLAIN_METADATA_RE = re.compile(
     r"^(Type|Question type|Question id|New snippet id|Difficulty(?: level)?|Objective):\s*(.*?)\s*$",
+    re.I,
+)
+PLAIN_QUESTION_START_WITH_SUFFIX_RE = re.compile(
+    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s+(Case\s+study)\s*$",
     re.I,
 )
 SECTION_ALIASES = {
@@ -304,6 +308,7 @@ def _question_starts(doc: _Document) -> list[tuple[Paragraph, int]]:
             QUESTION_START_RE.fullmatch(text)
             or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
             or PLAIN_QUESTION_START_RE.fullmatch(text)
+            or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
         )
         if match:
             starts.append((paragraph, int(match.group(1))))
@@ -627,7 +632,10 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
         assigned_number = options.start_question_number + ordinal
-        suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
+        suffix_match = (
+            QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
+            or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
+        )
         heading_suffix = suffix_match.group(2).strip() if suffix_match else None
         heading_match = PLAIN_QUESTION_START_RE.fullmatch(start.text.strip())
         heading_difficulty = DIFFICULTY_ALIASES.get((heading_match.group(2) or "").casefold()) if heading_match else None
@@ -710,6 +718,38 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
                 findings.append(Finding(0, "fixed", f"Inserted a missing @e@ after {block[pos].text.strip()}.", assigned_number))
 
     return len(starts)
+
+
+def _audit_unsectioned_record_text(doc: _Document, findings: list[Finding]) -> None:
+    """Flag preserved text that sits between CMS sections within a question record."""
+    context = _section_for_paragraphs(doc)
+    for index, paragraph in enumerate(body_paragraphs(doc), 1):
+        section, question = context.get(paragraph._p, (None, None))
+        text = paragraph.text.strip()
+        if question is None or section is not None or not text:
+            continue
+        if (
+            QUESTION_START_RE.fullmatch(text)
+            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            or PLAIN_QUESTION_START_RE.fullmatch(text)
+            or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            or KNOWN_METADATA_RE.fullmatch(text)
+            or PLAIN_METADATA_RE.fullmatch(text)
+            or text in SECTION_MARKERS
+            or text == "@e@"
+            or MAPPING_LABEL_RE.fullmatch(text)
+            or ">>" in text
+        ):
+            continue
+        findings.append(
+            Finding(
+                8,
+                "manual_review",
+                f"Text occurs outside a recognised Question, Answers/Choices or Solution section and was preserved in place: {text!r}",
+                question,
+                index,
+            )
+        )
 
 
 def _section_for_paragraphs(doc: _Document) -> dict[object, tuple[str | None, int | None]]:
@@ -1973,7 +2013,10 @@ def process_docx(
         if question_count:
             findings.append(Finding(0, "passed", "CMS tag insertion was not selected; existing question IDs, snippet IDs and CMS record structure were preserved."))
             for paragraph, number in _question_starts(doc):
-                suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
+                suffix_match = (
+                    QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
+                    or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
+                )
                 if suffix_match:
                     findings.append(
                         Finding(
@@ -1992,6 +2035,9 @@ def process_docx(
         mapping_instructions = _extract_mapping_instructions(doc, findings)
     else:
         findings.append(Finding(14, "passed", "Mapping-data preparation was not selected; Curriculum and Taxonomy lines were preserved unchanged."))
+
+    if add_cms_tags:
+        _audit_unsectioned_record_text(doc, findings)
 
     if normalize_text_structure:
         _remove_bold_from_questions_and_solutions(doc, findings)
