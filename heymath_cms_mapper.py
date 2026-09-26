@@ -7,7 +7,7 @@ it never removes or replaces mappings already present in CMS.
 from __future__ import annotations
 
 import html as _html
-from difflib import get_close_matches
+from difflib import SequenceMatcher
 import logging
 import re
 import threading
@@ -159,12 +159,51 @@ class HeyMathCmsMapper:
             index = self._taxonomy_index if taxonomy else self._curriculum_index
             matches = index.get(norm(path)) if index else None
             if not matches:
-                candidates = get_close_matches(norm(path), list(index or {}), n=3, cutoff=0.72)
-                suggestion = f" Did you mean: {'; '.join(candidates)}?" if candidates else ""
+                candidates = self._suggest_paths(path, index or {})
+                suggestion = f" Closest CMS matches: {'; '.join(candidates)}." if candidates else ""
                 return f"Path not found: {path}.{suggestion}"
             if len(matches) > 1:
                 return f"Path is ambiguous ({len(matches)} nodes): {path}"
             return None
+
+    @staticmethod
+    def _suggest_paths(path: str, index: dict[str, list[str]], limit: int = 3) -> list[str]:
+        """Return hierarchy-aware suggestions without treating them as approved mappings."""
+        requested = norm(path)
+        requested_parts = [part.casefold() for part in requested.split(SEP)]
+        if not requested_parts:
+            return []
+
+        ranked: list[tuple[float, int, str]] = []
+        for candidate in index:
+            candidate_parts = [part.casefold() for part in candidate.split(SEP)]
+            common_prefix = 0
+            for requested_part, candidate_part in zip(requested_parts, candidate_parts):
+                if requested_part != candidate_part:
+                    break
+                common_prefix += 1
+
+            whole_similarity = SequenceMatcher(
+                None, requested.casefold(), candidate.casefold()
+            ).ratio()
+            leaf_similarity = SequenceMatcher(
+                None, requested_parts[-1], candidate_parts[-1]
+            ).ratio()
+            shared_branch = common_prefix >= min(2, len(requested_parts), len(candidate_parts))
+
+            # Prefer paths in the same CMS branch, while still allowing a very close
+            # spelling correction when the mismatch occurs near the root.
+            score = (
+                whole_similarity
+                + (0.20 if shared_branch else 0.0)
+                + 0.10 * leaf_similarity
+                - 0.025 * abs(len(requested_parts) - len(candidate_parts))
+            )
+            if shared_branch or whole_similarity >= 0.62:
+                ranked.append((score, common_prefix, candidate))
+
+        ranked.sort(key=lambda item: (-item[0], -item[1], item[2].casefold()))
+        return [candidate for _, _, candidate in ranked[:limit]]
 
     def get_mappings(self, snippet_id: int) -> dict | None:
         """Return the current mappings without changing the CMS."""

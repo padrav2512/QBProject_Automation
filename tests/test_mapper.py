@@ -92,7 +92,41 @@ def test_validate_path_suggests_a_close_cms_path():
 
     assert error is not None
     assert "Path not found" in error
-    assert "Did you mean: Mathematics >> Measurement >> Measuring Temperature?" in error
+    assert "Closest CMS matches: Mathematics >> Measurement >> Measuring Temperature." in error
+
+
+def test_validate_path_suggests_same_branch_when_leaf_is_different():
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._curriculum_index = {"Known >> Path": ["10"]}
+    mapper._taxonomy_index = {
+        "Mathematics >> Measurement >> Length >> Measuring Distance": ["20"],
+        "Mathematics >> Measurement >> Length >> Perimeter": ["21"],
+        "Mathematics >> Geometry >> Circles": ["22"],
+    }
+    mapper._trees_loaded_at = 10**12
+    mapper._logged_in = True
+
+    error = mapper.validate_path(
+        "Mathematics >> Measurement >> Lengths >> Distance",
+        taxonomy=True,
+    )
+
+    assert error is not None
+    assert "Mathematics >> Measurement >> Length >> Measuring Distance" in error
+    assert "Mathematics >> Geometry >> Circles" not in error
+
+
+def test_validate_path_omits_unreliable_suggestions():
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._curriculum_index = {"CBSE NCERT >> Class 4 >> Mathematics": ["10"]}
+    mapper._taxonomy_index = {"Language >> Grammar >> Nouns": ["20"]}
+    mapper._trees_loaded_at = 10**12
+    mapper._logged_in = True
+
+    error = mapper.validate_path("Completely unrelated value", taxonomy=True)
+
+    assert error is not None
+    assert "Closest CMS matches" not in error
 
 
 def test_resolve_snippet_id_requires_exact_question_name(monkeypatch):

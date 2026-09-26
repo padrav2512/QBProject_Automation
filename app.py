@@ -332,6 +332,7 @@ st.divider()
 with st.expander("Apply mappings to CMS", expanded=False):
     st.write("Use this after the questions exist in CMS, whether they were created by Anand’s tool or were already present. Upload a mapping CSV or XLSX, review it, and then apply the mappings.")
     st.info("Existing Curriculum and Taxonomy mappings are retained. This tool only adds missing mappings; it never removes or replaces an existing mapping.")
+    st.caption("If a path is not found, the pre-check lists up to three closest paths from the corresponding live CMS tree. Suggestions are never applied automatically.")
     st.caption(
         "Accepted layouts: Question/Project + Snippet ID + Mapping Type + Path; or Snippet ID/Project with qno + separate Taxonomy and Curriculum columns. "
         "Several paths may be placed on separate lines within one cell."
@@ -440,10 +441,26 @@ with st.expander("Apply mappings to CMS", expanded=False):
                         f"Snippet {row['Snippet ID']} is named {cms_name!r} in CMS, not {row['Question']!r}."
                     )
 
-            for _, row in resolved_frame.drop_duplicates(["Mapping Type", "Path"]).iterrows():
-                error = mapper.validate_path(row["Path"], taxonomy=row["Mapping Type"] == "Taxonomy")
+            for (mapping_type, path), affected_rows in resolved_frame.groupby(
+                ["Mapping Type", "Path"], sort=False
+            ):
+                error = mapper.validate_path(path, taxonomy=mapping_type == "Taxonomy")
                 if error:
-                    validation_errors.append(f"{row['Mapping Type']}: {error}")
+                    targets: list[str] = []
+                    for _, affected in affected_rows.drop_duplicates(["Question", "Snippet ID"]).iterrows():
+                        question_name = str(affected["Question"]).strip()
+                        snippet_text = str(affected["Snippet ID"]).strip()
+                        if question_name and snippet_text:
+                            target = f"{question_name} (Snippet ID {snippet_text})"
+                        elif question_name:
+                            target = question_name
+                        else:
+                            target = f"Snippet ID {snippet_text}"
+                        if target not in targets:
+                            targets.append(target)
+                    validation_errors.append(
+                        f"{mapping_type} for {', '.join(targets)}: {error}"
+                    )
 
         if validation_errors:
             st.error(
