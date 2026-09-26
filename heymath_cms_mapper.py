@@ -34,6 +34,25 @@ def _norm_all(paths: Iterable[str] | None) -> list[str]:
     return [norm(path) for path in (paths or []) if path and str(path).strip()]
 
 
+def _lookup_path(index: dict[str, list[str]], path: str) -> tuple[str, list[str]] | None:
+    """Find a canonical CMS path without making letter case significant."""
+    requested = norm(path).casefold()
+    matching_keys = [candidate for candidate in index if candidate.casefold() == requested]
+    if not matching_keys:
+        return None
+    ids: list[str] = []
+    for key in matching_keys:
+        for node_id in index[key]:
+            if node_id not in ids:
+                ids.append(node_id)
+    return matching_keys[0], ids
+
+
+def _contains_path(paths: Iterable[str], path: str) -> bool:
+    requested = norm(path).casefold()
+    return any(norm(candidate).casefold() == requested for candidate in paths)
+
+
 @dataclass
 class MappingResult:
     snippet_id: int
@@ -138,16 +157,16 @@ class HeyMathCmsMapper:
             result.curriculum_after = after["curriculum"]
             result.taxonomy_after = after["taxonomy"]
             for path in _norm_all(curriculum_paths):
-                if path not in after["curriculum"]:
+                if not _contains_path(after["curriculum"], path):
                     result.errors.append(f"Curriculum mapping was not saved: {path}")
             for path in _norm_all(taxonomy_paths):
-                if path not in after["taxonomy"]:
+                if not _contains_path(after["taxonomy"], path):
                     result.errors.append(f"Taxonomy mapping was not saved: {path}")
             for path in page["curriculum"]:
-                if path not in after["curriculum"]:
+                if not _contains_path(after["curriculum"], path):
                     result.errors.append(f"Existing curriculum mapping disappeared: {path}")
             for path in page["taxonomy"]:
-                if path not in after["taxonomy"]:
+                if not _contains_path(after["taxonomy"], path):
                     result.errors.append(f"Existing taxonomy mapping disappeared: {path}")
             log.info(result.summary())
             return result
@@ -157,11 +176,12 @@ class HeyMathCmsMapper:
             self._ensure_logged_in()
             self._ensure_trees()
             index = self._taxonomy_index if taxonomy else self._curriculum_index
-            matches = index.get(norm(path)) if index else None
-            if not matches:
+            resolved = _lookup_path(index or {}, path)
+            if resolved is None:
                 candidates = self._suggest_paths(path, index or {})
                 suggestion = f" Closest CMS matches: {'; '.join(candidates)}." if candidates else ""
                 return f"Path not found: {path}.{suggestion}"
+            _, matches = resolved
             if len(matches) > 1:
                 return f"Path is ambiguous ({len(matches)} nodes): {path}"
             return None
@@ -225,31 +245,35 @@ class HeyMathCmsMapper:
             return None, "A Project with qno value is blank."
         with self._lock:
             self._ensure_logged_in()
-            token = self._site_authenticity_token()
-            response = self._session.post(
-                self.base_url + "/site/search",
-                data={
-                    "authenticity_token": token,
-                    "searchterms": requested,
-                    "content_type": "Question",
-                },
-                timeout=TIMEOUT,
-            )
-            if self._looks_like_login(response):
-                self._logged_in = False
-                self._ensure_logged_in()
+            candidates: list[str] = []
+            for search_term in dict.fromkeys((requested, requested.casefold())):
                 token = self._site_authenticity_token()
                 response = self._session.post(
                     self.base_url + "/site/search",
                     data={
                         "authenticity_token": token,
-                        "searchterms": requested,
+                        "searchterms": search_term,
                         "content_type": "Question",
                     },
                     timeout=TIMEOUT,
                 )
-            response.raise_for_status()
-            candidates = list(dict.fromkeys(re.findall(r'''href=["']/question/(\d+)/''', response.text, re.I)))
+                if self._looks_like_login(response):
+                    self._logged_in = False
+                    self._ensure_logged_in()
+                    token = self._site_authenticity_token()
+                    response = self._session.post(
+                        self.base_url + "/site/search",
+                        data={
+                            "authenticity_token": token,
+                            "searchterms": search_term,
+                            "content_type": "Question",
+                        },
+                        timeout=TIMEOUT,
+                    )
+                response.raise_for_status()
+                for candidate in re.findall(r'''href=["']/question/(\d+)/''', response.text, re.I):
+                    if candidate not in candidates:
+                        candidates.append(candidate)
             exact: list[int] = []
             for candidate in candidates[:50]:
                 page = self._load_mapping_page(int(candidate))
@@ -361,13 +385,16 @@ class HeyMathCmsMapper:
         for raw in paths:
             if not raw or not str(raw).strip():
                 continue
-            path = norm(raw)
-            matches = index.get(path)
-            if not matches:
+            requested_path = norm(raw)
+            resolved = _lookup_path(index, requested_path)
+            if resolved is None:
+                path = requested_path
                 result.errors.append(f"{label} path not found in the CMS tree: {path}")
-            elif len(matches) > 1:
+                continue
+            path, matches = resolved
+            if len(matches) > 1:
                 result.errors.append(f"{label} path matches {len(matches)} CMS nodes: {path}")
-            elif path in current:
+            elif _contains_path(current, path):
                 result.already_present.append(f"{label}: {path}")
             elif matches[0] not in ids:
                 ids.append(matches[0])

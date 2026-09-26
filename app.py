@@ -332,7 +332,7 @@ st.divider()
 with st.expander("Apply mappings to CMS", expanded=False):
     st.write("Use this after the questions exist in CMS, whether they were created by Anand’s tool or were already present. Upload a mapping CSV or XLSX, review it, and then apply the mappings.")
     st.info("Existing Curriculum and Taxonomy mappings are retained. This tool only adds missing mappings; it never removes or replaces an existing mapping.")
-    st.caption("If a path is not found, the pre-check lists up to three closest paths from the corresponding live CMS tree. Suggestions are never applied automatically.")
+    st.caption("Project names, spreadsheet headings and Curriculum/Taxonomy paths are matched without regard to uppercase or lowercase. Spelling and hierarchy must still match. If a path is not found, the pre-check lists up to three closest paths from the corresponding live CMS tree; suggestions are never applied automatically.")
     st.caption(
         "Accepted layouts: Question/Project + Snippet ID + Mapping Type + Path; or Snippet ID/Project with qno + separate Taxonomy and Curriculum columns. "
         "Several paths may be placed on separate lines within one cell."

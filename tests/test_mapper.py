@@ -33,8 +33,8 @@ def test_mapper_adds_missing_paths_and_retains_existing_mappings(monkeypatch):
 
     result = mapper.map_question(
         1001,
-        ["Existing>>Curriculum", "New >> Curriculum"],
-        ["Existing >> Taxonomy", "New>>Taxonomy"],
+        ["existing>>curriculum", "NEW >> curriculum"],
+        ["EXISTING >> taxonomy", "new>>TAXONOMY"],
     )
 
     assert result.success
@@ -95,6 +95,23 @@ def test_validate_path_suggests_a_close_cms_path():
     assert "Closest CMS matches: Mathematics >> Measurement >> Measuring Temperature." in error
 
 
+def test_validate_path_is_case_insensitive():
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._curriculum_index = {
+        "India >> Class 4 >> Mathematics >> Measurement": ["10"]
+    }
+    mapper._taxonomy_index = {"Mathematics >> Measurement >> Lengths": ["20"]}
+    mapper._trees_loaded_at = 10**12
+    mapper._logged_in = True
+
+    assert mapper.validate_path(
+        "mathematics >> MEASUREMENT >> lengths", taxonomy=True
+    ) is None
+    assert mapper.validate_path(
+        "india >> class 4 >> mathematics >> measurement"
+    ) is None
+
+
 def test_validate_path_suggests_same_branch_when_leaf_is_different():
     mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
     mapper._curriculum_index = {"Known >> Path": ["10"]}
@@ -142,17 +159,24 @@ def test_resolve_snippet_id_requires_exact_question_name(monkeypatch):
         def raise_for_status():
             return None
 
-    monkeypatch.setattr(mapper._session, "post", lambda *args, **kwargs: Response())
+    search_terms = []
+
+    def fake_post(*args, **kwargs):
+        search_terms.append(kwargs["data"]["searchterms"])
+        return Response()
+
+    monkeypatch.setattr(mapper._session, "post", fake_post)
     monkeypatch.setattr(
         mapper,
         "_load_mapping_page",
         lambda snippet_id: {"name": "project10433_q71" if snippet_id == 219263 else "project10433_q710"},
     )
 
-    snippet_id, error = mapper.resolve_snippet_id("project10433_q71")
+    snippet_id, error = mapper.resolve_snippet_id("PROJECT10433_Q71")
 
     assert snippet_id == 219263
     assert error is None
+    assert "project10433_q71" in search_terms
 
 
 def test_resolve_snippet_id_reports_missing_exact_match(monkeypatch):
