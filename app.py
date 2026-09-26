@@ -10,7 +10,7 @@ import streamlit as st
 
 import cms_processor as _cms_processor
 from heymath_cms_mapper import HeyMathCmsMapper
-from mapping_input import read_mapping_table, xlsx_sheet_names
+from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_sheet_names
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-preserve-existing-snippets-v14.7"
@@ -332,7 +332,10 @@ st.divider()
 with st.expander("Apply mappings to CMS", expanded=False):
     st.write("Use this after the questions exist in CMS, whether they were created by Anand’s tool or were already present. Upload a mapping CSV or XLSX, review it, and then apply the mappings.")
     st.info("Existing Curriculum and Taxonomy mappings are retained. This tool only adds missing mappings; it never removes or replaces an existing mapping.")
-    st.caption("Required columns: Question, Snippet ID, Mapping Type, Path. Use one Curriculum or Taxonomy path per row.")
+    st.caption(
+        "Accepted layouts: Question/Project + Snippet ID + Mapping Type + Path; or Snippet ID/Project with qno + separate Taxonomy and Curriculum columns. "
+        "Several paths may be placed on separate lines within one cell."
+    )
     mapping_upload = st.file_uploader("Upload mapping CSV or XLSX", type=["csv", "xlsx"], key="mapping_file_upload")
     mapping_frame = None
     mapping_problem = None
@@ -351,30 +354,21 @@ with st.expander("Apply mappings to CMS", expanded=False):
                 elif sheet_names:
                     selected_sheet = sheet_names[0]
                     st.caption(f"Using worksheet: {selected_sheet}")
-            mapping_frame = read_mapping_table(mapping_bytes, mapping_upload.name, selected_sheet)
+            mapping_frame = normalize_mapping_table(
+                read_mapping_table(mapping_bytes, mapping_upload.name, selected_sheet)
+            )
         except Exception as exc:
             mapping_problem = f"The mapping file could not be read: {exc}"
         else:
-            required_columns = {"Question", "Snippet ID", "Mapping Type", "Path"}
-            missing_columns = required_columns - set(mapping_frame.columns)
-            if missing_columns:
-                mapping_problem = "The mapping file is missing: " + ", ".join(sorted(missing_columns))
-            else:
-                mapping_frame = mapping_frame[["Question", "Snippet ID", "Mapping Type", "Path"]].copy()
-                mapping_frame["Mapping Type"] = mapping_frame["Mapping Type"].str.strip().str.title()
-                mapping_frame["Path"] = mapping_frame["Path"].str.strip()
-                invalid_types = mapping_frame[~mapping_frame["Mapping Type"].isin(["Curriculum", "Taxonomy"])]
-                invalid_snippets = mapping_frame[~mapping_frame["Snippet ID"].str.fullmatch(r"\d+")]
-                empty_paths = mapping_frame[mapping_frame["Path"] == ""]
-                if not invalid_types.empty:
-                    mapping_problem = "Every Mapping Type must be Curriculum or Taxonomy."
-                elif not invalid_snippets.empty:
-                    mapping_problem = "Every mapping row needs a numeric Snippet ID."
-                elif not empty_paths.empty:
-                    mapping_problem = "Every mapping row needs a path."
-                else:
-                    st.dataframe(mapping_frame, use_container_width=True, hide_index=True)
-                    st.caption(f"{len(mapping_frame)} mapping path(s) across {mapping_frame['Snippet ID'].nunique()} snippet(s).")
+            st.dataframe(mapping_frame, use_container_width=True, hide_index=True)
+            known_snippets = mapping_frame.loc[mapping_frame["Snippet ID"] != "", "Snippet ID"].nunique()
+            project_lookups = mapping_frame.loc[mapping_frame["Snippet ID"] == "", "Question"].nunique()
+            summary_parts = [f"{len(mapping_frame)} mapping path(s)"]
+            if known_snippets:
+                summary_parts.append(f"{known_snippets} supplied snippet ID(s)")
+            if project_lookups:
+                summary_parts.append(f"{project_lookups} Project with qno value(s) to resolve in CMS")
+            st.caption(" · ".join(summary_parts) + ".")
 
     if mapping_problem:
         st.error(mapping_problem)
@@ -417,11 +411,36 @@ with st.expander("Apply mappings to CMS", expanded=False):
     if st.button("Validate and apply mappings to CMS", type="primary", disabled=not can_apply, use_container_width=True):
         mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"])
         validation_errors: list[str] = []
+        resolved_frame = mapping_frame.copy()
         with st.spinner("Checking CMS snippets and mapping paths before saving anything…"):
-            for snippet_text in mapping_frame["Snippet ID"].drop_duplicates():
-                if mapper.get_mappings(int(snippet_text)) is None:
+            unresolved_questions = resolved_frame.loc[resolved_frame["Snippet ID"] == "", "Question"].drop_duplicates()
+            for question_name in unresolved_questions:
+                snippet_id, error = mapper.resolve_snippet_id(question_name)
+                if error:
+                    validation_errors.append(error)
+                elif snippet_id is not None:
+                    resolved_frame.loc[
+                        (resolved_frame["Snippet ID"] == "") & (resolved_frame["Question"] == question_name),
+                        "Snippet ID",
+                    ] = str(snippet_id)
+
+            snippet_pages: dict[str, dict | None] = {}
+            for snippet_text in resolved_frame.loc[resolved_frame["Snippet ID"] != "", "Snippet ID"].drop_duplicates():
+                page = mapper.get_mappings(int(snippet_text))
+                snippet_pages[snippet_text] = page
+                if page is None:
                     validation_errors.append(f"Snippet {snippet_text} does not yet exist in CMS.")
-            for _, row in mapping_frame.drop_duplicates(["Mapping Type", "Path"]).iterrows():
+
+            project_rows = resolved_frame[resolved_frame["Question"].str.match(r"(?i)^project.+_q\d+$")]
+            for _, row in project_rows[["Question", "Snippet ID"]].drop_duplicates().iterrows():
+                page = snippet_pages.get(row["Snippet ID"])
+                cms_name = str((page or {}).get("name") or "").strip()
+                if page is not None and cms_name.casefold() != row["Question"].strip().casefold():
+                    validation_errors.append(
+                        f"Snippet {row['Snippet ID']} is named {cms_name!r} in CMS, not {row['Question']!r}."
+                    )
+
+            for _, row in resolved_frame.drop_duplicates(["Mapping Type", "Path"]).iterrows():
                 error = mapper.validate_path(row["Path"], taxonomy=row["Mapping Type"] == "Taxonomy")
                 if error:
                     validation_errors.append(f"{row['Mapping Type']}: {error}")
@@ -433,6 +452,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
             )
             st.dataframe(pd.DataFrame({"Problem": validation_errors}), use_container_width=True, hide_index=True)
         else:
+            mapping_frame = resolved_frame
             result_rows = []
             grouped = list(mapping_frame.groupby("Snippet ID", sort=False))
             progress = st.progress(0.0)
@@ -529,6 +549,8 @@ with st.expander("What the app checks"):
 - Connects every path to its question number and New snippet ID.
 - Removes the author-only mapping lines from the processed DOCX and creates a reusable mapping CSV.
 - Supports a later CMS mapping step after Anand’s upload has created the snippets.
+- The later mapping step accepts long mapping rows or wide Project/Snippet ID/Taxonomy/Curriculum spreadsheets, including multiline path cells.
+- A missing snippet ID can be resolved from one exact CMS Project with qno/Project question name.
 - Adds missing mappings only. Existing CMS mappings are retained and are never removed or replaced.
 
 Only the selected sections change the document. The verification report records every applied fix and every unresolved manual check.

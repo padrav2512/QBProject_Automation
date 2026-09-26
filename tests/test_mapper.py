@@ -95,6 +95,54 @@ def test_validate_path_suggests_a_close_cms_path():
     assert "Did you mean: Mathematics >> Measurement >> Measuring Temperature?" in error
 
 
+def test_resolve_snippet_id_requires_exact_question_name(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    monkeypatch.setattr(mapper, "_site_authenticity_token", lambda: "search-token")
+
+    class Response:
+        text = '<a href="/question/219263/edit">project10433_q71</a><a href="/question/219264/edit">project10433_q710</a>'
+        url = "https://cms.example/site/search"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(mapper._session, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        mapper,
+        "_load_mapping_page",
+        lambda snippet_id: {"name": "project10433_q71" if snippet_id == 219263 else "project10433_q710"},
+    )
+
+    snippet_id, error = mapper.resolve_snippet_id("project10433_q71")
+
+    assert snippet_id == 219263
+    assert error is None
+
+
+def test_resolve_snippet_id_reports_missing_exact_match(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    monkeypatch.setattr(mapper, "_site_authenticity_token", lambda: "search-token")
+
+    class Response:
+        text = '<a href="/question/219264/edit">project10433_q710</a>'
+        url = "https://cms.example/site/search"
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(mapper._session, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(mapper, "_load_mapping_page", lambda snippet_id: {"name": "project10433_q710"})
+
+    snippet_id, error = mapper.resolve_snippet_id("project10433_q71")
+
+    assert snippet_id is None
+    assert "No exact CMS question" in error
+
+
 def test_mapper_accepts_realistic_form_spacing_and_single_quotes():
     page = """
     <form action = '/curriculum_trees/add_mapping' method = 'post'>

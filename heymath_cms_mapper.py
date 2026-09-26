@@ -179,6 +179,50 @@ class HeyMathCmsMapper:
                 "taxonomy": page["taxonomy"],
             }
 
+    def resolve_snippet_id(self, question_name: str) -> tuple[int | None, str | None]:
+        """Resolve an exact CMS question name such as project10433_q71 to its snippet ID."""
+        requested = re.sub(r"\s+", " ", str(question_name)).strip()
+        if not requested:
+            return None, "A Project with qno value is blank."
+        with self._lock:
+            self._ensure_logged_in()
+            token = self._site_authenticity_token()
+            response = self._session.post(
+                self.base_url + "/site/search",
+                data={
+                    "authenticity_token": token,
+                    "searchterms": requested,
+                    "content_type": "Question",
+                },
+                timeout=TIMEOUT,
+            )
+            if self._looks_like_login(response):
+                self._logged_in = False
+                self._ensure_logged_in()
+                token = self._site_authenticity_token()
+                response = self._session.post(
+                    self.base_url + "/site/search",
+                    data={
+                        "authenticity_token": token,
+                        "searchterms": requested,
+                        "content_type": "Question",
+                    },
+                    timeout=TIMEOUT,
+                )
+            response.raise_for_status()
+            candidates = list(dict.fromkeys(re.findall(r'''href=["']/question/(\d+)/''', response.text, re.I)))
+            exact: list[int] = []
+            for candidate in candidates[:50]:
+                page = self._load_mapping_page(int(candidate))
+                candidate_name = re.sub(r"\s+", " ", str((page or {}).get("name") or "")).strip()
+                if candidate_name.casefold() == requested.casefold():
+                    exact.append(int(candidate))
+            if not exact:
+                return None, f"No exact CMS question named {requested!r} was found."
+            if len(exact) > 1:
+                return None, f"CMS contains more than one exact question named {requested!r}: {', '.join(map(str, exact))}."
+            return exact[0], None
+
     def test_connection(self, *, refresh_trees: bool = True) -> dict[str, int]:
         """Log in and load both mapping trees without changing CMS content."""
         with self._lock:
@@ -227,6 +271,24 @@ class HeyMathCmsMapper:
             "curriculum": curriculum,
             "taxonomy": taxonomy,
         }
+
+    def _site_authenticity_token(self) -> str:
+        text = self._get("/user")
+        input_match = re.search(
+            r'''(?is)<input[^>]*name=["']authenticity_token["'][^>]*>''',
+            text,
+        )
+        if input_match:
+            value = re.search(r'''value=["']([^"']+)["']''', input_match.group(0), re.I)
+            if value:
+                return _html.unescape(value.group(1))
+        meta = re.search(
+            r'''(?is)<meta[^>]*name=["']csrf-token["'][^>]*content=["']([^"']+)["']''',
+            text,
+        )
+        if meta:
+            return _html.unescape(meta.group(1))
+        raise RuntimeError("The CMS search token could not be found; the CMS page may have changed.")
 
     @staticmethod
     def _form_token(text: str, action: str) -> str | None:
