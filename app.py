@@ -93,7 +93,7 @@ with st.sidebar:
 
 **3. Safe Math formatting** — Converts clear fractions and radicals, preserves valid native equations, italicises high-confidence variables and reports genuinely ambiguous scope.
 
-**4. Text and document formatting** — Repairs spacing, rupee notation, whole-block bold, answer layout, subparts and Assertion–Reason structure.
+**4. Text and document formatting** — Repairs spacing, rupee notation, whole-block bold, answer layout and subparts. For a clearly detected Assertion–Reason item, it can add the standard introductory sentence and reports incomplete choice structure for review.
 
 **5. Mapping data** — Reads per-question Curriculum and Taxonomy paths and creates the mapping CSV for use after Anand’s upload.
 """
@@ -558,7 +558,7 @@ with st.expander("What the app checks"):
 - Repairs deterministic prose, punctuation and operator spacing.
 - Converts numeric rupee amounts such as `₹ 1,250` to `Rs 1,250`.
 - Removes bold only when an entire Question, Choices or Solution block is bold; selective emphasis is preserved.
-- Normalises unambiguous answer lines, subpart labels and Assertion–Reason structure, while preserving table formatting.
+- Normalises unambiguous answer lines and subpart labels while preserving table formatting. For Assertion–Reason items, it adds only a missing standard introductory sentence; missing choices or correct-answer markers are reported rather than invented.
 
 **5. Prepare curriculum and taxonomy mapping data**
 
