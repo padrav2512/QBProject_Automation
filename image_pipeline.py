@@ -15,7 +15,12 @@ from PIL import Image, ImageChops
 
 
 QUESTION_RE = re.compile(r"^@Question:\s*(\d+)\s*@(?:\s+.+)?$", re.I)
+PLAIN_QUESTION_RE = re.compile(
+    r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?(?:\s+.*)?$",
+    re.I,
+)
 CHOICE_RE = re.compile(r"^@([1-4])@")
+PLAIN_CHOICE_RE = re.compile(r"^\s*([a-d])\s*[).:]", re.I)
 SECTION_MARKERS = {"@Question:@", "@Choices:@", "@Answers:@", "@Solution:@"}
 WHITE_TOLERANCE = 12
 VML_NS = "urn:schemas-microsoft-com:vml"
@@ -134,6 +139,10 @@ def _collect_occurrences(doc: _Document) -> list[_Occurrence]:
             question = int(question_match.group(1))
             section = "metadata"
             choice = None
+        elif plain_question_match := PLAIN_QUESTION_RE.fullmatch(stripped):
+            question = int(plain_question_match.group(1))
+            section = "question"
+            choice = None
         elif stripped in SECTION_MARKERS:
             section = {
                 "@Question:@": "question",
@@ -149,6 +158,15 @@ def _collect_occurrences(doc: _Document) -> list[_Occurrence]:
             choice_match = CHOICE_RE.match(stripped)
             if choice_match:
                 choice = int(choice_match.group(1))
+        elif re.fullmatch(r"Answers?:\s*", stripped, re.I):
+            section = "answers"
+            choice = None
+        elif re.fullmatch(r"Solution:\s*", stripped, re.I):
+            section = "solution"
+            choice = None
+        elif plain_choice_match := PLAIN_CHOICE_RE.match(stripped):
+            section = "choices"
+            choice = ord(plain_choice_match.group(1).lower()) - ord("a") + 1
 
         for drawing in paragraph.xpath(".//w:drawing"):
             doc_properties = drawing.xpath(".//wp:docPr")

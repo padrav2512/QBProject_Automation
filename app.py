@@ -13,7 +13,7 @@ from heymath_cms_mapper import HeyMathCmsMapper
 from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_sheet_names
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.09.25-preserve-existing-snippets-v14.7"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.09.29-plain-image-headings-v14.8"
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:

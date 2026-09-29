@@ -10,6 +10,8 @@ Mapping preparation reads per-question `Curriculum:` and `Taxonomy:` blocks, rem
 
 Full preparation accepts plain headings that include both difficulty and objective, such as `Question 44: Easy, Comprehension`. Image extraction supports modern DrawingML pictures and legacy Word VML picture containers.
 
+Image-only processing also recognises plain question headings, including suffix text such as `Question 16 Case study`. It uses the detected question number for the Alt Text filename and replaces stale image Alt Text with the current CMS filename.
+
 When every question already contains a positive `New snippet id:` or `Snippet id:`, the **First snippet ID** field may be left blank and those IDs are preserved. Enter a First snippet ID when any IDs are missing, or select **Replace existing question and snippet IDs** to regenerate the sequence deliberately.
 
 ## Run locally

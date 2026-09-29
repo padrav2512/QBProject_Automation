@@ -100,7 +100,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.09.25-preserve-existing-snippets-v14.7"
+    assert PROCESSOR_BUILD_ID == "2026.09.29-plain-image-headings-v14.8"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -976,6 +976,44 @@ def test_images_only_mode_preserves_existing_tags_and_text(tmp_path: Path):
     xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
     alt_texts = xml.xpath(".//wp:docPr/@descr", namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"})
     assert "existing_q7_1.gif" in alt_texts
+
+
+def test_images_only_mode_names_images_under_plain_question_headings(tmp_path: Path):
+    source = tmp_path / "plain_case_study_images.docx"
+    picture_1 = tmp_path / "cake.png"
+    picture_2 = tmp_path / "pools.png"
+    Image.new("RGB", (40, 30), "white").save(picture_1)
+    Image.new("RGB", (50, 30), "blue").save(picture_2)
+    doc = Document()
+    doc.add_paragraph("Question 16 Case study")
+    doc.add_paragraph("Difficulty level: Easy\nObjective: Knowledge\nQuestion type: FIB")
+    doc.add_paragraph("Use the cake diagram.")
+    doc.add_picture(str(picture_1))
+    first_doc_properties = doc.inline_shapes[-1]._inline.docPr
+    first_doc_properties.set("descr", "project10433_q21_1.gif")
+    doc.add_paragraph("Answers:")
+    doc.add_paragraph("1/8")
+    doc.add_paragraph("Question 17  Case study")
+    doc.add_paragraph("Use the swimming-pool diagram.")
+    doc.add_picture(str(picture_2))
+    doc.save(source)
+    original_texts = [paragraph.text for paragraph in doc.paragraphs]
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project10433_q"),
+        tmp_path / "plain_image_storage",
+    )
+
+    assert [paragraph.text for paragraph in Document(result.output_path).paragraphs] == original_texts
+    xml = etree.fromstring(ZipFile(result.output_path).read("word/document.xml"))
+    alt_texts = xml.xpath(
+        ".//wp:docPr/@descr",
+        namespaces={"wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"},
+    )
+    assert alt_texts == ["project10433_q16_1.gif", "project10433_q17_1.gif"]
+    assert not any(name.startswith("REVIEW_") for name in alt_texts)
 
 
 def test_exact_duplicate_question_images_reuse_first_filename(tmp_path: Path):
