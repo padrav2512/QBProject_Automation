@@ -22,7 +22,7 @@ log = logging.getLogger("heymath_cms_mapper")
 SEP = " >> "
 TREE_CACHE_SECONDS = 6 * 60 * 60
 TIMEOUT = 60
-MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v4"
+MAPPER_BUILD_ID = "2026.10.12-live-removal-v5"
 
 
 def norm(path: str) -> str:
@@ -66,6 +66,7 @@ class MappingResult:
     taxonomy_before: list[str] = field(default_factory=list)
     curriculum_after: list[str] = field(default_factory=list)
     taxonomy_after: list[str] = field(default_factory=list)
+    stage: str = "Validation"
 
     @property
     def success(self) -> bool:
@@ -93,12 +94,54 @@ class HeyMathCmsMapper:
         self._trees_loaded_at = 0.0
 
     def map_question(
+        self, snippet_id: int, curriculum_paths: Iterable[str] | None = None,
+        taxonomy_paths: Iterable[str] | None = None, *, action: str = "add",
+    ) -> MappingResult:
+        result = MappingResult(int(snippet_id))
+        curriculum_paths, taxonomy_paths = _norm_all(curriculum_paths), _norm_all(taxonomy_paths)
+        with self._lock:
+            try:
+                return self._map_question(snippet_id, curriculum_paths, taxonomy_paths, action=action, result=result)
+            except Exception as exc:
+                result.errors.append(f"Failed during {result.stage.lower()}: {exc}")
+                try:
+                    current = self._load_mapping_page(snippet_id)
+                    if current is not None:
+                        self._record_current(result, current, curriculum_paths, taxonomy_paths, action)
+                    else:
+                        result.errors.append("Current CMS mappings could not be verified.")
+                except Exception:
+                    result.errors.append("Current CMS mappings could not be verified; reported counts include only confirmed changes.")
+                return result
+
+    def _record_current(self, result: MappingResult, page: dict, curriculum_paths: list[str], taxonomy_paths: list[str], action: str) -> None:
+        result.curriculum_after = list(page["curriculum"])
+        result.taxonomy_after = list(page["taxonomy"])
+        for label, key, before, requested in (
+            ("Curriculum", "curriculum", result.curriculum_before, curriculum_paths),
+            ("Taxonomy", "taxonomy", result.taxonomy_before, taxonomy_paths),
+        ):
+            for path in before:
+                entry = f"{label}: {path}"
+                if not _contains_path(page[key], path) and entry not in result.removed:
+                    result.removed.append(entry)
+            if result.stage in {"Adding sheet mappings", "Verifying final mappings"} and action != "remove":
+                for path in requested:
+                    canonical = next((p for p in page[key] if _contains_path([p], path)), path)
+                    entry = f"{label}: {canonical}"
+                    if _contains_path(page[key], path) and entry not in result.added and (
+                        action == "replace" or not _contains_path(before, path)
+                    ):
+                        result.added.append(entry)
+
+    def _map_question(
         self,
         snippet_id: int,
         curriculum_paths: Iterable[str] | None = None,
         taxonomy_paths: Iterable[str] | None = None,
         *,
         action: str = "add",
+        result: MappingResult,
     ) -> MappingResult:
         if action not in {"add", "replace", "remove"}:
             raise ValueError("Mapping action must be add, replace, or remove.")
@@ -107,7 +150,6 @@ class HeyMathCmsMapper:
         if not curriculum_paths and not taxonomy_paths:
             return MappingResult(int(snippet_id))
         with self._lock:
-            result = MappingResult(int(snippet_id))
             self._ensure_logged_in()
             self._ensure_trees()
             page = self._load_mapping_page(snippet_id)
@@ -116,8 +158,8 @@ class HeyMathCmsMapper:
                 return result
 
             result.question_name = page["name"]
-            result.curriculum_before = page["curriculum"]
-            result.taxonomy_before = page["taxonomy"]
+            result.curriculum_before = list(page["curriculum"])
+            result.taxonomy_before = list(page["taxonomy"])
             curriculum_ids = self._resolve(
                 curriculum_paths,
                 self._curriculum_index,
@@ -132,6 +174,7 @@ class HeyMathCmsMapper:
                 "Taxonomy",
                 result,
             )
+            result.added.clear()  # Resolution is a plan; counts represent verified saves.
             if result.errors:
                 return result
 
@@ -140,35 +183,51 @@ class HeyMathCmsMapper:
                 result.errors.append(error)
                 return result
             if action != "add":
-                result.added.clear()
+                result.stage = "Removing existing CMS mappings"
                 for label, key, requested in (
                     ("Curriculum", "curriculum", curriculum_paths),
                     ("Taxonomy", "taxonomy", taxonomy_paths),
                 ):
-                    targets = page[key] if action == "replace" else requested
-                    for path in targets:
-                        if not _contains_path(page[key], path):
-                            result.already_absent.append(f"{label}: {path}")
-                            continue
+                    pending = list(requested)
+                    limit = max(20, len(page[key]) * 4 + len(pending))
+                    for _ in range(limit):
                         fresh = self._load_mapping_page(snippet_id)
                         if fresh is None:
                             raise RuntimeError("Question could not be reloaded before removal.")
+                        self._record_current(result, fresh, curriculum_paths, taxonomy_paths, action)
+                        if action == "replace":
+                            if not fresh[key]:
+                                break
+                            path = max(fresh[key], key=lambda p: p.count(">>"))
+                        else:
+                            if not pending:
+                                break
+                            path = pending.pop(0)
+                            if not _contains_path(fresh[key], path):
+                                result.already_absent.append(f"{label}: {path}")
+                                continue
                         self._remove_mapping(fresh, key, path, snippet_id)
                         verified = self._load_mapping_page(snippet_id)
+                        if verified is not None:
+                            self._record_current(result, verified, curriculum_paths, taxonomy_paths, action)
                         if verified is None or _contains_path(verified[key], path):
-                            result.errors.append(f"{label} mapping was not removed: {path}")
+                            result.errors.append(f"Failed while removing existing CMS mapping — {label}: {path}. Mapping was not removed or could not be verified.")
                             return result
-                        result.removed.append(f"{label}: {path}")
+                        entry = f"{label}: {path}"
+                        if entry not in result.removed:
+                            result.removed.append(entry)
+                    else:
+                        raise RuntimeError(f"{label} mappings kept changing; stopped before adding sheet entries.")
                 page = self._load_mapping_page(snippet_id)
                 if page is None:
                     raise RuntimeError("Question could not be reloaded after removal.")
                 if action == "remove":
                     curriculum_ids = taxonomy_ids = []
                 else:
-                    result.added = [f"Curriculum: {path}" for path in curriculum_paths] + [
-                        f"Taxonomy: {path}" for path in taxonomy_paths
-                    ]
+                    if page["curriculum"] or page["taxonomy"]:
+                        raise RuntimeError("Existing mappings are not empty; stopped before adding sheet entries.")
 
+            result.stage = "Adding sheet mappings" if action != "remove" else "Verifying final mappings"
             if curriculum_ids:
                 self._post_form(
                     "/curriculum_trees/add_mapping",
@@ -183,6 +242,7 @@ class HeyMathCmsMapper:
                 if fresh is None:
                     result.errors.append(f"Question {snippet_id} could not be reloaded before taxonomy mapping.")
                     return result
+                self._record_current(result, fresh, curriculum_paths, taxonomy_paths, action)
                 self._post_form(
                     "/heymath_taxonomy/add_mapping",
                     fresh["taxonomy_token"],
@@ -192,12 +252,14 @@ class HeyMathCmsMapper:
                     "Add Taxonomy Form",
                 )
 
+            result.stage = "Verifying final mappings"
             after = self._load_mapping_page(snippet_id)
             if after is None:
                 result.errors.append(f"Question {snippet_id} could not be verified after mapping.")
                 return result
             result.curriculum_after = after["curriculum"]
             result.taxonomy_after = after["taxonomy"]
+            self._record_current(result, after, curriculum_paths, taxonomy_paths, action)
             for path in curriculum_paths:
                 if action != "remove" and not _contains_path(after["curriculum"], path):
                     result.errors.append(f"Curriculum mapping was not saved: {path}")

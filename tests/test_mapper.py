@@ -2,6 +2,85 @@ from heymath_cms_mapper import HeyMathCmsMapper
 import pytest
 
 
+@pytest.mark.parametrize("action", ["replace", "remove"])
+def test_related_mappings_disappear_between_removals(monkeypatch, action):
+    mapper = HeyMathCmsMapper("https://cms.example", "unused", "unused")
+    mapper._logged_in = True
+    mapper._trees_loaded_at = 10**12
+    old_paths = ["Old >> First", "Old >> Second"]
+    mapper._curriculum_index = {old_paths[0]: ["1"], old_paths[1]: ["2"], "New >> Path": ["3"]}
+    mapper._taxonomy_index = {}
+    state = {"name": "Q", "curriculum": list(old_paths), "taxonomy": [], "curriculum_token": "c", "taxonomy_token": "t"}
+    def load(_):
+        return {**state, "curriculum": list(state["curriculum"]),
+                "removal_controls": [{"type": "curriculum", "path": p} for p in state["curriculum"]]}
+    calls = []
+    def remove(page, key, path, _):
+        assert path in page[key]
+        calls.append(path)
+        state[key].clear()  # CMS also removes the related mapping.
+    def add(*args):
+        assert state["curriculum"] == state["taxonomy"] == []
+        state["curriculum"] = ["New >> Path"]
+    monkeypatch.setattr(mapper, "_load_mapping_page", load)
+    monkeypatch.setattr(mapper, "_remove_mapping", remove)
+    monkeypatch.setattr(mapper, "_post_form", add)
+    result = mapper.map_question(123, ["New >> Path"] if action == "replace" else old_paths, action=action)
+    assert result.success, result.errors
+    assert len(calls) == 1
+    assert len(result.removed) == 2
+    assert len(result.added) == (1 if action == "replace" else 0)
+
+
+def test_partial_failure_preserves_confirmed_removals_and_question_name(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "unused", "unused")
+    mapper._logged_in = True
+    mapper._trees_loaded_at = 10**12
+    mapper._curriculum_index = {"New >> Path": ["3"]}
+    mapper._taxonomy_index = {}
+    state = {"name": "project10433_q82", "curriculum": ["Old >> First", "Old >> Second"], "taxonomy": []}
+    def load(_):
+        return {**state, "curriculum": list(state["curriculum"]),
+                "removal_controls": [{"type": "curriculum", "path": p} for p in state["curriculum"]]}
+    def remove(page, key, path, _):
+        if path == "Old >> Second":
+            raise RuntimeError("CMS request failed")
+        state[key].remove(path)
+    monkeypatch.setattr(mapper, "_load_mapping_page", load)
+    monkeypatch.setattr(mapper, "_remove_mapping", remove)
+    monkeypatch.setattr(mapper, "_post_form", lambda *args: pytest.fail("No addition after removal failure"))
+    result = mapper.map_question(123, ["New >> Path"], action="replace")
+    assert not result.success
+    assert result.question_name == "project10433_q82"
+    assert result.removed == ["Curriculum: Old >> First"]
+    assert result.added == []
+    assert result.curriculum_after == ["Old >> Second"]
+    assert "removing existing cms mappings" in result.errors[0]
+
+
+def test_replacement_clears_newly_revealed_mapping_before_adding(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "unused", "unused")
+    mapper._logged_in = True
+    mapper._trees_loaded_at = 10**12
+    mapper._curriculum_index = {"New >> Path": ["3"]}
+    mapper._taxonomy_index = {}
+    state = {"name": "Q", "curriculum": ["Old >> Child"], "taxonomy": [], "curriculum_token": "c"}
+    def load(_):
+        return {**state, "curriculum": list(state["curriculum"]),
+                "removal_controls": [{"type": "curriculum", "path": p} for p in state["curriculum"]]}
+    def remove(page, key, path, _):
+        state[key] = ["Old >> Parent"] if path == "Old >> Child" else []
+    def add(*args):
+        assert state["curriculum"] == []
+        state["curriculum"] = ["New >> Path"]
+    monkeypatch.setattr(mapper, "_load_mapping_page", load)
+    monkeypatch.setattr(mapper, "_remove_mapping", remove)
+    monkeypatch.setattr(mapper, "_post_form", add)
+    result = mapper.map_question(123, ["New >> Path"], action="replace")
+    assert result.success, result.errors
+    assert len(result.removed) == 2
+
+
 def test_app_precheck_loads_removal_controls_instead_of_public_mapping_summary(monkeypatch):
     mapper = HeyMathCmsMapper("http://cms.heymath.com", "unused", "unused")
     mapper._logged_in = True

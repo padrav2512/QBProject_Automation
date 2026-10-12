@@ -14,7 +14,7 @@ from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_shee
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.09.29-plain-image-headings-v14.8"
-EXPECTED_MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v4"
+EXPECTED_MAPPER_BUILD_ID = "2026.10.12-live-removal-v5"
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
     _cms_mapper = importlib.reload(_cms_mapper)
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
@@ -514,8 +514,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
                     status = "Done" if mapping_result.success else "Problem"
                     details = "; ".join(
                         mapping_result.errors
-                        if mapping_result.errors
-                        else ([f"Added — {p}" for p in mapping_result.added]
+                        + ([f"Added — {p}" for p in mapping_result.added]
                               + [f"Removed — {p}" for p in mapping_result.removed]
                               + [f"Already present — {p}" for p in mapping_result.already_present]
                               + [f"Already absent — {p}" for p in mapping_result.already_absent])
@@ -526,6 +525,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
                             "Question": mapping_result.question_name or "",
                             "Status": status,
                             "Action": mapping_action_label,
+                            "Stage": mapping_result.stage,
                             "Added": len(mapping_result.added),
                             "Removed": len(mapping_result.removed),
                             "Already absent": len(mapping_result.already_absent),
@@ -540,8 +540,9 @@ with st.expander("Apply mappings to CMS", expanded=False):
                             "Question": "",
                             "Status": "Problem",
                             "Action": mapping_action_label,
-                            "Added": 0,
-                            "Removed": 0,
+                            "Stage": "Unexpected error",
+                            "Added": None,
+                            "Removed": None,
                             "Already absent": 0,
                             "Already present": 0,
                             "Details": f"{exc} Changes may be partially applied; inspect current CMS mappings before retrying.",
