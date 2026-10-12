@@ -22,6 +22,7 @@ log = logging.getLogger("heymath_cms_mapper")
 SEP = " >> "
 TREE_CACHE_SECONDS = 6 * 60 * 60
 TIMEOUT = 60
+MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v2"
 
 
 def norm(path: str) -> str:
@@ -229,7 +230,10 @@ class HeyMathCmsMapper:
             targets = page[key] if action == "replace" else _norm_all(requested)
             for path in targets:
                 if _contains_path(page[key], path) and not self._removal_control(page, key, path):
-                    return f"CMS removal control not found for {key}: {path}. No changes were made to this question."
+                    count = sum(c["type"] == key for c in page.get("removal_controls", []))
+                    return (f"CMS removal control not found for {key}: {path}. "
+                            f"Found {count} {key} removal controls for {len(page[key])} existing mappings "
+                            f"(mapping build {MAPPER_BUILD_ID}). No changes were made to this question.")
         return None
 
     @staticmethod

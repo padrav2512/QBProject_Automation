@@ -2,6 +2,25 @@ from heymath_cms_mapper import HeyMathCmsMapper
 import pytest
 
 
+def test_q71_parent_level_mapping_has_unmap_control():
+    paths = ["CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length",
+             "India >> Class 4 >> Mathematics >> Measurement"]
+    text = '''<form action="/curriculum_trees/remove_mapping" method="post">
+      <input name="authenticity_token" type="hidden" value="test">
+      <input name="project_id" type="hidden" value="219263">
+      <span><input id="curriculum_tree_ids_716223" name="curriculum_tree_ids[716223]" type="checkbox" value="716223">
+      CBSE NCERT &gt;&gt; Class 4 &gt;&gt; Mathematics &gt;&gt; Measuring Length <br></span>
+      <span><input id="curriculum_tree_ids_716224" name="curriculum_tree_ids[716224]" type="checkbox" value="716224">
+      India &gt;&gt; Class 4 &gt;&gt; Mathematics &gt;&gt; Measurement <br></span>
+      <input type="submit" name="UnMap" value="UnMap"></form>'''
+    mapper = HeyMathCmsMapper("http://cms.heymath.com", "unused", "unused")
+    controls = mapper._parse_removal_controls(text, paths, [])
+    assert len(controls) == 2
+    page = {"curriculum": paths, "taxonomy": [], "removal_controls": controls}
+    assert mapper.validate_action(page, paths, [], action="replace") is None
+    assert controls[0]["data"]["curriculum_tree_ids[716223]"] == "716223"
+
+
 def test_real_cms_unmap_forms_select_only_the_requested_mapping_record(monkeypatch):
     # Structure observed on project10433_q103: curriculum spans, taxonomy
     # checkbox directly in form, shared UnMap submit, mapping-record IDs.

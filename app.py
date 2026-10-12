@@ -9,11 +9,18 @@ import pandas as pd
 import streamlit as st
 
 import cms_processor as _cms_processor
-from heymath_cms_mapper import HeyMathCmsMapper
+import heymath_cms_mapper as _cms_mapper
 from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_sheet_names
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.09.29-plain-image-headings-v14.8"
+EXPECTED_MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v2"
+if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
+    _cms_mapper = importlib.reload(_cms_mapper)
+if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
+    st.error("The CMS mapper update has not finished loading. Reboot the Streamlit app before applying mappings.")
+    st.stop()
+HeyMathCmsMapper = _cms_mapper.HeyMathCmsMapper
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
     _cms_processor = importlib.reload(_cms_processor)
 if getattr(_cms_processor, "PROCESSOR_BUILD_ID", None) != EXPECTED_PROCESSOR_BUILD_ID:
@@ -26,7 +33,7 @@ document_has_complete_snippet_ids = _cms_processor.document_has_complete_snippet
 
 
 @st.cache_resource
-def get_cms_mapper(base_url: str, login: str, password: str) -> HeyMathCmsMapper:
+def get_cms_mapper(base_url: str, login: str, password: str, build_id: str) -> HeyMathCmsMapper:
     return HeyMathCmsMapper(base_url, login, password)
 
 
@@ -338,6 +345,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
     }
     mapping_action_label = st.radio("Mapping action", list(mapping_actions), key="cms_mapping_action")
     mapping_action = mapping_actions[mapping_action_label]
+    st.caption(f"Mapping build: {EXPECTED_MAPPER_BUILD_ID}")
     if mapping_action == "add":
         st.info("Adds the listed mappings and retains all existing mappings.")
     elif mapping_action == "replace":
@@ -399,7 +407,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
     else:
         st.success("CMS secrets are configured. Test the connection before applying the first mapping file.")
         if st.button("Test CMS connection (read only)", use_container_width=True):
-            mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"])
+            mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"], EXPECTED_MAPPER_BUILD_ID)
             try:
                 with st.spinner("Signing in and loading the Curriculum and Taxonomy trees…"):
                     connection_result = mapper.test_connection(refresh_trees=True)
@@ -425,7 +433,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
     action_button = {"add": "Validate and add mappings", "replace": "Validate and replace all mappings", "remove": "Validate and remove listed mappings"}[mapping_action]
     if st.button(action_button, type="primary", disabled=not can_apply, use_container_width=True):
         st.session_state.pop("cms_mapping_results", None)
-        mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"])
+        mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"], EXPECTED_MAPPER_BUILD_ID)
         validation_errors: list[str] = []
         resolved_frame = mapping_frame.copy()
         with st.spinner("Checking CMS snippets and mapping paths before saving anything…"):
