@@ -423,7 +423,39 @@ class HeyMathCmsMapper:
         meta = root.xpath('//meta[@name="csrf-token"]/@content')
         token = meta[0] if meta else None
         controls = []
+        # CMS UnMap submits mapping-record IDs, not curriculum/taxonomy tree IDs.
+        # Curriculum checkboxes sit inside spans; taxonomy checkboxes are direct
+        # children of the form. In both cases the path follows up to the next br.
+        for form in root.xpath('//form[@action]'):
+            endpoint = urlparse(form.get("action", "")).path
+            key = {"/curriculum_trees/remove_mapping": "curriculum",
+                   "/heymath_taxonomy/remove_mapping": "taxonomy"}.get(endpoint)
+            if key is None:
+                continue
+            base_data = {field.get("name"): field.get("value", "")
+                         for field in form.xpath('.//input[@name][@type="hidden"]')}
+            for submit in form.xpath('.//input[@type="submit"][@name]'):
+                if submit.get("value", "").casefold() == "unmap":
+                    base_data[submit.get("name")] = submit.get("value")
+            expected_prefix = "curriculum_tree_ids[" if key == "curriculum" else "heymath_taxonomy_ids["
+            for checkbox in form.xpath('.//input[@type="checkbox"][@name]'):
+                if not checkbox.get("name", "").startswith(expected_prefix):
+                    continue
+                path_text = checkbox.tail or ""
+                for sibling in checkbox.itersiblings():
+                    if sibling.tag in {"br", "input"}:
+                        break
+                    path_text += sibling.text_content() + (sibling.tail or "")
+                path = norm(path_text)
+                paths = curriculum if key == "curriculum" else taxonomy
+                if not _contains_path(paths, path):
+                    continue
+                controls.append({"type": key, "path": path,
+                    "method": form.get("method", "post").upper(), "url": form.get("action"),
+                    "data": {**base_data, checkbox.get("name"): checkbox.get("value", "")}})
         for element in root.xpath('//a[@href] | //form[@action]'):
+            if element.tag == "form" and element.xpath('.//input[@type="checkbox"]'):
+                continue
             marker = " ".join([element.text_content(), element.get("title", ""),
                 element.get("aria-label", ""), element.get("href", ""), element.get("action", "")])
             if not re.search(r"\b(remove|delete|unmap|destroy)\b|remove_mapping|delete_mapping", marker, re.I):

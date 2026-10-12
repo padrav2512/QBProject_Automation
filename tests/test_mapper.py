@@ -2,6 +2,59 @@ from heymath_cms_mapper import HeyMathCmsMapper
 import pytest
 
 
+def test_real_cms_unmap_forms_select_only_the_requested_mapping_record(monkeypatch):
+    # Structure observed on project10433_q103: curriculum spans, taxonomy
+    # checkbox directly in form, shared UnMap submit, mapping-record IDs.
+    curriculum = [
+        "CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length >> Perimeter",
+        "India >> Class 4 >> Mathematics >> Area and Perimeter >> Perimeter of Simple Figures",
+    ]
+    taxonomy = ["Mathematics >> Measurement >> Length >> Perimeter"]
+    text = '''<html><form action="/curriculum_trees/remove_mapping" method="post">
+      <input name="authenticity_token" type="hidden" value="c-token">
+      <input name="project_id" type="hidden" value="219295">
+      <input name="project_type" type="hidden" value="question">
+      <input name="parent_project_type" type="hidden" value="">
+      <input name="parent_project_id" type="hidden" value="">
+      <span><input type="checkbox" name="curriculum_tree_ids[716309]" value="716309">
+      CBSE NCERT &gt;&gt; Class 4 &gt;&gt; Mathematics &gt;&gt; Measuring Length &gt;&gt; Perimeter<br></span>
+      <span><input type="checkbox" name="curriculum_tree_ids[716310]" value="716310" checked>
+      India &gt;&gt; Class 4 &gt;&gt; Mathematics &gt;&gt; Area and Perimeter &gt;&gt; Perimeter of Simple Figures<br></span>
+      <input type="submit" name="UnMap" value="UnMap"></form>
+      <form action="/heymath_taxonomy/remove_mapping" method="post">
+      <input name="authenticity_token" type="hidden" value="t-token">
+      <input name="project_id" type="hidden" value="219295">
+      <input name="project_type" type="hidden" value="question">
+      <input name="parent_project_type" type="hidden" value="">
+      <input name="parent_project_id" type="hidden" value="">
+      <input type="checkbox" name="heymath_taxonomy_ids[346644]" value="346644">
+      Mathematics &gt;&gt; Measurement &gt;&gt; Length &gt;&gt; Perimeter<br>
+      <input type="submit" name="UnMap" value="UnMap"></form></html>'''
+    mapper = HeyMathCmsMapper("http://cms.heymath.com", "unused", "unused")
+    controls = mapper._parse_removal_controls(text, curriculum, taxonomy)
+    assert len(controls) == 3
+    page = {"curriculum": curriculum, "taxonomy": taxonomy, "removal_controls": controls}
+    assert mapper.validate_action(page, curriculum, taxonomy, action="replace") is None
+    assert mapper.validate_action(page, curriculum[:1], [], action="remove") is None
+    captured = []
+    class Response:
+        url = "http://cms.heymath.com/question/219295/html_curriculum"
+        text = "Browse Mapping Content"
+        def raise_for_status(self):
+            pass
+    monkeypatch.setattr(mapper._session, "request", lambda *args, **kwargs: captured.append((args, kwargs)) or Response())
+    mapper._remove_mapping(page, "curriculum", curriculum[0], 219295)
+    mapper._remove_mapping(page, "taxonomy", taxonomy[0], 219295)
+    data = captured[0][1]["data"]
+    assert data["curriculum_tree_ids[716309]"] == "716309"
+    assert "curriculum_tree_ids[716310]" not in data
+    assert data["project_id"] == "219295"
+    assert data["authenticity_token"] == "c-token"
+    assert data["UnMap"] == "UnMap"
+    assert captured[1][1]["data"]["heymath_taxonomy_ids[346644]"] == "346644"
+    assert captured[0][0] == ("POST", "http://cms.heymath.com/curriculum_trees/remove_mapping")
+
+
 @pytest.mark.parametrize("action", ["replace", "remove"])
 def test_destructive_actions_validate_before_removing(monkeypatch, action):
     mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
