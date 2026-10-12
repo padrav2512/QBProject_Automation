@@ -22,7 +22,7 @@ log = logging.getLogger("heymath_cms_mapper")
 SEP = " >> "
 TREE_CACHE_SECONDS = 6 * 60 * 60
 TIMEOUT = 60
-MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v3"
+MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v4"
 
 
 def norm(path: str) -> str:
@@ -235,6 +235,19 @@ class HeyMathCmsMapper:
                             f"Found {count} {key} removal controls for {len(page[key])} existing mappings "
                             f"(mapping build {MAPPER_BUILD_ID}). No changes were made to this question.")
         return None
+
+    def validate_question_action(self, snippet_id: int, curriculum_paths: Iterable[str], taxonomy_paths: Iterable[str], *, action: str) -> str | None:
+        """Read and validate full CMS forms without exposing form tokens to the UI."""
+        if action not in {"add", "replace", "remove"}:
+            raise ValueError("Mapping action must be add, replace, or remove.")
+        if action == "add":
+            return None
+        with self._lock:
+            self._ensure_logged_in()
+            page = self._load_mapping_page(snippet_id)
+            if page is None:
+                return f"Question {snippet_id} was not found in CMS."
+            return self.validate_action(page, curriculum_paths, taxonomy_paths, action=action)
 
     @staticmethod
     def _removal_control(page: dict, key: str, path: str) -> dict | None:

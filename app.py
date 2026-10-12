@@ -14,7 +14,7 @@ from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_shee
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.09.29-plain-image-headings-v14.8"
-EXPECTED_MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v3"
+EXPECTED_MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v4"
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
     _cms_mapper = importlib.reload(_cms_mapper)
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
@@ -456,8 +456,8 @@ with st.expander("Apply mappings to CMS", expanded=False):
                     validation_errors.append(f"Snippet {snippet_text} does not yet exist in CMS.")
                 else:
                     rows = resolved_frame[resolved_frame["Snippet ID"] == snippet_text]
-                    action_error = mapper.validate_action(
-                        page,
+                    action_error = mapper.validate_question_action(
+                        int(snippet_text),
                         rows.loc[rows["Mapping Type"] == "Curriculum", "Path"].tolist(),
                         rows.loc[rows["Mapping Type"] == "Taxonomy", "Path"].tolist(),
                         action=mapping_action,

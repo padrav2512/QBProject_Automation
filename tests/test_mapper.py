@@ -2,6 +2,22 @@ from heymath_cms_mapper import HeyMathCmsMapper
 import pytest
 
 
+def test_app_precheck_loads_removal_controls_instead_of_public_mapping_summary(monkeypatch):
+    mapper = HeyMathCmsMapper("http://cms.heymath.com", "unused", "unused")
+    mapper._logged_in = True
+    path = "CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length"
+    full_page = {"name": "project10433_q71", "curriculum": [path], "taxonomy": [],
+                 "removal_controls": [{"type": "curriculum", "path": path,
+                                       "data": {"authenticity_token": "private-token"}}]}
+    monkeypatch.setattr(mapper, "_load_mapping_page", lambda _: full_page)
+    monkeypatch.setattr(mapper._session, "request", lambda *args, **kwargs: pytest.fail("Precheck must never submit"))
+    public_page = mapper.get_mappings(219263)
+    assert "removal_controls" not in public_page
+    assert "private-token" not in str(public_page)
+    assert mapper.validate_question_action(219263, [path], [], action="replace") is None
+    assert mapper.validate_question_action(219263, [path], [], action="remove") is None
+
+
 def test_q71_parent_level_mapping_has_unmap_control():
     paths = ["CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length",
              "India >> Class 4 >> Mathematics >> Measurement"]
