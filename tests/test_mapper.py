@@ -21,6 +21,22 @@ def test_q71_parent_level_mapping_has_unmap_control():
     assert controls[0]["data"]["curriculum_tree_ids[716223]"] == "716223"
 
 
+def test_unmap_form_is_preserved_inside_malformed_legacy_page():
+    path = "CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length"
+    text = '''<html><body><form action="/legacy_wrapper"><table><tr><td>
+      <form action="/curriculum_trees/remove_mapping" method="post">
+      <input name="authenticity_token" type="hidden" value="test">
+      <input name="project_id" type="hidden" value="219263">
+      <span><input name="curriculum_tree_ids[716223]" type="checkbox" value="716223">
+      CBSE NCERT &gt;&gt; Class 4 &gt;&gt; Mathematics &gt;&gt; Measuring Length <br></span>
+      <input type="submit" name="UnMap" value="UnMap"></form>
+      </td></tr></table></form></body></html>'''
+    controls = HeyMathCmsMapper._parse_removal_controls(text, [path], [])
+    assert len(controls) == 1
+    assert controls[0]["path"] == path
+    assert controls[0]["data"]["curriculum_tree_ids[716223]"] == "716223"
+
+
 def test_real_cms_unmap_forms_select_only_the_requested_mapping_record(monkeypatch):
     # Structure observed on project10433_q103: curriculum spans, taxonomy
     # checkbox directly in form, shared UnMap submit, mapping-record IDs.

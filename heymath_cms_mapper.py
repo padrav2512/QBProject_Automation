@@ -22,7 +22,7 @@ log = logging.getLogger("heymath_cms_mapper")
 SEP = " >> "
 TREE_CACHE_SECONDS = 6 * 60 * 60
 TIMEOUT = 60
-MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v2"
+MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v3"
 
 
 def norm(path: str) -> str:
@@ -430,7 +430,13 @@ class HeyMathCmsMapper:
         # CMS UnMap submits mapping-record IDs, not curriculum/taxonomy tree IDs.
         # Curriculum checkboxes sit inside spans; taxonomy checkboxes are direct
         # children of the form. In both cases the path follows up to the next br.
-        for form in root.xpath('//form[@action]'):
+        # Parse each source form independently. Repairing the entire legacy CMS
+        # document can discard nested form tags or move inputs outside a form.
+        source_forms = re.findall(r"(?is)<form\b[^>]*>.*?</form\s*>", text)
+        for source_form in source_forms:
+            # Start at the innermost opening form if the source nests forms.
+            openings = list(re.finditer(r"(?is)<form\b", source_form))
+            form = html.fromstring(source_form[openings[-1].start():])
             endpoint = urlparse(form.get("action", "")).path
             key = {"/curriculum_trees/remove_mapping": "curriculum",
                    "/heymath_taxonomy/remove_mapping": "taxonomy"}.get(endpoint)

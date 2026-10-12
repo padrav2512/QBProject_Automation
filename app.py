@@ -14,7 +14,7 @@ from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_shee
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.09.29-plain-image-headings-v14.8"
-EXPECTED_MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v2"
+EXPECTED_MAPPER_BUILD_ID = "2026.10.12-checkbox-unmap-v3"
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
     _cms_mapper = importlib.reload(_cms_mapper)
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
