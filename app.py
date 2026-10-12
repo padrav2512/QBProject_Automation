@@ -39,10 +39,41 @@ def get_cms_mapper(base_url: str, login: str, password: str, build_id: str) -> H
 
 st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅", layout="wide")
 
-st.title("CMS DOCX Verification Processor")
-st.caption("Convert quality-checked Word question banks into tagged CMS verification documents, then download the document, images and audit report.")
-st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
-st.caption("Choose the processing sections you need. Mathematical changes remain conservative: clear expressions are converted and ambiguous cases are preserved for review.")
+st.markdown("""
+<style>
+.stApp { background: #f7f9fd; color: #182b49; }
+.block-container { max-width: 1280px; padding-top: 2rem; padding-bottom: 3rem; }
+[data-testid="stSidebar"] { background: #edf2fa; border-right: 1px solid #d8e2f0; }
+[data-testid="stMarkdownContainer"] p, [data-testid="stWidgetLabel"] p,
+[data-testid="stCheckbox"] label, [data-testid="stRadio"] label { font-size: 1.06rem; line-height: 1.6; }
+[data-testid="stCaptionContainer"] p { font-size: .94rem; color: #52647b; }
+h1 { font-size: clamp(1.8rem, 3vw, 2.6rem) !important; letter-spacing: -.035em; }
+h2 { font-size: 1.55rem !important; }
+h3 { font-size: 1.3rem !important; }
+[data-testid="stExpander"] { background: white; border: 1px solid #d8e2f0; border-radius: 14px; }
+[data-testid="stExpander"] summary { padding: .8rem 1rem; }
+[data-testid="stExpander"] summary p { font-weight: 650; font-size: 1.1rem; }
+[data-testid="stFileUploader"] { background: white; border: 1px solid #d8e2f0; border-radius: 12px; padding: 1rem; }
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button { min-height: 44px; border-radius: 10px; font-weight: 600; }
+button:focus-visible, input:focus-visible { outline: 3px solid #60a5fa !important; outline-offset: 3px; }
+[data-testid="stMetric"] { background: white; border: 1px solid #d8e2f0; border-radius: 12px; padding: .9rem 1rem; }
+[data-testid="stRadio"] > div { gap: .55rem; }
+[data-testid="stRadio"] label { padding: .65rem .85rem; border: 1px solid #d8e2f0; border-radius: 10px; background: white; }
+.workspace-banner { background: linear-gradient(120deg, #173d7a, #2563eb); color: white; border-radius: 18px; padding: 1.8rem 2rem; margin-bottom: 1.6rem; }
+.workspace-banner .eyebrow { font-size: .8rem; font-weight: 700; letter-spacing: .14em; color: #dbeafe; margin-bottom: .65rem; }
+.workspace-banner h1 { color: white; margin: 0 0 .6rem; padding: 0; }
+.workspace-banner p { color: #edf4ff; font-size: 1.1rem; margin: 0; max-width: 780px; }
+@media (max-width: 640px) {
+  .workspace-banner { padding: 1.3rem; }
+  .block-container { padding-left: 1rem; padding-right: 1rem; }
+}
+</style>
+<div class="workspace-banner">
+  <div class="eyebrow">QUESTION BANK WORKSPACE</div>
+  <h1>CMS DOCX Verification Processor</h1>
+  <p>Prepare your Word question banks and manage CMS mappings in one place.</p>
+</div>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("1. Choose processing")
@@ -117,9 +148,15 @@ with st.sidebar:
         with st.expander("Effect of current selections", expanded=True):
             for note in selection_notes:
                 st.write(f"• {note}")
+    with st.expander("App details"):
+        st.caption(f"Processor build: {EXPECTED_PROCESSOR_BUILD_ID}")
+        st.caption(f"Mapping build: {EXPECTED_MAPPER_BUILD_ID}")
+        st.caption("Interface: 2026.10.12-ui-v1")
 
 storage_root = Path(os.environ.get("CMS_STORAGE_DIR", Path(__file__).parent / "data")).resolve()
-st.info("Upload a quality-checked DOCX, process it, and download the available outputs before closing the page.")
+st.subheader("Prepare a Word document")
+st.write("Choose your processing settings in the sidebar, then upload a quality-checked DOCX.")
+st.caption("Download your processed document, images, mapping data and report before closing the app.")
 
 uploaded = st.file_uploader("Upload a Word document", type=["docx"], accept_multiple_files=False)
 
@@ -336,28 +373,26 @@ if uploaded is not None:
             st.caption(f"Processing reference: {result.run_id}")
 
 st.divider()
-with st.expander("Apply mappings to CMS", expanded=False):
+with st.expander("Apply mappings to CMS", expanded=True):
     st.write("Use this after the questions exist in CMS, whether they were created by Anand’s tool or were already present. Upload a mapping CSV or XLSX, review it, and then apply the mappings.")
     mapping_actions = {
         "Add mappings from sheet": "add",
         "Replace all mappings with mappings from sheet": "replace",
-        "Remove mappings listed in sheet (Unmap)": "remove",
     }
-    mapping_action_label = st.radio("Mapping action", list(mapping_actions), key="cms_mapping_action")
+    st.subheader("1. Choose a mapping action")
+    mapping_action_label = st.radio("Mapping action", list(mapping_actions), key="cms_mapping_action_two_options")
     mapping_action = mapping_actions[mapping_action_label]
-    st.caption(f"Mapping build: {EXPECTED_MAPPER_BUILD_ID}")
     if mapping_action == "add":
         st.info("Adds the listed mappings and retains all existing mappings.")
     elif mapping_action == "replace":
         st.warning("Removes ALL existing Curriculum and Taxonomy mappings for each included question, then adds the mappings from the sheet. If only one mapping type is supplied, both existing mapping types are still cleared.")
-    else:
-        st.info("Removes only the Curriculum and Taxonomy mappings listed in the sheet. All other mappings are retained.")
     st.caption("Blank cells are ignored. Questions with no Curriculum or Taxonomy entries are skipped.")
     st.caption("Project names, spreadsheet headings and Curriculum/Taxonomy paths are matched without regard to uppercase or lowercase. Spelling and hierarchy must still match. If a path is not found, the pre-check lists up to three closest paths from the corresponding live CMS tree; suggestions are never applied automatically.")
     st.caption(
         "Accepted layouts: Question/Project + Snippet ID + Mapping Type + Path; or Snippet ID/Project with qno + separate Taxonomy and Curriculum columns. "
         "Several paths may be placed on separate lines within one cell."
     )
+    st.subheader("2. Upload and review your sheet")
     mapping_upload = st.file_uploader("Upload mapping CSV or XLSX", type=["csv", "xlsx"], key="mapping_file_upload")
     mapping_frame = None
     mapping_problem = None
@@ -391,6 +426,10 @@ with st.expander("Apply mappings to CMS", expanded=False):
             if project_lookups:
                 summary_parts.append(f"{project_lookups} Project with qno value(s) to resolve in CMS")
             st.caption(" · ".join(summary_parts) + ".")
+            preview_columns = st.columns(3)
+            preview_columns[0].metric("Mapping paths", len(mapping_frame))
+            preview_columns[1].metric("Curriculum paths", int((mapping_frame["Mapping Type"] == "Curriculum").sum()))
+            preview_columns[2].metric("Taxonomy paths", int((mapping_frame["Mapping Type"] == "Taxonomy").sum()))
 
     if mapping_problem:
         st.error(mapping_problem)
@@ -429,8 +468,10 @@ with st.expander("Apply mappings to CMS", expanded=False):
             else:
                 st.error(f"CMS connection test failed: {connection_test['message']}")
 
+    st.subheader("3. Validate and apply")
+    st.caption("Every question and path is checked before CMS changes begin. Results will show the selected action and confirmed changes.")
     can_apply = mapping_frame is not None and mapping_problem is None and not missing_secret and not mapping_frame.empty
-    action_button = {"add": "Validate and add mappings", "replace": "Validate and replace all mappings", "remove": "Validate and remove listed mappings"}[mapping_action]
+    action_button = {"add": "Validate and add mappings", "replace": "Validate and replace all mappings"}[mapping_action]
     if st.button(action_button, type="primary", disabled=not can_apply, use_container_width=True):
         st.session_state.pop("cms_mapping_results", None)
         mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"], EXPECTED_MAPPER_BUILD_ID)
@@ -554,7 +595,16 @@ with st.expander("Apply mappings to CMS", expanded=False):
     if st.session_state.get("cms_mapping_results"):
         mapping_results = pd.DataFrame(st.session_state["cms_mapping_results"])
         st.subheader("CMS mapping results")
-        st.dataframe(mapping_results, use_container_width=True, hide_index=True)
+        result_columns = st.columns(3)
+        result_columns[0].metric("Questions processed", len(mapping_results))
+        result_columns[1].metric("Completed", int((mapping_results["Status"] == "Done").sum()))
+        result_columns[2].metric("Need attention", int((mapping_results["Status"] == "Problem").sum()))
+        styled_results = mapping_results.style.apply(
+            lambda values: ["background-color: #dcfce7; color: #14532d; font-weight: 600" if value == "Done"
+                            else "background-color: #fef3c7; color: #78350f; font-weight: 600" for value in values],
+            subset=["Status"],
+        )
+        st.dataframe(styled_results, use_container_width=True, hide_index=True)
         if (mapping_results["Status"] == "Problem").any():
             st.warning("Some snippets need attention. Review the Details column before retrying those snippets.")
         else:
@@ -611,7 +661,7 @@ with st.expander("What the app checks"):
 - Supports a later CMS mapping step after Anand’s upload has created the snippets.
 - The later mapping step accepts long mapping rows or wide Project/Snippet ID/Taxonomy/Curriculum spreadsheets, including multiline path cells.
 - A missing snippet ID can be resolved from one exact CMS Project with qno/Project question name.
-- Offers Add, Replace all, and Remove listed (Unmap) actions using the same sheet format. Blank cells are ignored; questions with no mapping entries are skipped.
+- Offers Add and Replace all actions using the same sheet format. Blank cells are ignored; questions with no mapping entries are skipped.
 
 Only the selected sections change the document. The verification report records every applied fix and every unresolved manual check.
 """
