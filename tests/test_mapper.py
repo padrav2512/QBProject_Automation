@@ -1,4 +1,95 @@
 from heymath_cms_mapper import HeyMathCmsMapper
+import pytest
+
+
+@pytest.mark.parametrize("action", ["replace", "remove"])
+def test_destructive_actions_validate_before_removing(monkeypatch, action):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    mapper._curriculum_index = {"Existing >> Path": ["10"]}
+    mapper._taxonomy_index = {}
+    mapper._trees_loaded_at = 10**12
+    page = {"name": "Q", "curriculum": ["Existing >> Path"], "taxonomy": []}
+    monkeypatch.setattr(mapper, "_load_mapping_page", lambda _: page)
+    monkeypatch.setattr(mapper, "_remove_mapping", lambda *args: pytest.fail("Must not remove"))
+    result = mapper.map_question(123, ["Unknown >> Path"], action=action)
+    assert not result.success
+    result = mapper.map_question(123, ["Existing >> Path"], action=action)
+    assert not result.success
+    assert "removal control not found" in result.errors[0]
+
+
+@pytest.mark.parametrize("action", ["add", "replace", "remove"])
+def test_blank_paths_skip_question(monkeypatch, action):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    monkeypatch.setattr(mapper, "_ensure_logged_in", lambda: pytest.fail("Blank input must be skipped"))
+    assert mapper.map_question(123, ["", " "], [], action=action).success
+
+
+@pytest.mark.parametrize("action", ["replace", "remove"])
+def test_replace_and_remove_verify_final_state(monkeypatch, action):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    mapper._curriculum_index = {"Old >> Curriculum": ["10"], "New >> Curriculum": ["11"]}
+    mapper._taxonomy_index = {"Old >> Taxonomy": ["20"]}
+    mapper._trees_loaded_at = 10**12
+    state = {"name": "Q", "curriculum_token": "c", "taxonomy_token": "t",
+             "curriculum": ["Old >> Curriculum"], "taxonomy": ["Old >> Taxonomy"]}
+    def load(_):
+        return {**state, "curriculum": list(state["curriculum"]), "taxonomy": list(state["taxonomy"]),
+                "removal_controls": [{"type": key, "path": p} for key in ("curriculum", "taxonomy") for p in state[key]]}
+    monkeypatch.setattr(mapper, "_load_mapping_page", load)
+    monkeypatch.setattr(mapper, "_remove_mapping", lambda page, key, path, _: state[key].remove(path))
+    monkeypatch.setattr(mapper, "_post_form", lambda *args: state["curriculum"].append("New >> Curriculum"))
+    paths = ["New >> Curriculum"] if action == "replace" else ["Old >> Curriculum"]
+    result = mapper.map_question(123, paths, action=action)
+    assert result.success, result.errors
+    assert result.curriculum_after == (["New >> Curriculum"] if action == "replace" else [])
+    assert result.taxonomy_after == ([] if action == "replace" else ["Old >> Taxonomy"])
+    assert len(result.removed) == (2 if action == "replace" else 1)
+
+
+def test_removal_controls_are_read_from_explicit_per_path_controls():
+    text = '''<html><meta name="csrf-token" content="token"><table>
+    <tr><td>Old &gt;&gt; Curriculum</td><td><a href="/curriculum_trees/remove_mapping/7" data-method="delete">Remove</a></td></tr>
+    <tr><td>Old &gt;&gt; Taxonomy</td><td><form action="/heymath_taxonomy/remove_mapping" method="post">
+    <input name="authenticity_token" value="tax"><input name="id" value="9"><button>Remove</button></form></td></tr>
+    </table></html>'''
+    controls = HeyMathCmsMapper._parse_removal_controls(text, ["Old >> Curriculum"], ["Old >> Taxonomy"])
+    assert len(controls) == 2
+    assert controls[0]["method"] == "DELETE"
+    assert controls[0]["data"] == {"authenticity_token": "token"}
+    assert controls[1]["data"]["id"] == "9"
+
+
+def test_failed_removal_stops_before_adding(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    mapper._trees_loaded_at = 10**12
+    mapper._curriculum_index = {"Old >> Path": ["1"], "New >> Path": ["2"]}
+    mapper._taxonomy_index = {}
+    page = {"name": "Q", "curriculum": ["Old >> Path"], "taxonomy": [],
+            "removal_controls": [{"type": "curriculum", "path": "Old >> Path"}]}
+    monkeypatch.setattr(mapper, "_load_mapping_page", lambda _: page)
+    monkeypatch.setattr(mapper, "_remove_mapping", lambda *args: None)
+    monkeypatch.setattr(mapper, "_post_form", lambda *args: pytest.fail("Must not add after failed removal"))
+    result = mapper.map_question(123, ["New >> Path"], action="replace")
+    assert not result.success
+    assert "not removed" in result.errors[0]
+
+
+def test_unmap_absent_path_is_a_verified_noop(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    mapper._trees_loaded_at = 10**12
+    mapper._curriculum_index = {"Absent >> Path": ["1"]}
+    mapper._taxonomy_index = {}
+    page = {"name": "Q", "curriculum": [], "taxonomy": []}
+    monkeypatch.setattr(mapper, "_load_mapping_page", lambda _: page)
+    result = mapper.map_question(123, ["Absent >> Path"], action="remove")
+    assert result.success
+    assert result.already_absent == ["Curriculum: Absent >> Path"]
+    assert result.added == result.removed == []
 
 
 def test_mapper_adds_missing_paths_and_retains_existing_mappings(monkeypatch):

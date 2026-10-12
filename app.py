@@ -331,7 +331,20 @@ if uploaded is not None:
 st.divider()
 with st.expander("Apply mappings to CMS", expanded=False):
     st.write("Use this after the questions exist in CMS, whether they were created by Anand’s tool or were already present. Upload a mapping CSV or XLSX, review it, and then apply the mappings.")
-    st.info("Existing Curriculum and Taxonomy mappings are retained. This tool only adds missing mappings; it never removes or replaces an existing mapping.")
+    mapping_actions = {
+        "Add mappings from sheet": "add",
+        "Replace all mappings with mappings from sheet": "replace",
+        "Remove mappings listed in sheet (Unmap)": "remove",
+    }
+    mapping_action_label = st.radio("Mapping action", list(mapping_actions), key="cms_mapping_action")
+    mapping_action = mapping_actions[mapping_action_label]
+    if mapping_action == "add":
+        st.info("Adds the listed mappings and retains all existing mappings.")
+    elif mapping_action == "replace":
+        st.warning("Removes ALL existing Curriculum and Taxonomy mappings for each included question, then adds the mappings from the sheet. If only one mapping type is supplied, both existing mapping types are still cleared.")
+    else:
+        st.info("Removes only the Curriculum and Taxonomy mappings listed in the sheet. All other mappings are retained.")
+    st.caption("Blank cells are ignored. Questions with no Curriculum or Taxonomy entries are skipped.")
     st.caption("Project names, spreadsheet headings and Curriculum/Taxonomy paths are matched without regard to uppercase or lowercase. Spelling and hierarchy must still match. If a path is not found, the pre-check lists up to three closest paths from the corresponding live CMS tree; suggestions are never applied automatically.")
     st.caption(
         "Accepted layouts: Question/Project + Snippet ID + Mapping Type + Path; or Snippet ID/Project with qno + separate Taxonomy and Curriculum columns. "
@@ -409,7 +422,9 @@ with st.expander("Apply mappings to CMS", expanded=False):
                 st.error(f"CMS connection test failed: {connection_test['message']}")
 
     can_apply = mapping_frame is not None and mapping_problem is None and not missing_secret and not mapping_frame.empty
-    if st.button("Validate and apply mappings to CMS", type="primary", disabled=not can_apply, use_container_width=True):
+    action_button = {"add": "Validate and add mappings", "replace": "Validate and replace all mappings", "remove": "Validate and remove listed mappings"}[mapping_action]
+    if st.button(action_button, type="primary", disabled=not can_apply, use_container_width=True):
+        st.session_state.pop("cms_mapping_results", None)
         mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"])
         validation_errors: list[str] = []
         resolved_frame = mapping_frame.copy()
@@ -431,6 +446,16 @@ with st.expander("Apply mappings to CMS", expanded=False):
                 snippet_pages[snippet_text] = page
                 if page is None:
                     validation_errors.append(f"Snippet {snippet_text} does not yet exist in CMS.")
+                else:
+                    rows = resolved_frame[resolved_frame["Snippet ID"] == snippet_text]
+                    action_error = mapper.validate_action(
+                        page,
+                        rows.loc[rows["Mapping Type"] == "Curriculum", "Path"].tolist(),
+                        rows.loc[rows["Mapping Type"] == "Taxonomy", "Path"].tolist(),
+                        action=mapping_action,
+                    )
+                    if action_error:
+                        validation_errors.append(f"Snippet {snippet_text}: {action_error}")
 
             project_rows = resolved_frame[resolved_frame["Question"].str.match(r"(?i)^project.+_q\d+$")]
             for _, row in project_rows[["Question", "Snippet ID"]].drop_duplicates().iterrows():
@@ -464,7 +489,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
 
         if validation_errors:
             st.error(
-                "Nothing was mapped because the pre-check found a problem:\n\n"
+                "No CMS mappings were changed because the pre-check found a problem:\n\n"
                 + "\n".join(f"- {problem}" for problem in validation_errors)
             )
             st.dataframe(pd.DataFrame({"Problem": validation_errors}), use_container_width=True, hide_index=True)
@@ -477,19 +502,25 @@ with st.expander("Apply mappings to CMS", expanded=False):
                 curriculum_paths = rows_for_snippet.loc[rows_for_snippet["Mapping Type"] == "Curriculum", "Path"].tolist()
                 taxonomy_paths = rows_for_snippet.loc[rows_for_snippet["Mapping Type"] == "Taxonomy", "Path"].tolist()
                 try:
-                    mapping_result = mapper.map_question(int(snippet_text), curriculum_paths, taxonomy_paths)
+                    mapping_result = mapper.map_question(int(snippet_text), curriculum_paths, taxonomy_paths, action=mapping_action)
                     status = "Done" if mapping_result.success else "Problem"
                     details = "; ".join(
                         mapping_result.errors
                         if mapping_result.errors
-                        else mapping_result.added + mapping_result.already_present
+                        else ([f"Added — {p}" for p in mapping_result.added]
+                              + [f"Removed — {p}" for p in mapping_result.removed]
+                              + [f"Already present — {p}" for p in mapping_result.already_present]
+                              + [f"Already absent — {p}" for p in mapping_result.already_absent])
                     )
                     result_rows.append(
                         {
                             "Snippet ID": snippet_text,
                             "Question": mapping_result.question_name or "",
                             "Status": status,
+                            "Action": mapping_action_label,
                             "Added": len(mapping_result.added),
+                            "Removed": len(mapping_result.removed),
+                            "Already absent": len(mapping_result.already_absent),
                             "Already present": len(mapping_result.already_present),
                             "Details": details or "No change required",
                         }
@@ -500,9 +531,12 @@ with st.expander("Apply mappings to CMS", expanded=False):
                             "Snippet ID": snippet_text,
                             "Question": "",
                             "Status": "Problem",
+                            "Action": mapping_action_label,
                             "Added": 0,
+                            "Removed": 0,
+                            "Already absent": 0,
                             "Already present": 0,
-                            "Details": str(exc),
+                            "Details": f"{exc} Changes may be partially applied; inspect current CMS mappings before retrying.",
                         }
                     )
                 progress.progress(index / len(grouped))
@@ -515,7 +549,7 @@ with st.expander("Apply mappings to CMS", expanded=False):
         if (mapping_results["Status"] == "Problem").any():
             st.warning("Some snippets need attention. Review the Details column before retrying those snippets.")
         else:
-            st.success("All requested mappings were applied or were already present. Existing mappings were retained.")
+            st.success("All requested mapping actions completed and were verified. See the Action and Details columns for each question.")
         st.download_button(
             "Download mapping results CSV",
             data=mapping_results.to_csv(index=False).encode("utf-8-sig"),
@@ -568,7 +602,7 @@ with st.expander("What the app checks"):
 - Supports a later CMS mapping step after Anand’s upload has created the snippets.
 - The later mapping step accepts long mapping rows or wide Project/Snippet ID/Taxonomy/Curriculum spreadsheets, including multiline path cells.
 - A missing snippet ID can be resolved from one exact CMS Project with qno/Project question name.
-- Adds missing mappings only. Existing CMS mappings are retained and are never removed or replaced.
+- Offers Add, Replace all, and Remove listed (Unmap) actions using the same sheet format. Blank cells are ignored; questions with no mapping entries are skipped.
 
 Only the selected sections change the document. The verification report records every applied fix and every unresolved manual check.
 """

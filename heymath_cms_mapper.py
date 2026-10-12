@@ -1,8 +1,4 @@
-"""Add curriculum and taxonomy paths to existing HeyMath CMS snippets.
-
-This integration uses the CMS mapping webpages. It only adds missing mappings;
-it never removes or replaces mappings already present in CMS.
-"""
+"""Add, replace, or remove sheet-specified CMS mappings."""
 
 from __future__ import annotations
 
@@ -14,6 +10,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
+from urllib.parse import urljoin, urlparse
+
+from lxml import html
 
 import requests
 
@@ -59,6 +58,8 @@ class MappingResult:
     question_name: str | None = None
     added: list[str] = field(default_factory=list)
     already_present: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    already_absent: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     curriculum_before: list[str] = field(default_factory=list)
     taxonomy_before: list[str] = field(default_factory=list)
@@ -95,9 +96,15 @@ class HeyMathCmsMapper:
         snippet_id: int,
         curriculum_paths: Iterable[str] | None = None,
         taxonomy_paths: Iterable[str] | None = None,
+        *,
+        action: str = "add",
     ) -> MappingResult:
-        curriculum_paths = list(curriculum_paths or [])
-        taxonomy_paths = list(taxonomy_paths or [])
+        if action not in {"add", "replace", "remove"}:
+            raise ValueError("Mapping action must be add, replace, or remove.")
+        curriculum_paths = _norm_all(curriculum_paths)
+        taxonomy_paths = _norm_all(taxonomy_paths)
+        if not curriculum_paths and not taxonomy_paths:
+            return MappingResult(int(snippet_id))
         with self._lock:
             result = MappingResult(int(snippet_id))
             self._ensure_logged_in()
@@ -113,19 +120,53 @@ class HeyMathCmsMapper:
             curriculum_ids = self._resolve(
                 curriculum_paths,
                 self._curriculum_index,
-                page["curriculum"],
+                page["curriculum"] if action == "add" else [],
                 "Curriculum",
                 result,
             )
             taxonomy_ids = self._resolve(
                 taxonomy_paths,
                 self._taxonomy_index,
-                page["taxonomy"],
+                page["taxonomy"] if action == "add" else [],
                 "Taxonomy",
                 result,
             )
             if result.errors:
                 return result
+
+            error = self.validate_action(page, curriculum_paths, taxonomy_paths, action=action)
+            if error:
+                result.errors.append(error)
+                return result
+            if action != "add":
+                result.added.clear()
+                for label, key, requested in (
+                    ("Curriculum", "curriculum", curriculum_paths),
+                    ("Taxonomy", "taxonomy", taxonomy_paths),
+                ):
+                    targets = page[key] if action == "replace" else requested
+                    for path in targets:
+                        if not _contains_path(page[key], path):
+                            result.already_absent.append(f"{label}: {path}")
+                            continue
+                        fresh = self._load_mapping_page(snippet_id)
+                        if fresh is None:
+                            raise RuntimeError("Question could not be reloaded before removal.")
+                        self._remove_mapping(fresh, key, path, snippet_id)
+                        verified = self._load_mapping_page(snippet_id)
+                        if verified is None or _contains_path(verified[key], path):
+                            result.errors.append(f"{label} mapping was not removed: {path}")
+                            return result
+                        result.removed.append(f"{label}: {path}")
+                page = self._load_mapping_page(snippet_id)
+                if page is None:
+                    raise RuntimeError("Question could not be reloaded after removal.")
+                if action == "remove":
+                    curriculum_ids = taxonomy_ids = []
+                else:
+                    result.added = [f"Curriculum: {path}" for path in curriculum_paths] + [
+                        f"Taxonomy: {path}" for path in taxonomy_paths
+                    ]
 
             if curriculum_ids:
                 self._post_form(
@@ -156,20 +197,59 @@ class HeyMathCmsMapper:
                 return result
             result.curriculum_after = after["curriculum"]
             result.taxonomy_after = after["taxonomy"]
-            for path in _norm_all(curriculum_paths):
-                if not _contains_path(after["curriculum"], path):
+            for path in curriculum_paths:
+                if action != "remove" and not _contains_path(after["curriculum"], path):
                     result.errors.append(f"Curriculum mapping was not saved: {path}")
-            for path in _norm_all(taxonomy_paths):
-                if not _contains_path(after["taxonomy"], path):
+            for path in taxonomy_paths:
+                if action != "remove" and not _contains_path(after["taxonomy"], path):
                     result.errors.append(f"Taxonomy mapping was not saved: {path}")
-            for path in page["curriculum"]:
+            for path in result.curriculum_before:
+                if action == "replace" or (action == "remove" and _contains_path(curriculum_paths, path)):
+                    continue
                 if not _contains_path(after["curriculum"], path):
                     result.errors.append(f"Existing curriculum mapping disappeared: {path}")
-            for path in page["taxonomy"]:
+            for path in result.taxonomy_before:
+                if action == "replace" or (action == "remove" and _contains_path(taxonomy_paths, path)):
+                    continue
                 if not _contains_path(after["taxonomy"], path):
                     result.errors.append(f"Existing taxonomy mapping disappeared: {path}")
+            for key, requested in (("curriculum", curriculum_paths), ("taxonomy", taxonomy_paths)):
+                if action == "replace" and {norm(p).casefold() for p in after[key]} != {p.casefold() for p in requested}:
+                    result.errors.append(f"Final {key} mappings do not match the sheet.")
+                if action == "remove" and any(_contains_path(after[key], p) for p in requested):
+                    result.errors.append(f"Some requested {key} mappings remain.")
             log.info(result.summary())
             return result
+
+    def validate_action(self, page: dict, curriculum_paths: Iterable[str], taxonomy_paths: Iterable[str], *, action: str) -> str | None:
+        """Check every required removal control before changing any mappings."""
+        if action == "add":
+            return None
+        for key, requested in (("curriculum", curriculum_paths), ("taxonomy", taxonomy_paths)):
+            targets = page[key] if action == "replace" else _norm_all(requested)
+            for path in targets:
+                if _contains_path(page[key], path) and not self._removal_control(page, key, path):
+                    return f"CMS removal control not found for {key}: {path}. No changes were made to this question."
+        return None
+
+    @staticmethod
+    def _removal_control(page: dict, key: str, path: str) -> dict | None:
+        matches = [c for c in page.get("removal_controls", []) if c["type"] == key and _contains_path([c["path"]], path)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _remove_mapping(self, page: dict, key: str, path: str, snippet_id: int) -> None:
+        control = self._removal_control(page, key, path)
+        if control is None:
+            raise RuntimeError(f"CMS removal control not found for {key}: {path}")
+        url = urljoin(self.base_url + "/", control["url"])
+        if (urlparse(url).scheme, urlparse(url).netloc) != (urlparse(self.base_url).scheme, urlparse(self.base_url).netloc):
+            raise RuntimeError("CMS removal control points outside the configured CMS.")
+        response = self._session.request(control["method"], url, data=control["data"],
+            headers={"Referer": f"{self.base_url}/question/{int(snippet_id)}/html_curriculum"},
+            timeout=TIMEOUT, allow_redirects=True)
+        response.raise_for_status()
+        if self._looks_like_login(response):
+            raise RuntimeError("CMS session expired during removal. Review current mappings before retrying.")
 
     def validate_path(self, path: str, *, taxonomy: bool = False) -> str | None:
         with self._lock:
@@ -333,7 +413,58 @@ class HeyMathCmsMapper:
             "taxonomy_token": taxonomy_token,
             "curriculum": curriculum,
             "taxonomy": taxonomy,
+            "removal_controls": self._parse_removal_controls(text, curriculum, taxonomy),
         }
+
+    @staticmethod
+    def _parse_removal_controls(text: str, curriculum: list[str], taxonomy: list[str]) -> list[dict]:
+        """Read explicit per-path removal forms/links; never invent CMS endpoints."""
+        root = html.fromstring(text)
+        meta = root.xpath('//meta[@name="csrf-token"]/@content')
+        token = meta[0] if meta else None
+        controls = []
+        for element in root.xpath('//a[@href] | //form[@action]'):
+            marker = " ".join([element.text_content(), element.get("title", ""),
+                element.get("aria-label", ""), element.get("href", ""), element.get("action", "")])
+            if not re.search(r"\b(remove|delete|unmap|destroy)\b|remove_mapping|delete_mapping", marker, re.I):
+                continue
+            container = element
+            matches = []
+            # Require exactly one known mapped path within the nearest enclosing row/item.
+            for _ in range(5):
+                visible = norm(container.text_content())
+                matches = [(key, path) for key, paths in (("curriculum", curriculum), ("taxonomy", taxonomy))
+                    for path in paths if norm(path).casefold() in visible.casefold()]
+                if matches:
+                    break
+                container = container.getparent()
+                if container is None:
+                    break
+            if len(matches) != 1:
+                continue
+            data = {}
+            if element.tag == "form":
+                for field in element.xpath('.//input[@name] | .//button[@name]'):
+                    if field.get("type", "").lower() not in {"checkbox", "radio"} or field.get("checked") is not None:
+                        data[field.get("name")] = field.get("value", "")
+                method = element.get("method", "get").upper()
+                url = element.get("action")
+            else:
+                method = element.get("data-method", element.get("data-turbo-method", "get")).upper()
+                url = element.get("href")
+                if method != "GET":
+                    if not token:
+                        continue
+                    data = {"authenticity_token": token}
+            if not url or url.startswith(("#", "javascript:")) or method not in {"GET", "POST", "DELETE", "PATCH"}:
+                continue
+            endpoint = urlparse(url).path
+            if not endpoint.startswith(("/curriculum_trees/", "/heymath_taxonomy/")):
+                continue
+            if method == "GET" and data:
+                continue
+            controls.append({"type": matches[0][0], "path": matches[0][1], "method": method, "url": url, "data": data})
+        return controls
 
     def _site_authenticity_token(self) -> str:
         text = self._get("/user")
