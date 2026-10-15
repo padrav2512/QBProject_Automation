@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.09.29-plain-image-headings-v14.8"
+PROCESSOR_BUILD_ID = "2026.10.15-table-answer-boundaries-v14.9"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -82,7 +82,7 @@ TAGGED_CHOICE_RE = re.compile(r"^(\s*@[1-4]@\s*)(.*?)(\s+@correct answer@\s*)?$"
 SAFE_ROOT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*√\s*(\d+)$")
 SAFE_FRACTION_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])$")
 LETTER_ANSWER_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*\(?([A-Da-d])\)?\.?\s*$", re.I)
-ANSWER_VALUE_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*(.+?)\s*$", re.I)
+ANSWER_VALUE_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*(.+?)\s*$", re.I | re.S)
 MCQ_ANSWER_RE = re.compile(
     r"^\s*(?:Answer|Correct answer)\s*:?\s*(?:\(?([A-Da-d])\)?|([1-4]))(?:[.)])?(?:\s+(.+?))?\s*$",
     re.I,
@@ -402,6 +402,106 @@ def _block_paragraphs(start: Paragraph, next_start: Paragraph | None) -> list[Pa
     return result
 
 
+def _block_body_elements(start: Paragraph, next_start: Paragraph | None) -> list:
+    """Return top-level Word body elements in a question record, including tables."""
+    result = []
+    node = start._p
+    stop = next_start._p if next_start else None
+    while node is not None and node is not stop:
+        if node.tag in {qn("w:p"), qn("w:tbl")}:
+            result.append(node)
+        node = node.getnext()
+    return result
+
+
+def _insert_after_body_element(element, parent, text: str = "") -> Paragraph:
+    new_p = OxmlElement("w:p")
+    element.addnext(new_p)
+    paragraph = Paragraph(new_p, parent)
+    if text:
+        paragraph.add_run(text)
+    return paragraph
+
+
+def _body_element_text(element, parent) -> str:
+    return Paragraph(element, parent).text.strip() if element.tag == qn("w:p") else ""
+
+
+def _body_element_has_visible_content(element, parent) -> bool:
+    if element.tag == qn("w:tbl"):
+        # A table is visible content even when its cells are intentionally blank.
+        return True
+    paragraph = Paragraph(element, parent)
+    return _has_visible_content(paragraph)
+
+
+def _ensure_section_closures(
+    start: Paragraph,
+    next_start: Paragraph | None,
+    question_number: int,
+    findings: list[Finding],
+) -> None:
+    """Place one @e@ after all content in each section, including trailing tables."""
+    elements = _block_body_elements(start, next_start)
+    markers = [
+        element
+        for element in elements
+        if element.tag == qn("w:p") and _body_element_text(element, start._parent) in SECTION_MARKERS
+    ]
+    for marker_index in range(len(markers) - 1, -1, -1):
+        marker = markers[marker_index]
+        next_marker = markers[marker_index + 1] if marker_index + 1 < len(markers) else None
+        span = []
+        node = marker.getnext()
+        while node is not None and node is not next_marker and node is not (next_start._p if next_start else None):
+            if node.tag in {qn("w:p"), qn("w:tbl")}:
+                span.append(node)
+            node = node.getnext()
+
+        terminators = [
+            element
+            for element in span
+            if element.tag == qn("w:p") and _body_element_text(element, start._parent) == "@e@"
+        ]
+        content = [
+            element
+            for element in span
+            if element not in terminators and _body_element_has_visible_content(element, start._parent)
+        ]
+        if terminators:
+            first_terminator_index = span.index(terminators[0])
+            trailing_content = [
+                element
+                for element in span[first_terminator_index + 1 :]
+                if element not in terminators and _body_element_has_visible_content(element, start._parent)
+            ]
+            # Ordinary text after a closing marker may be deliberate inter-question
+            # information and must stay outside the CMS section. A trailing table,
+            # however, is part of the question content Word stored as a sibling.
+            if not any(element.tag == qn("w:tbl") for element in trailing_content):
+                continue
+            anchor = trailing_content[-1]
+            for terminator in terminators:
+                parent = terminator.getparent()
+                if parent is not None:
+                    parent.remove(terminator)
+            _insert_after_body_element(anchor, start._parent, "@e@")
+            action = "Repositioned"
+        else:
+            anchor = content[-1] if content else marker
+            _insert_after_body_element(anchor, start._parent, "@e@")
+            action = "Inserted a missing"
+        section_name = _body_element_text(marker, start._parent)
+        findings.append(
+            Finding(
+                0,
+                "fixed",
+                f"{action} @e@ after all content in {section_name}, including any table.",
+                question_number,
+            )
+        )
+
+
 def _metadata_value(block: Iterable[Paragraph], name: str) -> str | None:
     for p in block:
         for line in p.text.replace("\u00a0", " ").splitlines():
@@ -713,7 +813,11 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             continue
         answer_paragraph, answer_match = candidates[0]
         answer_value = answer_match.group(1).strip()
-        if not answer_value or len(answer_value) > 100 or "\n" in answer_value:
+        answer_lines = [line.strip() for line in answer_value.splitlines() if line.strip()]
+        labelled_multiline_answer = len(answer_lines) > 1 and all(
+            re.match(r"^\s*\([a-z]\)\s*\S", line, re.I) for line in answer_lines
+        )
+        if not answer_value or len(answer_value) > 1000 or (len(answer_lines) > 1 and not labelled_multiline_answer):
             findings.append(Finding(0, "manual_review", "An FIB-style answer was found but is too complex to structure automatically.", detected_number))
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
@@ -792,7 +896,9 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
 
         findings.append(Finding(0, "fixed", f"Normalised CMS metadata and assigned question ID {qid} and snippet ID {snippet}.", assigned_number))
 
-    # Recompute and close each content block immediately before the next section.
+    # Recompute and close each content block immediately after all its content.
+    # This must use top-level body elements rather than paragraphs alone because
+    # Word stores a table beside, rather than inside, the surrounding paragraphs.
     starts = _question_starts(doc)
     for ordinal, (start, _) in enumerate(starts):
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
@@ -802,27 +908,11 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         if not any(block[i].text.strip() in {"@Answers:@", "@Choices:@"} for i in section_positions):
             findings.append(Finding(8, "manual_review", "The record has no @Answers:@ or @Choices:@ block.", assigned_number))
         if not any(block[i].text.strip() == "@Solution:@" for i in section_positions):
-            marker = _insert_after(block[-1], "@Solution:@")
+            body_elements = _block_body_elements(start, next_start)
+            marker = _insert_after_body_element(body_elements[-1], start._parent, "@Solution:@")
             _insert_after(marker, "@e@")
             findings.append(Finding(1, "manual_review", "Added an empty Solution section because no solution was supplied. No solution content was invented.", assigned_number))
-
-        for pos_index in range(len(section_positions) - 1, -1, -1):
-            pos = section_positions[pos_index]
-            end = section_positions[pos_index + 1] if pos_index + 1 < len(section_positions) else len(block)
-            content = block[pos + 1 : end]
-            last_nonblank = next(
-                (
-                    p
-                    for p in reversed(content)
-                    if p.text.strip() or p._p.xpath(".//w:drawing | .//w:pict | .//m:oMath")
-                ),
-                None,
-            )
-            if last_nonblank is None:
-                continue
-            if last_nonblank.text.strip() != "@e@":
-                _insert_after(last_nonblank, "@e@")
-                findings.append(Finding(0, "fixed", f"Inserted a missing @e@ after {block[pos].text.strip()}.", assigned_number))
+        _ensure_section_closures(start, next_start, assigned_number, findings)
 
     return len(starts)
 
