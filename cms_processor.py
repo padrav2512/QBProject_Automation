@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.15-table-answer-boundaries-v14.9"
+PROCESSOR_BUILD_ID = "2026.10.16-plural-answer-blocks-v14.10"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -81,10 +81,11 @@ OPTION_RE = re.compile(r"^\s*(?:@([1-4])@|\(?([A-Da-d])\)?[.)])\s*(.*)$")
 TAGGED_CHOICE_RE = re.compile(r"^(\s*@[1-4]@\s*)(.*?)(\s+@correct answer@\s*)?$", re.I)
 SAFE_ROOT_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*√\s*(\d+)$")
 SAFE_FRACTION_ASSIGNMENT_RE = re.compile(r"^([A-Za-z])\s*=\s*(-?\d+|[A-Za-z])\s*/\s*(-?\d+|[A-Za-z])$")
-LETTER_ANSWER_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*\(?([A-Da-d])\)?\.?\s*$", re.I)
-ANSWER_VALUE_RE = re.compile(r"^\s*(?:Answer|Correct answer)\s*:?\s*(.+?)\s*$", re.I | re.S)
+LETTER_ANSWER_RE = re.compile(r"^\s*(?:Answers?|Correct answers?)\s*:?\s*\(?([A-Da-d])\)?\.?\s*$", re.I)
+ANSWER_VALUE_RE = re.compile(r"^\s*(?:Answers?|Correct answers?)\s*:?\s*(.+?)\s*$", re.I | re.S)
+ANSWER_CONTINUATION_RE = re.compile(r"^\s*\((?:[a-z]|[ivxlcdm]+)\)\s*\S", re.I)
 MCQ_ANSWER_RE = re.compile(
-    r"^\s*(?:Answer|Correct answer)\s*:?\s*(?:\(?([A-Da-d])\)?|([1-4]))(?:[.)])?(?:\s+(.+?))?\s*$",
+    r"^\s*(?:Answers?|Correct answers?)\s*:?\s*(?:\(?([A-Da-d])\)?|([1-4]))(?:[.)])?(?:\s+(.+?))?\s*$",
     re.I,
 )
 MAPPING_LABEL_RE = re.compile(r"^(Curriculum|Taxonomy)\s*:\s*(.*?)\s*$", re.I)
@@ -821,10 +822,22 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             findings.append(Finding(0, "manual_review", "An FIB-style answer was found but is too complex to structure automatically.", detected_number))
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
-        prefix = re.match(r"^\s*(?:Answer|Correct answer)\s*:?\s*", answer_paragraph.text, re.I)
-        _replace_text_prefix(answer_paragraph, prefix.end())
+        prefix = re.match(r"^\s*(?:Answers?|Correct answers?)\s*:?\s*", answer_paragraph.text, re.I)
+        # Manual line breaks are separate XML nodes and must count towards the
+        # removed prefix; otherwise the first answer's opening bracket is lost.
+        _remove_run_text_prefix(answer_paragraph, prefix.end())
         if solution_index == len(block):
-            solution_marker = _insert_after(answer_paragraph, "@Solution:@")
+            answer_tail = answer_paragraph
+            answer_position = block.index(answer_paragraph)
+            for following in block[answer_position + 1 :]:
+                following_text = following.text.strip()
+                if not following_text:
+                    continue
+                if ANSWER_CONTINUATION_RE.match(following_text):
+                    answer_tail = following
+                    continue
+                break
+            solution_marker = _insert_after(answer_tail, "@Solution:@")
             # Keep the explicit answer in @Answers:@, but do not invent solution prose.
             _insert_after(solution_marker, "@e@")
         findings.append(Finding(0, "fixed", "Identified an untagged FIB and created its Answers and Solution sections.", detected_number))
@@ -1836,6 +1849,19 @@ def _convert_simple_math_paragraphs(doc: _Document, findings: list[Finding]) -> 
         findings.append(Finding(7, "fixed", f"Converted slash fractions to stacked fractions wherever they occurred in {converted} unambiguous standalone expression(s)."))
 
 
+def _top_level_answer_label_matches(text: str) -> list[re.Match[str]]:
+    """Return sequential (a), (b), ... labels while ignoring nested (i), (ii), ... labels."""
+    candidates = list(re.finditer(r"(?<!\w)(\([a-z]\)|[a-z]\))\s*", text, re.I))
+    matches: list[re.Match[str]] = []
+    expected = ord("a")
+    for match in candidates:
+        label = re.search(r"[a-z]", match.group(1), re.I)
+        if label and label.group(0).casefold() == chr(expected):
+            matches.append(match)
+            expected += 1
+    return matches
+
+
 def _split_answers(doc: _Document, findings: list[Finding]) -> None:
     context = _section_for_paragraphs(doc)
     splits = 0
@@ -1844,14 +1870,14 @@ def _split_answers(doc: _Document, findings: list[Finding]) -> None:
         if section != "@Answers:@":
             continue
         text = paragraph.text.strip()
-        matches = list(re.finditer(r"(?<!\w)(\([a-z]\)|[a-z]\))\s*", text, re.I))
+        matches = _top_level_answer_label_matches(text)
         if len(matches) < 2:
             continue
         if _has_embedded_content(paragraph):
             findings.append(Finding(8, "manual_review", "Combined answers contain equations or objects; preserved intact. Put each labelled answer in its own paragraph.", question))
             continue
         # Match against the original string so offsets include leading whitespace.
-        matches = list(re.finditer(r"(?<!\w)(\([a-z]\)|[a-z]\))\s*", paragraph.text, re.I))
+        matches = _top_level_answer_label_matches(paragraph.text)
         spans = [(m.start(), matches[i + 1].start() if i + 1 < len(matches) else len(paragraph.text)) for i, m in enumerate(matches)]
         parts = _split_formatted_text(paragraph, spans)
         splits += len(parts) - 1

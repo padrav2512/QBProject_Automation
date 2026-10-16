@@ -110,7 +110,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.15-table-answer-boundaries-v14.9"
+    assert PROCESSOR_BUILD_ID == "2026.10.16-plural-answer-blocks-v14.10"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -1441,3 +1441,34 @@ def test_multiline_labelled_fib_answer_becomes_answers_block(tmp_path: Path):
         "@e@",
     ]
     assert not any(text.startswith("Answer:") for text in texts)
+
+
+def test_plural_multiline_fib_answers_become_answers_block(tmp_path: Path):
+    source = tmp_path / "plural_multiline_fib_answers.docx"
+    doc = Document()
+    for text in [
+        "Question 1",
+        "Difficulty level: Average",
+        "Objective: Application",
+        "Question type: FIB",
+        "Find the requested values.",
+    ]:
+        doc.add_paragraph(text)
+    answers = doc.add_paragraph()
+    answers.add_run("Answers:\n(a) 2\n(b) QR = 42 cm\n(c) (i) 4")
+    doc.add_paragraph("(ii) 2")
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "plural_answer_storage")
+    texts = [paragraph.text.strip() for paragraph in Document(result.output_path).paragraphs if paragraph.text.strip()]
+    answers_index = texts.index("@Answers:@")
+    solution_index = texts.index("@Solution:@")
+
+    assert texts[answers_index + 1 : solution_index] == [
+        "(a) 2",
+        "(b) QR = 42 cm",
+        "(c) (i) 4",
+        "(ii) 2",
+        "@e@",
+    ]
+    assert not any(text.startswith("Answers:") for text in texts)
