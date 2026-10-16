@@ -13,7 +13,7 @@ import heymath_cms_mapper as _cms_mapper
 from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_sheet_names
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.10.16-plural-answer-blocks-v14.10"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.10.16-structure-count-audit-v14.11"
 EXPECTED_MAPPER_BUILD_ID = "2026.10.12-live-removal-v5"
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
     _cms_mapper = importlib.reload(_cms_mapper)
@@ -332,6 +332,82 @@ if uploaded is not None:
                 use_container_width=True,
                 on_click="ignore",
             )
+
+            structure = result.structure_counts
+            question_total = structure["questions_detected"]
+            structure_rows = [
+                {
+                    "Item": "Questions detected",
+                    "Count": question_total,
+                    "Expected": "Reference count",
+                    "Status": "Counted",
+                },
+                {
+                    "Item": "@Question: number@ headings",
+                    "Count": structure["question_heading_tags"],
+                    "Expected": question_total,
+                    "Status": "Match" if structure["question_heading_tags"] == question_total else "Mismatch",
+                },
+                {
+                    "Item": "@Type:@ tags",
+                    "Count": structure["type_tags"],
+                    "Expected": question_total,
+                    "Status": "Match" if structure["type_tags"] == question_total else "Mismatch",
+                },
+                {
+                    "Item": "MCQ Type tags",
+                    "Count": structure["mcq_types"],
+                    "Expected": f"Same as @Choices:@ ({structure['choices_tags']})",
+                    "Status": "Match" if structure["mcq_types"] == structure["choices_tags"] else "Mismatch",
+                },
+                {
+                    "Item": "@Choices:@ tags",
+                    "Count": structure["choices_tags"],
+                    "Expected": f"Same as MCQs ({structure['mcq_types']})",
+                    "Status": "Match" if structure["choices_tags"] == structure["mcq_types"] else "Mismatch",
+                },
+                {
+                    "Item": "FIB Type tags",
+                    "Count": structure["fib_types"],
+                    "Expected": f"Same as @Answers:@ ({structure['answers_tags']})",
+                    "Status": "Match" if structure["fib_types"] == structure["answers_tags"] else "Mismatch",
+                },
+                {
+                    "Item": "@Answers:@ tags",
+                    "Count": structure["answers_tags"],
+                    "Expected": f"Same as FIBs ({structure['fib_types']})",
+                    "Status": "Match" if structure["answers_tags"] == structure["fib_types"] else "Mismatch",
+                },
+                {
+                    "Item": "@Question:@ section tags",
+                    "Count": structure["question_section_tags"],
+                    "Expected": question_total,
+                    "Status": "Match" if structure["question_section_tags"] == question_total else "Mismatch",
+                },
+                {
+                    "Item": "@Solution:@ tags",
+                    "Count": structure["solution_tags"],
+                    "Expected": question_total,
+                    "Status": "Match" if structure["solution_tags"] == question_total else "Mismatch",
+                },
+                {
+                    "Item": "@e@ closing tags",
+                    "Count": structure["closing_tags"],
+                    "Expected": structure["expected_closing_tags"],
+                    "Status": "Match" if structure["closing_tags"] == structure["expected_closing_tags"] else "Mismatch",
+                },
+            ]
+            st.subheader("CMS structure count check")
+            st.caption("The MCQ count must equal the @Choices:@ count, and the FIB count must equal the @Answers:@ count. Each question is also checked individually for its required tags and three @e@ closing tags.")
+            if not structure["enforced"]:
+                st.info("Counts are shown for information only because CMS tag insertion was not selected and no existing tagged question records were detected.")
+            elif structure["all_match"]:
+                st.success("All document-level counts and individual question structures match.")
+            else:
+                mismatch_questions = structure["record_mismatch_questions"]
+                question_note = f" Check question(s): {', '.join(map(str, mismatch_questions))}." if mismatch_questions else ""
+                st.error(f"One or more CMS structure counts or individual question records do not match.{question_note}")
+            st.dataframe(pd.DataFrame(structure_rows), use_container_width=True, hide_index=True)
 
             manual_rows = [
                 {

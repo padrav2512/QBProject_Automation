@@ -110,7 +110,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.16-plural-answer-blocks-v14.10"
+    assert PROCESSOR_BUILD_ID == "2026.10.16-structure-count-audit-v14.11"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -1472,3 +1472,79 @@ def test_plural_multiline_fib_answers_become_answers_block(tmp_path: Path):
         "@e@",
     ]
     assert not any(text.startswith("Answers:") for text in texts)
+
+
+def test_cms_structure_counts_match_for_complete_mcq_and_fib_records(tmp_path: Path):
+    source = tmp_path / "complete_tagged_records.docx"
+    doc = Document()
+    for text in [
+        "@Question: 1@", "@Type: MCQ@", "@Question id: project1_q1@", "@New snippet id: 10@",
+        "@Question:@", "Choose one.", "@e@", "@Choices:@",
+        "@1@ One @correct answer@", "@2@ Two", "@3@ Three", "@4@ Four", "@e@",
+        "@Solution:@", "@e@",
+        "@Question: 2@", "@Type: FIB@", "@Question id: project1_q2@", "@New snippet id: 11@",
+        "@Question:@", "Fill the blank.", "@e@", "@Answers:@", "5", "@e@",
+        "@Solution:@", "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project_q"),
+        tmp_path / "complete_structure_storage",
+    )
+
+    assert result.structure_counts == {
+        "questions_detected": 2,
+        "question_heading_tags": 2,
+        "type_tags": 2,
+        "mcq_types": 1,
+        "fib_types": 1,
+        "invalid_type_tags": 0,
+        "question_section_tags": 2,
+        "choices_tags": 1,
+        "answers_tags": 1,
+        "solution_tags": 2,
+        "closing_tags": 6,
+        "expected_closing_tags": 6,
+        "record_mismatch_count": 0,
+        "record_mismatch_questions": [],
+        "all_match": True,
+        "enforced": True,
+    }
+    count_findings = [finding for finding in result.findings if finding.rule == 16]
+    assert len(count_findings) == 1 and count_findings[0].status == "passed"
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["structure_counts"] == result.structure_counts
+
+
+def test_cms_structure_count_mismatch_identifies_affected_question(tmp_path: Path):
+    source = tmp_path / "mismatched_tagged_record.docx"
+    doc = Document()
+    for text in [
+        "@Question: 7@", "@Type: MCQ@", "@Question id: project1_q7@", "@New snippet id: 17@",
+        "@Question:@", "Choose one.", "@e@", "@Answers:@", "One", "@e@",
+        "@Solution:@", "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(processing_mode="images_only", project_question_prefix="project_q"),
+        tmp_path / "mismatch_structure_storage",
+    )
+
+    counts = result.structure_counts
+    assert counts["mcq_types"] == 1
+    assert counts["choices_tags"] == 0
+    assert counts["answers_tags"] == 1
+    assert counts["all_match"] is False
+    assert counts["record_mismatch_questions"] == [7]
+    count_findings = [finding for finding in result.findings if finding.rule == 16]
+    assert len(count_findings) == 1
+    assert count_findings[0].status == "manual_review"
+    assert "question(s): 7" in count_findings[0].message

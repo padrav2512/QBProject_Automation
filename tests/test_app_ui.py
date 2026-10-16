@@ -30,3 +30,4 @@ def test_app_renders_five_processing_sections_and_mapping_stage():
     )
     assert "Validate and add mappings" in [button.label for button in app.button]
     assert "Apply mappings to CMS" in [expander.label for expander in app.expander]
+    assert "CMS structure count check" in app_path.read_text(encoding="utf-8")

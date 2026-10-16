@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.16-plural-answer-blocks-v14.10"
+PROCESSOR_BUILD_ID = "2026.10.16-structure-count-audit-v14.11"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -147,6 +147,7 @@ class ProcessResult:
     question_count: int
     image_count: int
     mapping_count: int
+    structure_counts: dict
     findings: list[Finding]
 
     @property
@@ -657,6 +658,101 @@ def _audit_question_types(doc: _Document, findings: list[Finding], *, fix_mismat
 
     if checked and not issues:
         findings.append(Finding(12, "passed", f"Question Type tags matched the detected Answers/Choices structure in {checked} record(s)."))
+
+
+def _audit_cms_structure_counts(
+    doc: _Document,
+    findings: list[Finding],
+    *,
+    enforce: bool,
+) -> dict:
+    """Count CMS record tags and verify their document-level and per-record relationships."""
+    paragraphs = body_paragraphs(doc)
+    texts = [paragraph.text.strip() for paragraph in paragraphs]
+    starts = _question_starts(doc)
+    tagged_question_headings = sum(
+        bool(QUESTION_START_RE.fullmatch(text) or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text))
+        for text in texts
+    )
+    type_values = []
+    for text in texts:
+        match = KNOWN_METADATA_RE.fullmatch(text)
+        if match and match.group(1).casefold() == "type":
+            type_values.append(match.group(2).strip().upper())
+
+    counts = {
+        "questions_detected": len(starts),
+        "question_heading_tags": tagged_question_headings,
+        "type_tags": len(type_values),
+        "mcq_types": type_values.count("MCQ"),
+        "fib_types": type_values.count("FIB"),
+        "invalid_type_tags": sum(value not in {"MCQ", "FIB"} for value in type_values),
+        "question_section_tags": texts.count("@Question:@"),
+        "choices_tags": texts.count("@Choices:@"),
+        "answers_tags": texts.count("@Answers:@"),
+        "solution_tags": texts.count("@Solution:@"),
+        "closing_tags": texts.count("@e@"),
+    }
+    counts["expected_closing_tags"] = counts["questions_detected"] * 3
+
+    comparisons = [
+        ("tagged question headings", counts["question_heading_tags"], counts["questions_detected"]),
+        ("Type tags", counts["type_tags"], counts["questions_detected"]),
+        ("MCQ types and @Choices:@ tags", counts["mcq_types"], counts["choices_tags"]),
+        ("FIB types and @Answers:@ tags", counts["fib_types"], counts["answers_tags"]),
+        ("@Question:@ tags", counts["question_section_tags"], counts["questions_detected"]),
+        ("@Solution:@ tags", counts["solution_tags"], counts["questions_detected"]),
+        ("@e@ tags", counts["closing_tags"], counts["expected_closing_tags"]),
+        ("MCQ plus FIB Type tags", counts["mcq_types"] + counts["fib_types"], counts["questions_detected"]),
+    ]
+    mismatch_messages = [f"{label}: {actual} versus expected {expected}" for label, actual, expected in comparisons if actual != expected]
+    if counts["invalid_type_tags"]:
+        mismatch_messages.append(f"invalid Type tags: {counts['invalid_type_tags']}")
+
+    record_mismatches = []
+    for ordinal, (start, number) in enumerate(starts):
+        next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
+        block_texts = [paragraph.text.strip() for paragraph in _block_paragraphs(start, next_start)]
+        block_types = []
+        for text in block_texts:
+            match = KNOWN_METADATA_RE.fullmatch(text)
+            if match and match.group(1).casefold() == "type":
+                block_types.append(match.group(2).strip().upper())
+        valid_type = block_types[0] if len(block_types) == 1 and block_types[0] in {"MCQ", "FIB"} else None
+        expected_answer_tag = "@Choices:@" if valid_type == "MCQ" else "@Answers:@" if valid_type == "FIB" else None
+        wrong_answer_tag = "@Answers:@" if valid_type == "MCQ" else "@Choices:@" if valid_type == "FIB" else None
+        record_ok = (
+            len(block_types) == 1
+            and block_texts.count("@Question:@") == 1
+            and block_texts.count("@Solution:@") == 1
+            and block_texts.count("@e@") == 3
+            and expected_answer_tag is not None
+            and block_texts.count(expected_answer_tag) == 1
+            and block_texts.count(wrong_answer_tag) == 0
+        )
+        if not record_ok:
+            record_mismatches.append(number)
+
+    counts["record_mismatch_count"] = len(record_mismatches)
+    counts["record_mismatch_questions"] = record_mismatches
+    counts["all_match"] = not mismatch_messages and not record_mismatches
+    counts["enforced"] = enforce
+
+    summary = (
+        f"Questions {counts['questions_detected']}; MCQs {counts['mcq_types']}; FIBs {counts['fib_types']}; "
+        f"@Question:@ {counts['question_section_tags']}; @Choices:@ {counts['choices_tags']}; "
+        f"@Answers:@ {counts['answers_tags']}; @Solution:@ {counts['solution_tags']}; @e@ {counts['closing_tags']}."
+    )
+    if not enforce:
+        findings.append(Finding(16, "passed", f"CMS structure counts were recorded for information only because CMS tag insertion was not selected. {summary}"))
+    elif counts["all_match"]:
+        findings.append(Finding(16, "passed", f"CMS structure counts match. {summary}"))
+    else:
+        details = mismatch_messages[:]
+        if record_mismatches:
+            details.append("record-level mismatches in question(s): " + ", ".join(map(str, record_mismatches)))
+        findings.append(Finding(16, "manual_review", f"CMS structure count check failed. {summary} Problems: {'; '.join(details)}."))
+    return counts
 
 
 def _has_visible_content(paragraph: Paragraph) -> bool:
@@ -2278,6 +2374,16 @@ def process_docx(
     if add_cms_tags:
         _bold_cms_tags(doc, findings)
 
+    structure_counts = _audit_cms_structure_counts(
+        doc,
+        findings,
+        enforce=add_cms_tags or any(
+            QUESTION_START_RE.fullmatch(paragraph.text.strip())
+            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
+            for paragraph in body_paragraphs(doc)
+        ),
+    )
+
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
     if original_equations - _equation_inventory(doc):
         raise ValueError("Processing stopped: an original Word equation changed or went missing. No processed document was released. Please share the original for review.")
@@ -2349,6 +2455,7 @@ def process_docx(
             "prepare_mappings": prepare_mappings,
         },
         "mapping_count": len(mapping_instructions),
+        "structure_counts": structure_counts,
         "mapping_csv": str(mapping_csv_path),
         "mappings": [asdict(item) for item in mapping_instructions],
         "download_filename": output_name,
@@ -2371,6 +2478,7 @@ def process_docx(
         "images_zip": str(images_zip_path),
         "mapping_csv": str(mapping_csv_path),
         "mapping_count": len(mapping_instructions),
+        "structure_counts": structure_counts,
         "manual_review_count": manual_review_count,
         "numbering_error_count": numbering_error_count,
     }
@@ -2388,6 +2496,7 @@ def process_docx(
         question_count,
         len(image_result.artifacts),
         len(mapping_instructions),
+        structure_counts,
         findings,
     )
 

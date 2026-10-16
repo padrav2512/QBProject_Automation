@@ -14,6 +14,8 @@ Image-only processing also recognises plain question headings, including suffix 
 
 When every question already contains a positive `New snippet id:` or `Snippet id:`, the **First snippet ID** field may be left blank and those IDs are preserved. Enter a First snippet ID when any IDs are missing, or select **Replace existing question and snippet IDs** to regenerate the sequence deliberately.
 
+After processing, **CMS structure count check** displays the detected question total and the counts of MCQ, FIB, `@Question: n@`, `@Type:@`, `@Question:@`, `@Choices:@`, `@Answers:@`, `@Solution:@`, and `@e@` tags. It verifies that every MCQ has one Choices block, every FIB has one Answers block, every question has the required section tags, and every record has three closing `@e@` tags. Document-level or question-level mismatches are added to **Action required** and stored under `structure_counts` in the JSON audit report.
+
 ## Run locally
 
 ```powershell
