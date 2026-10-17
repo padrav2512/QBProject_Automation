@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.16-structure-count-audit-v14.11"
+PROCESSOR_BUILD_ID = "2026.10.17-word-structure-hardening-v14.12"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -50,6 +50,15 @@ PLAIN_METADATA_RE = re.compile(
 )
 PLAIN_QUESTION_START_WITH_SUFFIX_RE = re.compile(
     r"^(?:Question|Q)\s*[:.\-]?\s*(\d+)\s*[).:]?\s+(.+?)\s*$",
+    re.I,
+)
+PLAIN_QUESTION_PREFIX_RE = re.compile(r"^(?:Question\s*:?[.]?\s*|Q\s*\.?\s*)(\d+)(.*)$", re.I)
+COMPACT_HEADING_METADATA_RE = re.compile(
+    r"^(Easy|Medium|Average|Challenging|Hard)\s*,\s*(Knowledge|Comprehension|Application|Analysis)$",
+    re.I,
+)
+DESCRIPTIVE_HEADING_SUFFIX_RE = re.compile(
+    r"^(?:Case\s*[-–—]?\s*Study|Assertion\s*[-–—]?\s*Reasoning)$",
     re.I,
 )
 SECTION_ALIASES = {
@@ -124,6 +133,16 @@ class Finding:
     message: str
     question: int | None = None
     paragraph: int | None = None
+
+
+@dataclass(frozen=True)
+class QuestionHeading:
+    number: int
+    suffix: str | None = None
+    difficulty: str | None = None
+    objective: str | None = None
+    tagged: bool = False
+    contains_manual_lines: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,6 +251,92 @@ def _equation_inventory(doc: _Document) -> Counter:
     return result
 
 
+@dataclass(frozen=True)
+class EquationRecord:
+    signature: tuple
+    question: int | None
+    paragraph: int
+    equation: int
+    text: str
+    operators: tuple[str, ...]
+
+
+def _equation_records(doc: _Document) -> list[EquationRecord]:
+    """Describe original equations with enough source context for a useful integrity error."""
+    records: list[EquationRecord] = []
+    current_question: int | None = None
+    simple_heading = re.compile(r"^\s*(?:@Question:\s*|Question\s*:?[.]?\s*|Q\s*\.?\s*)(\d+)", re.I)
+    for paragraph_index, paragraph in enumerate(iter_paragraphs(doc), 1):
+        first_line = next((line.strip() for line in paragraph.text.splitlines() if line.strip()), "")
+        heading_match = simple_heading.match(first_line)
+        if heading_match:
+            current_question = int(heading_match.group(1))
+        for equation_index, equation in enumerate(paragraph._p.xpath(".//m:oMath"), 1):
+            tokens = tuple(
+                token
+                for node in equation.iter(qn("m:t"))
+                if (token := re.sub(r"\s+", "", node.text or ""))
+            )
+            if not tokens:
+                continue
+            operators = tuple(
+                node.tag
+                for node in equation.iter()
+                if node.tag in {qn("m:rad"), qn("m:f"), qn("m:sSup"), qn("m:sSub"), qn("m:sSubSup"), qn("m:nary")}
+                and any((text.text or "").strip() for text in node.iter(qn("m:t")))
+            )
+            display_operators = tuple(tag.rsplit("}", 1)[-1] for tag in operators)
+            records.append(
+                EquationRecord(
+                    (tokens, operators),
+                    current_question,
+                    paragraph_index,
+                    equation_index,
+                    "".join(tokens),
+                    display_operators,
+                )
+            )
+    return records
+
+
+def _equation_integrity_error(original: list[EquationRecord], current: list[EquationRecord]) -> str | None:
+    """Return a precise error when an original non-empty equation signature disappeared."""
+    available = Counter(record.signature for record in current)
+    missing: list[EquationRecord] = []
+    for record in original:
+        if available[record.signature]:
+            available[record.signature] -= 1
+        else:
+            missing.append(record)
+    if not missing:
+        return None
+
+    current_by_text: dict[str, list[EquationRecord]] = {}
+    for record in current:
+        current_by_text.setdefault(record.text, []).append(record)
+    details = []
+    for record in missing[:5]:
+        location = f"Question {record.question}" if record.question is not None else "question not identified"
+        same_text = current_by_text.get(record.text, [])
+        expected = ", ".join(record.operators) or "plain equation"
+        if same_text:
+            found_sets = sorted({", ".join(item.operators) or "plain equation" for item in same_text})
+            nature = f"structural operators changed (expected {expected}; found {' or '.join(found_sets)})"
+        else:
+            nature = "mathematical text changed or the equation object is missing"
+        details.append(
+            f"{location}, source paragraph {record.paragraph}, equation {record.equation}, "
+            f"text {record.text!r}: {nature}"
+        )
+    remainder = f" A further {len(missing) - 5} changed equation(s) were also detected." if len(missing) > 5 else ""
+    return (
+        "Processing stopped: an original Word equation changed or went missing. "
+        + " | ".join(details)
+        + remainder
+        + " No processed document was released; the equation-integrity safeguard remains active."
+    )
+
+
 def _replace_text_prefix(paragraph: Paragraph, length: int, replacement: str = "") -> None:
     """Edit only the ordinary-text prefix, preserving equations, objects and run properties."""
     for run in paragraph.runs:
@@ -303,23 +408,188 @@ def _remove_paragraph(paragraph: Paragraph) -> None:
         parent.remove(paragraph._p)
 
 
+def _heading_context_line(text: str) -> bool:
+    stripped = text.replace("\u00a0", " ").strip()
+    return bool(
+        PLAIN_METADATA_RE.fullmatch(stripped)
+        or KNOWN_METADATA_RE.fullmatch(stripped)
+        or MAPPING_LABEL_RE.fullmatch(stripped)
+        or ">>" in stripped
+    )
+
+
+def _parse_question_heading(text: str, next_text: str | None = None) -> QuestionHeading | None:
+    """Parse only a clear heading at the start of a paragraph."""
+    lines = [line.strip() for line in text.replace("\u00a0", " ").splitlines() if line.strip()]
+    if not lines:
+        return None
+    first_line = lines[0]
+    tagged = QUESTION_START_RE.fullmatch(first_line) or QUESTION_START_WITH_SUFFIX_RE.fullmatch(first_line)
+    if tagged:
+        suffix = tagged.group(2).strip() if tagged.lastindex and tagged.lastindex >= 2 else None
+        return QuestionHeading(int(tagged.group(1)), suffix=suffix, tagged=True, contains_manual_lines=len(lines) > 1)
+
+    match = PLAIN_QUESTION_PREFIX_RE.fullmatch(first_line)
+    if not match:
+        return None
+    number = int(match.group(1))
+    raw_tail = match.group(2).strip()
+    # A closing bracket or full stop belongs to the question number. A comma,
+    # colon or dash is a harmless separator before metadata or a description.
+    raw_tail = re.sub(r"^[).]\s*", "", raw_tail)
+    raw_tail = re.sub(r"^(?:[,;:]|[-–—])\s*", "", raw_tail).strip()
+    if not raw_tail:
+        return QuestionHeading(number, contains_manual_lines=len(lines) > 1)
+
+    compact = COMPACT_HEADING_METADATA_RE.fullmatch(raw_tail)
+    if compact:
+        return QuestionHeading(
+            number,
+            difficulty=DIFFICULTY_ALIASES.get(compact.group(1).casefold(), compact.group(1).title()),
+            objective=compact.group(2).title(),
+            contains_manual_lines=len(lines) > 1,
+        )
+
+    difficulty_only = DIFFICULTY_ALIASES.get(raw_tail.casefold())
+    if difficulty_only:
+        return QuestionHeading(number, difficulty=difficulty_only, contains_manual_lines=len(lines) > 1)
+
+    suffix = raw_tail
+    if suffix.startswith("(") and suffix.endswith(")"):
+        suffix = suffix[1:-1].strip()
+    context_evidence = bool(lines[1:] and all(_heading_context_line(line) for line in lines[1:]))
+    if not context_evidence and next_text:
+        next_lines = [line.strip() for line in next_text.replace("\u00a0", " ").splitlines() if line.strip()]
+        context_evidence = bool(next_lines and _heading_context_line(next_lines[0]))
+    if DESCRIPTIVE_HEADING_SUFFIX_RE.fullmatch(suffix) or context_evidence:
+        return QuestionHeading(number, suffix=suffix, contains_manual_lines=len(lines) > 1)
+    return None
+
+
+def _manual_break_nodes(paragraph: Paragraph) -> list:
+    return [
+        node
+        for node in paragraph._p.iter(qn("w:br"))
+        if node.get(qn("w:type")) in {None, "textWrapping"}
+    ]
+
+
+def _safe_manual_line_structure(paragraph: Paragraph, next_text: str | None) -> tuple[bool, str | None]:
+    lines = [line.strip() for line in paragraph.text.replace("\u00a0", " ").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False, None
+    heading = _parse_question_heading(paragraph.text, next_text)
+    if heading and all(_heading_context_line(line) for line in lines[1:]):
+        return True, "question heading and metadata"
+    if all(_heading_context_line(line) for line in lines):
+        return True, "metadata"
+    answer_label = re.compile(r"(?:Answers?|Correct answers?)\s*:?")
+    if answer_label.fullmatch(lines[0]) and all(ANSWER_CONTINUATION_RE.match(line) for line in lines[1:]):
+        return True, "answer label and labelled FIB answers"
+    choices = [OPTION_RE.fullmatch(line) for line in lines]
+    if all(choices) and len({(match.group(1) or match.group(2)).casefold() for match in choices}) == len(lines):
+        return True, "MCQ choices"
+    return False, None
+
+
+def _split_paragraph_at_manual_breaks(paragraph: Paragraph) -> list[Paragraph] | None:
+    """Split direct Word manual breaks while cloning every XML child unchanged."""
+    if not _manual_break_nodes(paragraph):
+        return [paragraph]
+    segments: list[list] = [[]]
+    paragraph_properties = paragraph._p.find(qn("w:pPr"))
+    for child in paragraph._p:
+        if child.tag == qn("w:pPr"):
+            continue
+        if child.tag != qn("w:r"):
+            if any(
+                node.get(qn("w:type")) in {None, "textWrapping"}
+                for node in child.iter(qn("w:br"))
+            ):
+                return None
+            segments[-1].append(deepcopy(child))
+            continue
+
+        run_properties = child.find(qn("w:rPr"))
+        run_segment: list = []
+
+        def flush_run() -> None:
+            nonlocal run_segment
+            if not run_segment:
+                return
+            new_run = OxmlElement("w:r")
+            if run_properties is not None:
+                new_run.append(deepcopy(run_properties))
+            for run_child in run_segment:
+                new_run.append(run_child)
+            segments[-1].append(new_run)
+            run_segment = []
+
+        for run_child in child:
+            if run_child.tag == qn("w:rPr"):
+                continue
+            if run_child.tag == qn("w:br") and run_child.get(qn("w:type")) in {None, "textWrapping"}:
+                flush_run()
+                segments.append([])
+            else:
+                run_segment.append(deepcopy(run_child))
+        flush_run()
+
+    parent = paragraph._p.getparent()
+    if parent is None:
+        return None
+    position = parent.index(paragraph._p)
+    new_paragraphs = []
+    for offset, content in enumerate(segments):
+        new_element = OxmlElement("w:p")
+        if paragraph_properties is not None:
+            new_element.append(deepcopy(paragraph_properties))
+        for child in content:
+            new_element.append(child)
+        parent.insert(position + offset, new_element)
+        new_paragraphs.append(Paragraph(new_element, paragraph._parent))
+    parent.remove(paragraph._p)
+    return new_paragraphs
+
+
+def _split_safe_manual_line_breaks(doc: _Document, findings: list[Finding]) -> None:
+    paragraphs = body_paragraphs(doc)
+    split_count = 0
+    for index, paragraph in enumerate(paragraphs, 1):
+        if not _manual_break_nodes(paragraph):
+            continue
+        next_text = next((item.text for item in paragraphs[index:] if item.text.strip()), None)
+        safe, description = _safe_manual_line_structure(paragraph, next_text)
+        if not safe:
+            first_line = next((line.strip() for line in paragraph.text.splitlines() if line.strip()), "")
+            if re.match(r"^(?:Question|Q\.?|Answers?|Correct answers?|Type|Question type|Difficulty|Objective)\b", first_line, re.I):
+                findings.append(
+                    Finding(
+                        17,
+                        "manual_review",
+                        f"A structural-looking paragraph contains manual line breaks but could not be separated safely: {paragraph.text!r}",
+                        paragraph=index,
+                    )
+                )
+            continue
+        separated = _split_paragraph_at_manual_breaks(paragraph)
+        if separated is None:
+            findings.append(Finding(17, "manual_review", "A manual line break is nested inside unsupported Word XML and was preserved for review.", paragraph=index))
+            continue
+        split_count += 1
+        findings.append(Finding(17, "fixed", f"Separated {description} stored with manual line breaks into {len(separated)} Word paragraphs.", paragraph=index))
+    if not split_count and not any(finding.rule == 17 for finding in findings):
+        findings.append(Finding(17, "passed", "No structural paragraphs required safe manual-line-break separation."))
+
+
 def _question_starts(doc: _Document) -> list[tuple[Paragraph, int]]:
     starts: list[tuple[Paragraph, int]] = []
     paragraphs = body_paragraphs(doc)
     for index, paragraph in enumerate(paragraphs):
-        text = paragraph.text.strip()
-        match = (
-            QUESTION_START_RE.fullmatch(text)
-            or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
-            or PLAIN_QUESTION_START_RE.fullmatch(text)
-        )
-        if match is None:
-            suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
-            next_paragraph = next((candidate for candidate in paragraphs[index + 1 :] if candidate.text.strip()), None)
-            if suffix_match and next_paragraph is not None and _metadata_prefix_length(next_paragraph.text) > 0:
-                match = suffix_match
-        if match:
-            starts.append((paragraph, int(match.group(1))))
+        next_paragraph = next((candidate for candidate in paragraphs[index + 1 :] if candidate.text.strip()), None)
+        heading = _parse_question_heading(paragraph.text, next_paragraph.text if next_paragraph else None)
+        if heading:
+            starts.append((paragraph, heading.number))
     return starts
 
 
@@ -329,6 +599,23 @@ def _audit_source_question_numbering(
     findings: list[Finding],
 ) -> None:
     """Block CMS-ready outputs when author question headings are not sequential."""
+    paragraph_positions = {paragraph._p: index for index, paragraph in enumerate(body_paragraphs(doc), 1)}
+    recognised_nodes = {paragraph._p for paragraph, _ in starts}
+    unrecognised_candidates: list[tuple[int, str]] = []
+    for index, paragraph in enumerate(body_paragraphs(doc), 1):
+        if paragraph._p in recognised_nodes:
+            continue
+        first_line = next((line.strip() for line in paragraph.text.splitlines() if line.strip()), "")
+        if re.match(r"^(?:Question\b|Q\s*\.)", first_line, re.I) and re.search(r"\d", first_line):
+            unrecognised_candidates.append((index, first_line))
+            findings.append(
+                Finding(
+                    15,
+                    "manual_review",
+                    f"A heading-like paragraph was not recognised at source paragraph {index}: {first_line!r}. Use a supported Question/Q heading structure or correct unintended text.",
+                    paragraph=index,
+                )
+            )
     if not starts:
         return
     occurrences: dict[int, list[int]] = {}
@@ -337,17 +624,21 @@ def _audit_source_question_numbering(
         source_numbers.append(number)
         occurrences.setdefault(number, []).append(detected_position)
 
-    errors = 0
+    errors = len(unrecognised_candidates)
     for number, positions in sorted(occurrences.items()):
         if len(positions) < 2:
             continue
         errors += 1
-        locations = ", ".join(str(value) for value in positions)
+        source_paragraphs = [paragraph_positions.get(starts[value - 1][0]._p) for value in positions]
+        locations = ", ".join(
+            f"detected position {value} (source paragraph {paragraph})"
+            for value, paragraph in zip(positions, source_paragraphs)
+        )
         findings.append(
             Finding(
                 15,
                 "manual_review",
-                f"Duplicate source question number {number} appears {len(positions)} times at detected question positions {locations}. Correct the source headings and reprocess; CMS-ready document, image and mapping downloads are blocked.",
+                f"Duplicate source question number {number} appears {len(positions)} times at {locations}. Correct the source headings and reprocess; CMS-ready document, image and mapping downloads are blocked.",
                 number,
             )
         )
@@ -357,21 +648,30 @@ def _audit_source_question_numbering(
         missing = [number for number in range(unique_numbers[0], unique_numbers[-1] + 1) if number not in occurrences]
         if missing:
             errors += 1
+            cause = (
+                "Heading-like paragraphs that were not recognised are listed separately and may account for the gap."
+                if unrecognised_candidates
+                else "No unrecognised heading-like paragraph was found for the gap, so the question may genuinely be missing."
+            )
             findings.append(
                 Finding(
                     15,
                     "manual_review",
-                    f"Source question numbering has a gap. Missing question number(s): {', '.join(map(str, missing))}. Correct the source headings and reprocess; CMS-ready downloads are blocked.",
+                    f"Source question numbering has a gap. Missing question number(s): {', '.join(map(str, missing))}. {cause} Correct the source headings and reprocess; CMS-ready downloads are blocked.",
                 )
             )
 
     if any(current < previous for previous, current in zip(source_numbers, source_numbers[1:])):
         errors += 1
+        order_with_paragraphs = ", ".join(
+            f"{number} (paragraph {paragraph_positions.get(paragraph._p)})"
+            for paragraph, number in starts
+        )
         findings.append(
             Finding(
                 15,
                 "manual_review",
-                f"Source question headings are out of order: {', '.join(map(str, source_numbers))}. Correct their order and reprocess; CMS-ready downloads are blocked.",
+                f"Source question headings are out of order: {order_with_paragraphs}. Correct their order and reprocess; CMS-ready downloads are blocked.",
             )
         )
 
@@ -822,6 +1122,8 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         block = _block_paragraphs(start, next_start)
         if any(p.text.strip() == "@Answers:@" for p in block):
             continue
+        if (_metadata_value(block, "Type") or "").upper() == "FIB":
+            continue
         # A Question or Solution heading does not imply that choices are already structured.
         solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
         block = block[:solution_index]
@@ -889,6 +1191,7 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
 def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> None:
     """Structure an untagged FIB when a single non-letter Answer value is explicit."""
     starts = _question_starts(doc)
+    paragraph_positions = {paragraph._p: index for index, paragraph in enumerate(body_paragraphs(doc), 1)}
     for ordinal, (start, detected_number) in enumerate(starts):
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
@@ -901,21 +1204,61 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
         candidates: list[tuple[Paragraph, re.Match[str]]] = []
         for paragraph in answer_block:
             match = ANSWER_VALUE_RE.fullmatch(paragraph.text.strip())
+            if (
+                match
+                and not re.match(r"^\s*(?:Answers?|Correct answers?)\s*:", paragraph.text, re.I)
+                and re.match(r"^(?:the|these|those|following|all)\b", match.group(1).strip(), re.I)
+            ):
+                match = None
             mcq_key = _parse_mcq_answer_key(paragraph.text.strip())
             if match and mcq_key and declared_type != "FIB" and option_count >= 4:
                 continue
             if match and (_has_embedded_content(paragraph) or not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or declared_type == "FIB"):
                 candidates.append((paragraph, match))
         if len(candidates) != 1:
+            answer_like = [
+                paragraph for paragraph in answer_block
+                if re.match(r"^\s*(?:Answers?|Correct answers?)\b", paragraph.text, re.I)
+            ]
+            if answer_like:
+                reason = "more than one possible answer boundary was found" if len(candidates) > 1 else "the answer label or values did not match a supported unambiguous form"
+                findings.append(
+                    Finding(
+                        18,
+                        "manual_review",
+                        f"An answer section was recognised but not moved because {reason}. The source content was preserved.",
+                        detected_number,
+                        paragraph_positions.get(answer_like[0]._p),
+                    )
+                )
             continue
         answer_paragraph, answer_match = candidates[0]
         answer_value = answer_match.group(1).strip()
         answer_lines = [line.strip() for line in answer_value.splitlines() if line.strip()]
-        labelled_multiline_answer = len(answer_lines) > 1 and all(
-            re.match(r"^\s*\([a-z]\)\s*\S", line, re.I) for line in answer_lines
-        )
+        labelled_multiline_answer = len(answer_lines) > 1 and all(ANSWER_CONTINUATION_RE.match(line) for line in answer_lines)
+        alphabetic_labels = bool(answer_lines) and all(ALPHA_RE.match(line) for line in answer_lines)
+        ambiguous_alpha_choices = labelled_multiline_answer and alphabetic_labels and declared_type != "FIB"
+        if ambiguous_alpha_choices:
+            findings.append(
+                Finding(
+                    18,
+                    "manual_review",
+                    "A multiline Answer/Answers section uses alphabetic labels, but the question is not explicitly FIB. It was preserved because the labels could be MCQ choices.",
+                    detected_number,
+                    paragraph_positions.get(answer_paragraph._p),
+                )
+            )
+            continue
         if not answer_value or len(answer_value) > 1000 or (len(answer_lines) > 1 and not labelled_multiline_answer):
-            findings.append(Finding(0, "manual_review", "An FIB-style answer was found but is too complex to structure automatically.", detected_number))
+            findings.append(
+                Finding(
+                    18,
+                    "manual_review",
+                    "An FIB-style answer was found but its multiline boundary or labels are ambiguous, so the source content was preserved.",
+                    detected_number,
+                    paragraph_positions.get(answer_paragraph._p),
+                )
+            )
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
         prefix = re.match(r"^\s*(?:Answers?|Correct answers?)\s*:?\s*", answer_paragraph.text, re.I)
@@ -940,6 +1283,7 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
 
 
 def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: list[Finding]) -> int:
+    _split_safe_manual_line_breaks(doc, findings)
     _canonicalise_section_labels(doc, findings)
     _infer_untagged_mcq_sections(doc, findings)
     _infer_untagged_fib_sections(doc, findings)
@@ -955,13 +1299,10 @@ def _ensure_cms_records(doc: _Document, options: ProcessorOptions, findings: lis
         next_start = starts[ordinal + 1][0] if ordinal + 1 < len(starts) else None
         block = _block_paragraphs(start, next_start)
         assigned_number = options.start_question_number + ordinal
-        heading_match = PLAIN_QUESTION_START_RE.fullmatch(start.text.strip())
-        suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
-        if suffix_match is None and heading_match is None:
-            suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(start.text.strip())
-        heading_suffix = suffix_match.group(2).strip() if suffix_match else None
-        heading_difficulty = DIFFICULTY_ALIASES.get((heading_match.group(2) or "").casefold()) if heading_match else None
-        heading_objective = heading_match.group(3).title() if heading_match and heading_match.group(3) else None
+        heading = _parse_question_heading(start.text)
+        heading_suffix = heading.suffix if heading else None
+        heading_difficulty = heading.difficulty if heading else None
+        heading_objective = heading.objective if heading else None
         canonical_heading = f"@Question: {assigned_number}@" + (f" {heading_suffix}" if heading_suffix else "")
         _set_text(start, canonical_heading)
 
@@ -1037,8 +1378,7 @@ def _audit_unsectioned_record_text(doc: _Document, findings: list[Finding]) -> N
         if (
             QUESTION_START_RE.fullmatch(text)
             or QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
-            or PLAIN_QUESTION_START_RE.fullmatch(text)
-            or PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(text)
+            or _parse_question_heading(text)
             or KNOWN_METADATA_RE.fullmatch(text)
             or PLAIN_METADATA_RE.fullmatch(text)
             or text in SECTION_MARKERS
@@ -1127,38 +1467,38 @@ def _remove_bold_from_questions_and_solutions(doc: _Document, findings: list[Fin
 
 def _remove_empty_scripts(doc: _Document, findings: list[Finding]) -> None:
     root = doc.element
-    removed = 0
+    preserved_embedded_scripts = 0
     for tag, child_tag in (("sSup", "sup"), ("sSub", "sub")):
-        scripts = list(root.xpath(f".//m:{tag}"))
-        for script in reversed(scripts):
+        for script in root.xpath(f".//m:{tag}"):
             slot = script.find(qn(f"m:{child_tag}"))
             if slot is not None and "".join(slot.itertext()).strip():
                 continue
-            base = script.find(qn("m:e"))
-            parent = script.getparent()
-            if base is None or parent is None:
-                continue
-            position = parent.index(script)
-            parent.remove(script)
-            for child in list(base):
-                base.remove(child)
-                parent.insert(position, child)
-                position += 1
-            removed += 1
+            equation = next((ancestor for ancestor in script.iterancestors(qn("m:oMath"))), None)
+            if equation is not None and any((node.text or "").strip() for node in equation.iter(qn("m:t"))):
+                # An empty script slot may be invisible, but its container is part
+                # of the author's non-empty OMML equation and must remain intact.
+                preserved_embedded_scripts += 1
     blank_equations = 0
     for equation in reversed(list(root.xpath(".//m:oMath"))):
         visible_text = "".join(node.text or "" for node in equation.iter(qn("m:t"))).strip()
         if visible_text:
             continue
+        if any(
+            next(equation.iter(qn(tag)), None) is not None
+            for tag in ("w:drawing", "w:pict", "w:object")
+        ):
+            continue
         parent = equation.getparent()
         if parent is not None:
             parent.remove(equation)
             blank_equations += 1
-    total = removed + blank_equations
-    if total:
-        findings.append(Finding(4, "fixed", f"Removed {removed} blank exponent/subscript template(s) and {blank_equations} completely blank equation object(s)."))
+    if blank_equations:
+        suffix = f" Preserved {preserved_embedded_scripts} empty script slot(s) inside non-empty original equations." if preserved_embedded_scripts else ""
+        findings.append(Finding(4, "fixed", f"Removed {blank_equations} completely blank standalone equation object(s).{suffix}"))
+    elif preserved_embedded_scripts:
+        findings.append(Finding(4, "passed", f"Preserved {preserved_embedded_scripts} empty script slot(s) embedded inside non-empty original equations."))
     else:
-        findings.append(Finding(4, "passed", "No blank equation, exponent or subscript templates were found."))
+        findings.append(Finding(4, "passed", "No completely blank standalone equation objects were found."))
 
 
 def _normalise_spacing(text: str) -> str:
@@ -2294,7 +2634,7 @@ def process_docx(
         original_path.write_bytes(source)
 
     doc = Document(original_path)
-    original_equations = _equation_inventory(doc)
+    original_equations = _equation_records(doc)
     findings: list[Finding] = []
     add_cms_tags, process_images, format_math, normalize_text_structure, prepare_mappings = _selected_processing_sections(options)
     suffix = _output_suffix(add_cms_tags, process_images, format_math, normalize_text_structure, prepare_mappings)
@@ -2323,16 +2663,13 @@ def process_docx(
         if question_count:
             findings.append(Finding(0, "passed", "CMS tag insertion was not selected; existing question IDs, snippet IDs and CMS record structure were preserved."))
             for paragraph, number in _question_starts(doc):
-                plain_heading = PLAIN_QUESTION_START_RE.fullmatch(paragraph.text.strip())
-                suffix_match = QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
-                if suffix_match is None and plain_heading is None:
-                    suffix_match = PLAIN_QUESTION_START_WITH_SUFFIX_RE.fullmatch(paragraph.text.strip())
-                if suffix_match:
+                heading = _parse_question_heading(paragraph.text)
+                if heading and heading.suffix:
                     findings.append(
                         Finding(
                             0,
                             "passed",
-                            f"Preserved question-heading text after the question number: {suffix_match.group(2).strip()!r}.",
+                            f"Preserved question-heading text after the question number: {heading.suffix!r}.",
                             number,
                         )
                     )
@@ -2385,8 +2722,9 @@ def process_docx(
     )
 
     project_id = re.sub(r"_q$", "", options.project_question_prefix.strip(), flags=re.I).rstrip("_")
-    if original_equations - _equation_inventory(doc):
-        raise ValueError("Processing stopped: an original Word equation changed or went missing. No processed document was released. Please share the original for review.")
+    equation_error = _equation_integrity_error(original_equations, _equation_records(doc))
+    if equation_error:
+        raise ValueError(equation_error)
     findings.append(Finding(2, "passed", "Verified that all non-empty original Word equations retained their mathematical text and operators."))
     if preserve_cms_mode:
         document_project_id, document_project_ids = _existing_project_id(doc)

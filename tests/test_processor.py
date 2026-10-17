@@ -3,6 +3,7 @@ from zipfile import ZipFile
 import csv
 import io
 import json
+import re
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -110,7 +111,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.16-structure-count-audit-v14.11"
+    assert PROCESSOR_BUILD_ID == "2026.10.17-word-structure-hardening-v14.12"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -377,9 +378,75 @@ def test_equation_loss_blocks_output(tmp_path: Path, monkeypatch):
         for node in document.element.xpath(".//m:oMath"):
             node.getparent().remove(node)
     monkeypatch.setattr(cms_processor, "_repair_spacing", lose_equations)
-    with pytest.raises(ValueError, match="original Word equation"):
+    with pytest.raises(ValueError, match=r"Question 1, source paragraph 3, equation 1.*mathematical text changed or the equation object is missing"):
         process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
     assert not list((tmp_path / "storage" / "processed").glob("*.docx"))
+
+
+def test_q34_empty_subscript_inside_nonempty_equation_is_preserved(tmp_path: Path):
+    source = tmp_path / "q34_empty_subscript.docx"
+    doc = Document()
+    for text in [
+        "Question 34",
+        "Difficulty level: Easy",
+        "Objective: Comprehension",
+        "Question type: FIB",
+        "Complete the equation.",
+    ]:
+        doc.add_paragraph(text)
+    equation = etree.fromstring(
+        b'<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
+        b'<m:sSub><m:e><m:r><m:t>(-6)</m:t></m:r><m:r><m:t>\xc3\x97___</m:t></m:r></m:e>'
+        b'<m:sub><m:r><m:t>  </m:t></m:r></m:sub></m:sSub><m:r><m:t>=6</m:t></m:r></m:oMath>'
+    )
+    answer = doc.add_paragraph("Answer: ")
+    answer._p.append(equation)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=34),
+        tmp_path / "storage",
+    )
+    output = Document(result.output_path)
+
+    assert len(output.element.xpath(".//m:sSub")) == 1
+    subscript = output.element.xpath(".//m:sSub")[0]
+    assert "".join(node.text or "" for node in subscript.iter(qn("m:t"))).replace(" ", "") == "(-6)\u00d7___"
+    assert any("Preserved 1 empty script slot" in finding.message for finding in result.findings)
+
+
+def test_q27_blank_standalone_equation_is_removed_safely(tmp_path: Path):
+    source = tmp_path / "q27_blank_equation.docx"
+    doc = Document()
+    for text in [
+        "Question 27",
+        "Difficulty level: Easy",
+        "Objective: Comprehension",
+        "Question type: FIB",
+        "Find the product.",
+    ]:
+        doc.add_paragraph(text)
+    blank = etree.fromstring(
+        b'<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>  </m:t></m:r></m:oMath>'
+    )
+    doc.add_paragraph()._p.append(blank)
+    answer = doc.add_paragraph("Answer: ")
+    add_radical_answer(answer)
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=27),
+        tmp_path / "storage",
+    )
+    output = Document(result.output_path)
+
+    assert len(output.element.xpath(".//m:oMath")) == 1
+    assert len(output.element.xpath(".//m:rad")) == 1
+    assert any("Removed 1 completely blank standalone equation object" in finding.message for finding in result.findings)
 
 
 @pytest.mark.parametrize("units", [" cm", ""])
@@ -797,6 +864,35 @@ def test_duplicate_source_question_number_blocks_verification(tmp_path: Path):
     assert "CMS-ready document, image and mapping downloads are blocked" in numbering_findings[0].message
 
 
+def test_numbering_diagnostic_distinguishes_unrecognised_heading_from_missing_question(tmp_path: Path):
+    unrecognised_source = tmp_path / "unrecognised_heading.docx"
+    doc = Document()
+    for heading, answer in [("Question 1", "1"), ("Question No. 2", "2"), ("Question 3", "3")]:
+        doc.add_paragraph(heading)
+        doc.add_paragraph("Question type: FIB")
+        doc.add_paragraph("Find the value.")
+        doc.add_paragraph(f"Answer: {answer}")
+    doc.save(unrecognised_source)
+
+    unrecognised = process_docx(unrecognised_source, unrecognised_source.name, ProcessorOptions(), tmp_path / "unrecognised_storage")
+    messages = [finding.message for finding in unrecognised.findings if finding.rule == 15 and finding.status == "manual_review"]
+    assert any("heading-like paragraph was not recognised" in message.lower() and "source paragraph 5" in message for message in messages)
+    assert any("may account for the gap" in message and "2" in message for message in messages)
+
+    missing_source = tmp_path / "genuinely_missing_question.docx"
+    doc = Document()
+    for heading, answer in [("Question 1", "1"), ("Question 3", "3")]:
+        doc.add_paragraph(heading)
+        doc.add_paragraph("Question type: FIB")
+        doc.add_paragraph("Find the value.")
+        doc.add_paragraph(f"Answer: {answer}")
+    doc.save(missing_source)
+
+    missing = process_docx(missing_source, missing_source.name, ProcessorOptions(), tmp_path / "missing_storage")
+    missing_messages = [finding.message for finding in missing.findings if finding.rule == 15 and finding.status == "manual_review"]
+    assert any("may genuinely be missing" in message and "2" in message for message in missing_messages)
+
+
 def test_question_tags_accept_spaces_before_closing_at_sign(tmp_path: Path):
     source = tmp_path / "spaced_question_tags.docx"
     doc = Document()
@@ -870,6 +966,103 @@ def test_plain_heading_accepts_difficulty_and_objective(tmp_path: Path):
     assert "@Difficulty level: Easy @" in texts
     assert "@Objective: Comprehension @" in texts
     assert "@Type: MCQ@" in texts
+
+
+def test_supported_question_heading_punctuation_and_suffixes_are_detected(tmp_path: Path):
+    source = tmp_path / "heading_variations.docx"
+    headings = [
+        "Question 1", "Question: 2", "Question 3:", "Q4", "Q. 5",
+        "Question 6, Case study", "Question 7 Case Study", "Question 8: Case study",
+        "Question 9 – Case study", "Question 10, Assertion Reasoning",
+        "Question 11 Assertion–Reasoning", "Question 12, case study",
+        "Question 13: Easy, Comprehension", "Question 14, Average, Application",
+    ]
+    doc = Document()
+    for number, heading in enumerate(headings, 1):
+        doc.add_paragraph(heading)
+        doc.add_paragraph("Question type: FIB")
+        doc.add_paragraph(f"Find value {number}.")
+        doc.add_paragraph(f"Answer: {number}")
+    doc.add_paragraph("Refer to Question 20 when checking your work.")
+    doc.add_paragraph("In Question 15, a different method was used.")
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    output_headings = [
+        paragraph.text
+        for paragraph in Document(result.output_path).paragraphs
+        if paragraph.text.startswith("@Question: ")
+    ]
+
+    assert result.question_count == 14
+    assert [int(re.search(r"\d+", text).group()) for text in output_headings] == list(range(1, 15))
+    assert output_headings[5:12] == [
+        "@Question: 6@ Case study",
+        "@Question: 7@ Case Study",
+        "@Question: 8@ Case study",
+        "@Question: 9@ Case study",
+        "@Question: 10@ Assertion Reasoning",
+        "@Question: 11@ Assertion–Reasoning",
+        "@Question: 12@ case study",
+    ]
+
+
+def test_heading_and_metadata_manual_breaks_are_split_without_touching_equations(tmp_path: Path):
+    source = tmp_path / "manual_break_structure.docx"
+    doc = Document()
+    heading = doc.add_paragraph()
+    heading.add_run("Question 44")
+    heading.add_run().add_break()
+    heading.add_run("Difficulty level: Easy")
+    heading.add_run().add_break()
+    heading.add_run("Objective: Comprehension")
+    heading.add_run().add_break()
+    heading.add_run("Question type: FIB")
+    doc.add_paragraph("Find the value.")
+    answer = doc.add_paragraph("Answers:")
+    answer.add_run().add_break()
+    answer.add_run("(i) +240")
+    answer.add_run().add_break()
+    answer.add_run("(ii) −100")
+    answer.add_run().add_break()
+    answer.add_run("(iii) 3")
+
+    doc.add_paragraph("Question 45, Case Study")
+    metadata = doc.add_paragraph("Difficulty level: Average")
+    metadata.add_run().add_break()
+    metadata.add_run("Objective: Application")
+    metadata.add_run().add_break()
+    metadata.add_run("Question type: FIB")
+    question = doc.add_paragraph("Evaluate the expression")
+    question.add_run().add_break()
+    add_radical_answer(question)
+    doc.add_paragraph("Answer: 1")
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=44),
+        tmp_path / "storage",
+    )
+    output = Document(result.output_path)
+    texts = [paragraph.text for paragraph in output.paragraphs]
+
+    assert result.question_count == 2
+    assert "@Question: 44@" in texts
+    assert "@Question: 45@ Case Study" in texts
+    assert texts.count("@Difficulty level: Easy @") == 1
+    assert texts.count("@Objective: Comprehension @") == 1
+    q44_answers = texts.index("@Answers:@")
+    answer_values = [
+        "".join(node.text or "" for node in paragraph._p.xpath(".//w:t | .//m:t")).strip()
+        for paragraph in output.paragraphs[q44_answers + 1 : q44_answers + 4]
+    ]
+    assert [value.replace(" ", "") for value in answer_values] == ["(i)+240", "(ii)−100", "(iii)3"]
+    assert len(output.element.xpath(".//m:rad")) == 1
+    preserved_question = next(paragraph for paragraph in output.paragraphs if paragraph.text.startswith("Evaluate the expression"))
+    assert len(preserved_question._p.xpath(".//w:br")) == 1
+    assert any(finding.rule == 17 and finding.status == "fixed" for finding in result.findings)
 
 
 def test_mcq_answer_key_with_closing_parenthesis_is_inferred_as_mcq(tmp_path: Path):
@@ -1472,6 +1665,55 @@ def test_plural_multiline_fib_answers_become_answers_block(tmp_path: Path):
         "@e@",
     ]
     assert not any(text.startswith("Answers:") for text in texts)
+
+
+def test_roman_multiline_fib_answers_are_moved_out_of_question_section(tmp_path: Path):
+    source = tmp_path / "roman_multiline_fib_answers.docx"
+    doc = Document()
+    for text in [
+        "Question 42, Case study",
+        "Difficulty level: Average",
+        "Objective: Application",
+        "Question type: FIB",
+        "Answer the three subparts.",
+        "(i) First question",
+        "(ii) Second question",
+        "(iii) Third question",
+    ]:
+        doc.add_paragraph(text)
+    answers = doc.add_paragraph("Answers: (i) +240")
+    answers.add_run().add_break()
+    answers.add_run("(ii) −100")
+    answers.add_run().add_break()
+    answers.add_run("(iii) 3")
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=42),
+        tmp_path / "storage",
+    )
+    output = Document(result.output_path)
+    texts = [paragraph.text.strip() for paragraph in output.paragraphs if paragraph.text.strip()]
+    question_index = texts.index("@Question:@")
+    first_close = texts.index("@e@", question_index)
+    answers_index = texts.index("@Answers:@")
+    solution_index = texts.index("@Solution:@")
+    answer_start_paragraph = next(i for i, paragraph in enumerate(output.paragraphs) if paragraph.text.strip() == "@Answers:@")
+    solution_start_paragraph = next(i for i, paragraph in enumerate(output.paragraphs) if paragraph.text.strip() == "@Solution:@")
+    answer_xml_text = "".join(
+        node.text or ""
+        for paragraph in output.paragraphs[answer_start_paragraph + 1 : solution_start_paragraph]
+        for node in paragraph._p.xpath(".//w:t | .//m:t")
+    )
+
+    assert question_index < first_close < answers_index < solution_index
+    assert "+240" in answer_xml_text.replace(" ", "")
+    assert "−100" in answer_xml_text.replace(" ", "")
+    assert "(iii)3" in answer_xml_text.replace(" ", "")
+    assert result.structure_counts["answers_tags"] == 1
+    assert result.structure_counts["all_match"] is True
 
 
 def test_cms_structure_counts_match_for_complete_mcq_and_fib_records(tmp_path: Path):
