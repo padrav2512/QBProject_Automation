@@ -111,7 +111,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.18-upright-part-labels-v14.14"
+    assert PROCESSOR_BUILD_ID == "2026.10.18-safe-numbering-and-spacing-v14.15"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -356,6 +356,147 @@ def test_parenthesised_part_labels_a_to_e_remain_upright(tmp_path: Path):
         for paragraph in question_paragraphs
         for run in paragraph.runs
     )
+
+
+def test_roman_subpart_labels_remain_upright_while_variables_are_italicised(tmp_path: Path):
+    source = tmp_path / "upright_roman_labels.docx"
+    doc = Document()
+    for text in [
+        "@Question: 1@", "@Type: FIB@", "@Question id: project1_q1@", "@New snippet id: 1@",
+        "@Difficulty level: Easy@", "@Objective: Application@", "@Question:@",
+        "(i) Find x if x + 2 = 5.", "(ii) Find y if y + 3 = 7.", "(iii) State the result.",
+        "@e@", "@Answers:@", "(i) 3", "(ii) 4", "(iii) Complete", "@e@", "@Solution:@", "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "roman_label_storage")
+    output = Document(result.output_path)
+    labelled = [paragraph for paragraph in output.paragraphs if re.match(r"^\((?:i|ii|iii)\)\s", paragraph.text)]
+
+    assert len(labelled) == 6
+    for paragraph in labelled:
+        label_end = paragraph.text.index(")") + 1
+        offset = 0
+        for run in paragraph.runs:
+            run_start, run_end = offset, offset + len(run.text)
+            if run_start < label_end and run_end > 1:
+                assert run.italic is not True
+            offset = run_end
+    assert any(run.text == "x" and run.italic is True for paragraph in labelled for run in paragraph.runs)
+    assert any(run.text == "y" and run.italic is True for paragraph in labelled for run in paragraph.runs)
+
+
+def _apply_direct_lower_letter_list(doc, paragraphs):
+    root = doc.part.numbering_part.element
+    abstract_ids = [int(node.get(qn("w:abstractNumId"))) for node in root.findall(qn("w:abstractNum"))]
+    num_ids = [int(node.get(qn("w:numId"))) for node in root.findall(qn("w:num"))]
+    abstract_id = max(abstract_ids, default=-1) + 1
+    num_id = max(num_ids, default=0) + 1
+
+    abstract = OxmlElement("w:abstractNum")
+    abstract.set(qn("w:abstractNumId"), str(abstract_id))
+    level = OxmlElement("w:lvl")
+    level.set(qn("w:ilvl"), "0")
+    for tag, value in (("w:start", "1"), ("w:numFmt", "lowerLetter"), ("w:lvlText", "%1)")):
+        child = OxmlElement(tag)
+        child.set(qn("w:val"), value)
+        level.append(child)
+    abstract.append(level)
+    root.append(abstract)
+
+    number = OxmlElement("w:num")
+    number.set(qn("w:numId"), str(num_id))
+    abstract_ref = OxmlElement("w:abstractNumId")
+    abstract_ref.set(qn("w:val"), str(abstract_id))
+    number.append(abstract_ref)
+    root.append(number)
+
+    for paragraph in paragraphs:
+        properties = paragraph._p.get_or_add_pPr()
+        numbering = OxmlElement("w:numPr")
+        level_ref = OxmlElement("w:ilvl")
+        level_ref.set(qn("w:val"), "0")
+        number_ref = OxmlElement("w:numId")
+        number_ref.set(qn("w:val"), str(num_id))
+        numbering.extend((level_ref, number_ref))
+        properties.append(numbering)
+
+
+def test_word_automatic_a_to_d_numbering_is_structured_as_explicit_mcq(tmp_path: Path):
+    source = tmp_path / "automatic_alpha_mcq.docx"
+    doc = Document()
+    for text in ["Question 27", "Difficulty level: Average", "Objective: Comprehension", "Question type: MCQ"]:
+        doc.add_paragraph(text)
+    doc.add_paragraph("Which multiplication is represented?")
+    choices = [doc.add_paragraph(text) for text in ["5 × (−3)", "(−5) × (−3)", "(−5) × 3", "5 × 3"]]
+    _apply_direct_lower_letter_list(doc, choices)
+    doc.add_paragraph("Answer: c")
+    doc.save(source)
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(start_question_number=27),
+        tmp_path / "automatic_alpha_storage",
+    )
+    output = Document(result.output_path)
+    texts = [paragraph.text.strip() for paragraph in output.paragraphs if paragraph.text.strip()]
+
+    choices_index = texts.index("@Choices:@")
+    solution_index = texts.index("@Solution:@")
+    choice_paragraphs = [
+        paragraph
+        for paragraph in output.paragraphs
+        if paragraph.text.strip().startswith(("@1@", "@2@", "@3@", "@4@"))
+    ]
+    visible_choices = [
+        "".join(node.text or "" for node in paragraph._p.xpath(".//w:t | .//m:t")).strip()
+        for paragraph in choice_paragraphs
+    ]
+    assert [re.sub(r"\s+", "", choice) for choice in visible_choices] == [
+        "@1@5×(−3)",
+        "@2@(−5)×(−3)",
+        "@3@(−5)×3@correctanswer@",
+        "@4@5×3",
+    ]
+    assert texts[solution_index - 1] == "@e@"
+    assert not any(text.startswith("Answer:") for text in texts)
+    for paragraph in choice_paragraphs:
+        assert paragraph._p.find(qn("w:pPr") + "/" + qn("w:numPr")) is None
+    assert result.structure_counts["all_match"] is True
+
+
+def test_word_automatic_mcq_with_conflicting_answer_text_is_preserved(tmp_path: Path):
+    source = tmp_path / "automatic_alpha_mcq_conflict.docx"
+    doc = Document()
+    for text in ["Question 1", "Question type: MCQ", "Choose one."]:
+        doc.add_paragraph(text)
+    choices = [doc.add_paragraph(text) for text in ["Four", "Seven", "Eleven", "Twenty-eight"]]
+    _apply_direct_lower_letter_list(doc, choices)
+    doc.add_paragraph("Answer: b) Nine")
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "automatic_conflict_storage")
+    output = Document(result.output_path)
+    texts = [paragraph.text.strip() for paragraph in output.paragraphs if paragraph.text.strip()]
+
+    assert "Answer: b) Nine" in texts
+    assert "@Choices:@" not in texts
+    assert any(finding.status == "manual_review" and "does not match" in finding.message for finding in result.findings)
+
+
+def test_spacing_distinguishes_unary_signs_and_preserves_numeric_comma_spaces():
+    from cms_processor import _normalise_spacing
+
+    assert _normalise_spacing("To represent (−6)×(−2), remove two tokens.") == "To represent (−6) × (−2), remove two tokens."
+    assert _normalise_spacing("p−q=15") == "p − q = 15"
+    assert _normalise_spacing("x=−6") == "x = −6"
+    assert _normalise_spacing("1,-12,-15, 28") == "1,-12,-15, 28"
+    assert _normalise_spacing("1,   − 12") == "1,   −12"
+    assert _normalise_spacing("1, 2, 3") == "1, 2, 3"
+    assert _normalise_spacing("1,250") == "1,250"
+    assert _normalise_spacing("word,word") == "word, word"
 
 
 @pytest.mark.parametrize("all_bold", [False, True])

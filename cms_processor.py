@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.18-upright-part-labels-v14.14"
+PROCESSOR_BUILD_ID = "2026.10.18-safe-numbering-and-spacing-v14.15"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -1114,6 +1114,119 @@ def _write_choice_marker(paragraph: Paragraph, option: int, correct: bool) -> No
         paragraph.add_run(suffix)
 
 
+def _direct_numbering_level(paragraph: Paragraph) -> tuple[str, int, str, str, int] | None:
+    """Return a directly numbered paragraph's safe list metadata.
+
+    Word's visible list label is not part of ``paragraph.text``.  Resolve only
+    direct numbering properties here; style-inherited and field-generated
+    labels are deliberately left for manual review because their effective
+    numbering can depend on wider document state.
+    """
+    properties = paragraph._p.find(qn("w:pPr"))
+    numbering = properties.find(qn("w:numPr")) if properties is not None else None
+    if numbering is None:
+        return None
+    num_id_node = numbering.find(qn("w:numId"))
+    level_node = numbering.find(qn("w:ilvl"))
+    if num_id_node is None:
+        return None
+    num_id = num_id_node.get(qn("w:val"))
+    if not num_id or num_id == "0":
+        return None
+    try:
+        level = int(level_node.get(qn("w:val"), "0")) if level_node is not None else 0
+        root = paragraph.part.numbering_part.element
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    number = next((node for node in root.findall(qn("w:num")) if node.get(qn("w:numId")) == num_id), None)
+    if number is None:
+        return None
+    abstract_id_node = number.find(qn("w:abstractNumId"))
+    if abstract_id_node is None:
+        return None
+    abstract_id = abstract_id_node.get(qn("w:val"))
+    abstract = next(
+        (node for node in root.findall(qn("w:abstractNum")) if node.get(qn("w:abstractNumId")) == abstract_id),
+        None,
+    )
+    if abstract is None:
+        return None
+    level_definition = next(
+        (node for node in abstract.findall(qn("w:lvl")) if node.get(qn("w:ilvl"), "0") == str(level)),
+        None,
+    )
+    if level_definition is None:
+        return None
+    format_node = level_definition.find(qn("w:numFmt"))
+    text_node = level_definition.find(qn("w:lvlText"))
+    if format_node is None or text_node is None:
+        return None
+
+    start = 1
+    start_node = level_definition.find(qn("w:start"))
+    if start_node is not None:
+        try:
+            start = int(start_node.get(qn("w:val"), "1"))
+        except ValueError:
+            return None
+    override = next(
+        (node for node in number.findall(qn("w:lvlOverride")) if node.get(qn("w:ilvl"), "0") == str(level)),
+        None,
+    )
+    if override is not None:
+        start_override = override.find(qn("w:startOverride"))
+        if start_override is not None:
+            try:
+                start = int(start_override.get(qn("w:val"), "1"))
+            except ValueError:
+                return None
+    return num_id, level, format_node.get(qn("w:val"), ""), text_node.get(qn("w:val"), ""), start
+
+
+def _automatic_alpha_choices(doc: _Document, paragraphs: list[Paragraph]) -> list[Paragraph] | None:
+    """Accept one unambiguous Word-generated a)-d) list and nothing broader."""
+    candidates: list[tuple[int, Paragraph, tuple[str, int, str, str, int]]] = []
+    for index, paragraph in enumerate(paragraphs):
+        info = _direct_numbering_level(paragraph)
+        if info is not None:
+            candidates.append((index, paragraph, info))
+    if len(candidates) != 4:
+        return None
+    positions = [index for index, _, _ in candidates]
+    if positions != list(range(positions[0], positions[0] + 4)):
+        return None
+    first_info = candidates[0][2]
+    if any(info != first_info for _, _, info in candidates[1:]):
+        return None
+    num_id, level, number_format, level_text, start = first_info
+    if level != 0 or number_format not in {"lowerLetter", "upperLetter"} or start != 1:
+        return None
+    if level_text.strip() not in {"%1)", "(%1)", "%1."}:
+        return None
+
+    # A reused numId could visibly continue at e) even though its definition
+    # starts at one.  Require these to be the only four direct occurrences of
+    # that numId, so their visible labels are provably a)-d).
+    occurrences = [
+        paragraph
+        for paragraph in iter_paragraphs(doc)
+        if (info := _direct_numbering_level(paragraph)) is not None
+        and info[0] == num_id
+        and info[1] == level
+    ]
+    if [paragraph._p for paragraph in occurrences] != [paragraph._p for _, paragraph, _ in candidates]:
+        return None
+    return [paragraph for _, paragraph, _ in candidates]
+
+
+def _remove_direct_numbering(paragraph: Paragraph) -> None:
+    properties = paragraph._p.find(qn("w:pPr"))
+    numbering = properties.find(qn("w:numPr")) if properties is not None else None
+    if numbering is not None:
+        properties.remove(numbering)
+
+
 def _parse_mcq_answer_key(text: str) -> tuple[int, str | None] | None:
     match = MCQ_ANSWER_RE.fullmatch(text)
     if not match:
@@ -1163,6 +1276,7 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
             if compound is not None:
                 choice_paragraphs = compound
                 break
+        automatic_numbered_choices = False
         if choice_paragraphs is None:
             candidates = [
                 p for p in block[1:answer_index]
@@ -1178,6 +1292,9 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
                 )
             if len(candidates) == 4 and option_numbers == [1, 2, 3, 4]:
                 choice_paragraphs = candidates
+        if choice_paragraphs is None and declared_type == "MCQ":
+            choice_paragraphs = _automatic_alpha_choices(doc, block[1:answer_index])
+            automatic_numbered_choices = choice_paragraphs is not None
         if not choice_paragraphs or len(choice_paragraphs) != 4:
             if declared_type == "MCQ":
                 findings.append(Finding(0, "manual_review", "The question is declared MCQ, but four clearly labelled choices could not be identified safely.", detected_number))
@@ -1214,6 +1331,8 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         if not any(p.text.strip() == "@Choices:@" for p in block):
             choice_paragraphs[0].insert_paragraph_before("@Choices:@")
         for option, paragraph in enumerate(choice_paragraphs, 1):
+            if automatic_numbered_choices:
+                _remove_direct_numbering(paragraph)
             _write_choice_marker(paragraph, option, option == correct_option)
 
         refreshed = _block_paragraphs(start, next_start)
@@ -1238,6 +1357,8 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
         answer_block = block[:solution_index]
         declared_type = (_metadata_value(block, "Type") or "").upper()
         option_count = sum(bool(OPTION_RE.fullmatch(p.text.strip())) for p in answer_block)
+        if _automatic_alpha_choices(doc, answer_block) is not None:
+            option_count = max(option_count, 4)
         candidates: list[tuple[Paragraph, re.Match[str]]] = []
         for paragraph in answer_block:
             paragraph_answer_text = _paragraph_text_with_equations(paragraph).strip()
@@ -1543,10 +1664,45 @@ def _normalise_spacing(text: str) -> str:
     if not text:
         return text
     text = text.replace("\u00a0", " ")
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\s*,\s*", ", ", text)
-    text = re.sub(r"(?<=\d),\s+(?=\d)", ",", text)
-    text = re.sub(r"\s*([=+×÷−])\s*", r" \1 ", text)
+
+    def repeated_spacing(match: re.Match[str]) -> str:
+        before = text[:match.start()].rstrip()
+        after = text[match.end():].lstrip()
+        after_comma = after[1:].lstrip() if after.startswith(",") else ""
+        numeric_after_comma = bool(re.match(r"[+−-]?\s*\d", after_comma))
+        if before.endswith(",") and re.match(r"[+−-]?\s*\d", after):
+            return match.group(0)
+        if before[-1:].isdigit() and after.startswith(",") and numeric_after_comma:
+            return match.group(0)
+        return " "
+
+    text = re.sub(r"[ \t]{2,}", repeated_spacing, text)
+    def comma_spacing(match: re.Match[str]) -> str:
+        before = text[:match.start()].rstrip()
+        after = text[match.end():].lstrip()
+        # Numeric punctuation is author-owned. Preserve exactly whether it is
+        # a list separator or a thousands separator, including its whitespace.
+        numeric_left = bool(before and before[-1].isdigit())
+        numeric_right = bool(re.match(r"[+−-]?\s*\d", after))
+        return match.group(0) if numeric_left and numeric_right else ", "
+
+    text = re.sub(r"[ \t]*,[ \t]*", comma_spacing, text)
+    text = re.sub(r"\s*([=×÷])\s*", r" \1 ", text)
+
+    def sign_spacing(match: re.Match[str]) -> str:
+        leading, sign = match.group(1), match.group(2)
+        before = text[:match.start()].rstrip()
+        previous = before[-1:] if before else ""
+        unary = not previous or previous in "([{×÷=+−-,:;"
+        if not unary:
+            return f" {sign} "
+        if previous in "([{":
+            leading = ""
+        # Attach a unary sign to its value. Preserve author-entered separation
+        # before the signed number, especially in comma-separated number lists.
+        return f"{leading}{sign}"
+
+    text = re.sub(r"([ \t]*)([+−])\s*", sign_spacing, text)
     text = re.sub(r" +([.;:?!])", r"\1", text)
     return text
 
@@ -1719,6 +1875,7 @@ VARIABLE_CUE_RE = re.compile(
 PROTECTED_LABEL_RE = re.compile(r"\b(?i:option|choice|part|class)\s+([A-Da-d])\b")
 ASSERTION_REASON_LABEL_RE = re.compile(r"\b(?i:Assertion|Reason)\s*\(\s*([AR])\s*\)")
 PARENTHESIZED_PART_LABEL_RE = re.compile(r"(?<![A-Za-z0-9])\(([a-e])\)(?=\s|$)")
+ROMAN_PART_LABEL_RE = re.compile(r"^\s*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)(?=\s)", re.I)
 UNIT_TOKENS = {"mm", "cm", "m", "km", "mg", "g", "kg", "ml", "l", "s", "min", "h"}
 
 
@@ -1830,6 +1987,7 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
         # it from cues such as "the equation".
         protected_labels = [match.span(1) for match in ASSERTION_REASON_LABEL_RE.finditer(text)]
         protected_labels.extend(match.span(1) for match in PARENTHESIZED_PART_LABEL_RE.finditer(text))
+        protected_labels.extend(match.span(1) for match in ROMAN_PART_LABEL_RE.finditer(text))
         for match in re.finditer(r"(?<![A-Za-z])([A-Za-z])(?![A-Za-z])", text):
             start, end = match.span(1)
             if _range_contains(protected_labels, start, end):
@@ -1868,6 +2026,7 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
         protected = [match.span(1) for match in PROTECTED_LABEL_RE.finditer(text)]
         protected.extend(match.span(1) for match in ASSERTION_REASON_LABEL_RE.finditer(text))
         protected.extend(match.span(1) for match in PARENTHESIZED_PART_LABEL_RE.finditer(text))
+        protected.extend(match.span(1) for match in ROMAN_PART_LABEL_RE.finditer(text))
         protected.extend(_measurement_unit_ranges(text, paragraph))
         choice_label = re.match(r"^\s*([a-dA-D])(?:[.)]|\s*@)", text)
         if choice_label:
