@@ -111,7 +111,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.18-fib-answer-key-guard-v14.13"
+    assert PROCESSOR_BUILD_ID == "2026.10.18-upright-part-labels-v14.14"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -302,6 +302,60 @@ def test_assertion_and_reason_labels_are_not_auto_italicised(tmp_path: Path):
         label_runs = [run for run in paragraph.runs if label in run.text]
         assert label_runs
         assert all(run.italic is not True for run in label_runs)
+
+
+def test_parenthesised_part_labels_a_to_e_remain_upright(tmp_path: Path):
+    source = tmp_path / "upright_part_labels.docx"
+    doc = Document()
+    for text in [
+        "@Question: 1@",
+        "@Type: FIB@",
+        "@Question id: project1_q1@",
+        "@New snippet id: 1@",
+        "@Difficulty level: Easy@",
+        "@Objective: Application@",
+        "@Question:@",
+        "(a) Find x if x + 2 = 5.",
+        "(b) Find x if x + 3 = 7.",
+        "(c) Find x if x + 4 = 9.",
+        "(d) Find y if y + 1 = 4.",
+        "(e) Find y if y + 2 = 6.",
+        "@e@",
+        "@Answers:@",
+        "(a) 3",
+        "(b) 4",
+        "(c) 5",
+        "(d) 3",
+        "(e) 4",
+        "@e@",
+        "@Solution:@",
+        "@e@",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+    output = Document(result.output_path)
+
+    for label in "abcde":
+        matching = [paragraph for paragraph in output.paragraphs if paragraph.text.startswith(f"({label})")]
+        assert len(matching) == 2
+        for paragraph in matching:
+            offset = 0
+            label_run = None
+            for run in paragraph.runs:
+                if offset <= 1 < offset + len(run.text):
+                    label_run = run
+                    break
+                offset += len(run.text)
+            assert label_run is not None and label_run.italic is not True
+
+    question_paragraphs = [paragraph for paragraph in output.paragraphs if "Find " in paragraph.text]
+    assert any(
+        run.italic is True and run.text in {"x", "y"}
+        for paragraph in question_paragraphs
+        for run in paragraph.runs
+    )
 
 
 @pytest.mark.parametrize("all_bold", [False, True])

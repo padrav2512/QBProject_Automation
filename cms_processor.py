@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.18-fib-answer-key-guard-v14.13"
+PROCESSOR_BUILD_ID = "2026.10.18-upright-part-labels-v14.14"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -1718,6 +1718,7 @@ VARIABLE_CUE_RE = re.compile(
 )
 PROTECTED_LABEL_RE = re.compile(r"\b(?i:option|choice|part|class)\s+([A-Da-d])\b")
 ASSERTION_REASON_LABEL_RE = re.compile(r"\b(?i:Assertion|Reason)\s*\(\s*([AR])\s*\)")
+PARENTHESIZED_PART_LABEL_RE = re.compile(r"(?<![A-Za-z0-9])\(([a-e])\)(?=\s|$)")
 UNIT_TOKENS = {"mm", "cm", "m", "km", "mg", "g", "kg", "ml", "l", "s", "min", "h"}
 
 
@@ -1828,6 +1829,7 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
         # superscript is a high-confidence variable even when prose separates
         # it from cues such as "the equation".
         protected_labels = [match.span(1) for match in ASSERTION_REASON_LABEL_RE.finditer(text)]
+        protected_labels.extend(match.span(1) for match in PARENTHESIZED_PART_LABEL_RE.finditer(text))
         for match in re.finditer(r"(?<![A-Za-z])([A-Za-z])(?![A-Za-z])", text):
             start, end = match.span(1)
             if _range_contains(protected_labels, start, end):
@@ -1865,6 +1867,7 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
         spans = list(direct_spans.get(paragraph._p, []))
         protected = [match.span(1) for match in PROTECTED_LABEL_RE.finditer(text)]
         protected.extend(match.span(1) for match in ASSERTION_REASON_LABEL_RE.finditer(text))
+        protected.extend(match.span(1) for match in PARENTHESIZED_PART_LABEL_RE.finditer(text))
         protected.extend(_measurement_unit_ranges(text, paragraph))
         choice_label = re.match(r"^\s*([a-dA-D])(?:[.)]|\s*@)", text)
         if choice_label:
@@ -1888,6 +1891,10 @@ def _repair_italics(doc: _Document, findings: list[Finding]) -> None:
                     continue
                 uncertain_by_question.setdefault(question, set()).add(match.group(1))
 
+        spans = [
+            (start, end) for start, end in spans
+            if not _range_contains(protected, start, end)
+        ]
         changed += _italicise_absolute_spans(paragraph, spans)
 
     if changed:

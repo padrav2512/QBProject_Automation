@@ -13,7 +13,7 @@ import heymath_cms_mapper as _cms_mapper
 from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_sheet_names
 
 
-EXPECTED_PROCESSOR_BUILD_ID = "2026.10.18-fib-answer-key-guard-v14.13"
+EXPECTED_PROCESSOR_BUILD_ID = "2026.10.18-upright-part-labels-v14.14"
 EXPECTED_MAPPER_BUILD_ID = "2026.10.12-live-removal-v5"
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
     _cms_mapper = importlib.reload(_cms_mapper)
