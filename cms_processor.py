@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.17-word-structure-hardening-v14.12"
+PROCESSOR_BUILD_ID = "2026.10.18-fib-answer-key-guard-v14.13"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -230,6 +230,19 @@ def _set_text(paragraph: Paragraph, text: str) -> None:
 
 def _has_embedded_content(paragraph: Paragraph) -> bool:
     return bool(paragraph._p.xpath(".//m:oMath | .//w:drawing | .//w:pict | .//w:object"))
+
+
+def _paragraph_text_with_equations(paragraph: Paragraph) -> str:
+    """Return visible paragraph text while retaining OMML math text in XML order."""
+    parts: list[str] = []
+    for node in paragraph._p.iter():
+        if node.tag in {qn("w:t"), qn("m:t")}:
+            parts.append(node.text or "")
+        elif node.tag == qn("w:tab"):
+            parts.append("\t")
+        elif node.tag == qn("w:br"):
+            parts.append("\n")
+    return "".join(parts)
 
 
 def _equation_inventory(doc: _Document) -> Counter:
@@ -1122,19 +1135,27 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         block = _block_paragraphs(start, next_start)
         if any(p.text.strip() == "@Answers:@" for p in block):
             continue
-        if (_metadata_value(block, "Type") or "").upper() == "FIB":
+        declared_type = (_metadata_value(block, "Type") or "").strip().upper()
+        # An explicit FIB declaration is authoritative at this stage. In
+        # particular, Answer: A = 35° is a mathematical answer beginning with
+        # a variable, not an MCQ key followed by mismatching choice text.
+        if declared_type == "FIB":
             continue
         # A Question or Solution heading does not imply that choices are already structured.
         solution_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Solution:@"), len(block))
         block = block[:solution_index]
-        answer_candidates = [
-            (i, parsed)
+
+        # Locate the Answer boundary without interpreting its value as an MCQ
+        # key. Key parsing and choice-text validation happen only after four
+        # clearly labelled choices have been proved.
+        answer_paragraphs = [
+            (i, p)
             for i, p in enumerate(block)
-            if not _has_embedded_content(p) and (parsed := _parse_mcq_answer_key(p.text.strip())) is not None
+            if re.match(r"^\s*(?:Answers?|Correct answers?)\s*:", _paragraph_text_with_equations(p), re.I)
         ]
-        if len(answer_candidates) != 1:
+        if len(answer_paragraphs) != 1:
             continue
-        answer_index, (correct_option, supplied_answer_text) = answer_candidates[0]
+        answer_index, answer_paragraph = answer_paragraphs[0]
 
         choice_paragraphs: list[Paragraph] | None = None
         for paragraph in block[1:answer_index]:
@@ -1143,19 +1164,38 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
                 choice_paragraphs = compound
                 break
         if choice_paragraphs is None:
-            choices_index = next((i for i, p in enumerate(block) if p.text.strip() == "@Choices:@"), None)
-            candidates = [p for p in block[(choices_index + 1 if choices_index is not None else 1):answer_index]
-                          if _has_visible_content(p) and p.text.strip() not in SECTION_MARKERS | {"@e@"}
-                          and not (PLAIN_METADATA_RE.fullmatch(p.text.strip()) or KNOWN_METADATA_RE.fullmatch(p.text.strip()))]
-            if (choices_index is not None and len(candidates) == 4) or (choices_index is None and len(candidates) >= 5):
-                choice_paragraphs = candidates[-4:]
+            candidates = [
+                p for p in block[1:answer_index]
+                if OPTION_RE.fullmatch(p.text.strip()) is not None
+            ]
+            option_numbers = []
+            for paragraph in candidates:
+                option_match = OPTION_RE.fullmatch(paragraph.text.strip())
+                option_numbers.append(
+                    int(option_match.group(1))
+                    if option_match.group(1)
+                    else ord(option_match.group(2).upper()) - ord("A") + 1
+                )
+            if len(candidates) == 4 and option_numbers == [1, 2, 3, 4]:
+                choice_paragraphs = candidates
         if not choice_paragraphs or len(choice_paragraphs) != 4:
-            findings.append(Finding(0, "manual_review", "A letter answer was found, but four MCQ choices could not be identified safely.", detected_number))
+            if declared_type == "MCQ":
+                findings.append(Finding(0, "manual_review", "The question is declared MCQ, but four clearly labelled choices could not be identified safely.", detected_number))
             continue
 
+        if _has_embedded_content(answer_paragraph):
+            # Never delete or reinterpret a mathematical answer object while
+            # inferring an untagged MCQ.
+            continue
+        parsed_answer = _parse_mcq_answer_key(_paragraph_text_with_equations(answer_paragraph).strip())
+        if parsed_answer is None:
+            continue
+        correct_option, supplied_answer_text = parsed_answer
+
         if supplied_answer_text is not None:
-            selected = OPTION_RE.fullmatch(choice_paragraphs[correct_option - 1].text.strip())
-            selected_text = selected.group(3).strip() if selected else choice_paragraphs[correct_option - 1].text.strip()
+            selected_full_text = _paragraph_text_with_equations(choice_paragraphs[correct_option - 1]).strip()
+            selected = OPTION_RE.fullmatch(selected_full_text)
+            selected_text = selected.group(3).strip() if selected else selected_full_text
             if _normalise_answer_text(selected_text) != _normalise_answer_text(supplied_answer_text):
                 findings.append(
                     Finding(
@@ -1176,15 +1216,12 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
         for option, paragraph in enumerate(choice_paragraphs, 1):
             _write_choice_marker(paragraph, option, option == correct_option)
 
-        # Locate the answer paragraph again because splitting a compound choice can change the block.
         refreshed = _block_paragraphs(start, next_start)
-        answer_paragraph = next((p for p in refreshed if _parse_mcq_answer_key(p.text.strip()) is not None), None)
-        if answer_paragraph is not None:
-            if not any(p.text.strip() == "@Solution:@" for p in refreshed):
-                answer_paragraph.insert_paragraph_before("@Solution:@")
-            # Do not invent solution prose when the source MCQ has no solution.
-            # CMS still requires the Solution block and its closing marker.
-            _set_text(answer_paragraph, "@e@")
+        if not any(p.text.strip() == "@Solution:@" for p in refreshed):
+            answer_paragraph.insert_paragraph_before("@Solution:@")
+        # Do not invent solution prose when the source MCQ has no solution.
+        # CMS still requires the Solution block and its closing marker.
+        _set_text(answer_paragraph, "@e@")
         findings.append(Finding(0, "fixed", "Identified an untagged MCQ, created its Choices and Solution sections, and marked the keyed answer.", detected_number))
 
 
@@ -1203,17 +1240,18 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
         option_count = sum(bool(OPTION_RE.fullmatch(p.text.strip())) for p in answer_block)
         candidates: list[tuple[Paragraph, re.Match[str]]] = []
         for paragraph in answer_block:
-            match = ANSWER_VALUE_RE.fullmatch(paragraph.text.strip())
+            paragraph_answer_text = _paragraph_text_with_equations(paragraph).strip()
+            match = ANSWER_VALUE_RE.fullmatch(paragraph_answer_text)
             if (
                 match
-                and not re.match(r"^\s*(?:Answers?|Correct answers?)\s*:", paragraph.text, re.I)
+                and not re.match(r"^\s*(?:Answers?|Correct answers?)\s*:", paragraph_answer_text, re.I)
                 and re.match(r"^(?:the|these|those|following|all)\b", match.group(1).strip(), re.I)
             ):
                 match = None
-            mcq_key = _parse_mcq_answer_key(paragraph.text.strip())
+            mcq_key = _parse_mcq_answer_key(paragraph_answer_text)
             if match and mcq_key and declared_type != "FIB" and option_count >= 4:
                 continue
-            if match and (_has_embedded_content(paragraph) or not LETTER_ANSWER_RE.fullmatch(paragraph.text.strip()) or declared_type == "FIB"):
+            if match and (_has_embedded_content(paragraph) or not LETTER_ANSWER_RE.fullmatch(paragraph_answer_text) or declared_type == "FIB"):
                 candidates.append((paragraph, match))
         if len(candidates) != 1:
             answer_like = [
@@ -1261,7 +1299,7 @@ def _infer_untagged_fib_sections(doc: _Document, findings: list[Finding]) -> Non
             )
             continue
         answer_paragraph.insert_paragraph_before("@Answers:@")
-        prefix = re.match(r"^\s*(?:Answers?|Correct answers?)\s*:?\s*", answer_paragraph.text, re.I)
+        prefix = re.match(r"^\s*(?:Answers?|Correct answers?)\s*:?\s*", _paragraph_text_with_equations(answer_paragraph), re.I)
         # Manual line breaks are separate XML nodes and must count towards the
         # removed prefix; otherwise the first answer's opening bracket is lost.
         _remove_run_text_prefix(answer_paragraph, prefix.end())

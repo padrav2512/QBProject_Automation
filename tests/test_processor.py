@@ -111,7 +111,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.17-word-structure-hardening-v14.12"
+    assert PROCESSOR_BUILD_ID == "2026.10.18-fib-answer-key-guard-v14.13"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -690,8 +690,8 @@ def test_heading_with_difficulty_and_untagged_mcq_are_structured(tmp_path: Path)
     doc.add_paragraph("Which pair has a sum of 55?")
     doc.add_paragraph("a) 30 and 25")
     doc.add_paragraph("b) 35 and 20")
-    doc.add_paragraph("20 and 35")
-    doc.add_paragraph("25 and 30")
+    doc.add_paragraph("c) 20 and 35")
+    doc.add_paragraph("d) 25 and 30")
     doc.add_paragraph("Answer: b")
     doc.save(source)
 
@@ -1088,6 +1088,103 @@ def test_mcq_answer_key_with_closing_parenthesis_is_inferred_as_mcq(tmp_path: Pa
     assert "@Choices:@" in texts
     assert "@2@ Second @correct answer@" in texts
     assert "@Answers:@" not in texts
+
+
+def test_project10439_q25_explicit_fib_variable_answer_is_not_an_mcq_key(tmp_path: Path):
+    source = tmp_path / "project10439_q25.docx"
+    doc = Document()
+    for text in [
+        "Question 25",
+        "Difficulty level: Average",
+        "Objective: Application",
+        "Question type: FIB",
+        "If C is the centre of the circle, and ∠ACB = 110°, calculate the value of ∠A.",
+    ]:
+        doc.add_paragraph(text)
+    answer = doc.add_paragraph()
+    answer.add_run("Answer: ")
+    equation = OxmlElement("m:oMath")
+    math_run = OxmlElement("m:r")
+    math_text = OxmlElement("m:t")
+    math_text.text = "∠"
+    math_run.append(math_text)
+    equation.append(math_run)
+    answer._p.append(equation)
+    answer.add_run("A = 35°")
+    doc.save(source)
+
+    # python-docx omits the OMML symbol from paragraph.text, reproducing the
+    # Project 10439 failure mode exactly.
+    assert answer.text == "Answer: A = 35°"
+
+    result = process_docx(
+        source,
+        source.name,
+        ProcessorOptions(project_question_prefix="project10439_q", start_snippet_id=1),
+        tmp_path / "storage",
+    )
+    output = Document(result.output_path)
+    texts = [paragraph.text for paragraph in output.paragraphs]
+
+    assert "@Type: FIB@" in texts
+    assert "@Answers:@" in texts
+    assert "@Choices:@" not in texts
+    assert not any("correct-answer label" in finding.message for finding in result.findings)
+    assert not any("supplied text does not match" in finding.message for finding in result.findings)
+    answer_paragraph = output.paragraphs[texts.index("@Answers:@") + 1]
+    visible_answer = "".join(node.text or "" for node in answer_paragraph._p.xpath(".//w:t | .//m:t"))
+    assert visible_answer.replace(" ", "") == "∠A=35°"
+    assert any(
+        "∠" in "".join(node.text or "" for node in equation_node.iter(qn("m:t")))
+        for equation_node in answer_paragraph._p.xpath(".//m:oMath")
+    )
+
+
+def test_genuine_mcq_choice_text_mismatch_is_still_reported(tmp_path: Path):
+    source = tmp_path / "genuine_mcq_mismatch.docx"
+    doc = Document()
+    for text in [
+        "Question 1",
+        "Question type: MCQ",
+        "Which value is correct?",
+        "a) 10",
+        "b) 20",
+        "c) 30",
+        "d) 40",
+        "Answer: b) 25",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+
+    mismatches = [
+        finding for finding in result.findings
+        if finding.question == 1 and "supplied text does not match" in finding.message
+    ]
+    assert len(mismatches) == 1
+    assert mismatches[0].status == "manual_review"
+
+
+def test_mcq_choice_text_validation_requires_four_clear_choices(tmp_path: Path):
+    source = tmp_path / "incomplete_mcq_choices.docx"
+    doc = Document()
+    for text in [
+        "Question 1",
+        "Question type: MCQ",
+        "Which value is correct?",
+        "a) 10",
+        "b) 20",
+        "c) 30",
+        "Answer: A = 35°",
+    ]:
+        doc.add_paragraph(text)
+    doc.save(source)
+
+    result = process_docx(source, source.name, ProcessorOptions(), tmp_path / "storage")
+
+    assert any("four clearly labelled choices" in finding.message for finding in result.findings)
+    assert not any("supplied text does not match" in finding.message for finding in result.findings)
 
 
 def test_safe_math_image_mode_converts_clear_choices_and_flags_ambiguous_scope(tmp_path: Path):
