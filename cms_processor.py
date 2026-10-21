@@ -26,7 +26,7 @@ from image_pipeline import ImagePipelineResult, process_document_images
 from safe_math import parse as parse_safe_math, replace_span as replace_math_span
 
 
-PROCESSOR_BUILD_ID = "2026.10.18-safe-numbering-and-spacing-v14.15"
+PROCESSOR_BUILD_ID = "2026.10.21-word-list-choice-cleanup-v14.16"
 
 MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -1220,11 +1220,35 @@ def _automatic_alpha_choices(doc: _Document, paragraphs: list[Paragraph]) -> lis
     return [paragraph for _, paragraph, _ in candidates]
 
 
-def _remove_direct_numbering(paragraph: Paragraph) -> None:
+def _remove_choice_list_artifacts(paragraph: Paragraph) -> bool:
+    """Remove Word-list properties after replacing its label with a CMS tag.
+
+    A list paragraph can retain a hanging indent after ``w:numPr`` is removed.
+    Some downstream DOCX readers consequently group the four choices as one
+    logical list block.  Remove only list-specific indent attributes; preserve
+    paragraph spacing, alignment and any unrelated right indentation.
+    """
     properties = paragraph._p.find(qn("w:pPr"))
+    if properties is None:
+        return False
+    changed = False
     numbering = properties.find(qn("w:numPr")) if properties is not None else None
     if numbering is not None:
         properties.remove(numbering)
+        changed = True
+    indentation = properties.find(qn("w:ind"))
+    if indentation is not None and (
+        indentation.get(qn("w:hanging")) is not None
+        or indentation.get(qn("w:hangingChars")) is not None
+    ):
+        for attribute in ("left", "leftChars", "hanging", "hangingChars"):
+            key = qn(f"w:{attribute}")
+            if key in indentation.attrib:
+                del indentation.attrib[key]
+                changed = True
+        if not indentation.attrib and not len(indentation):
+            properties.remove(indentation)
+    return changed
 
 
 def _parse_mcq_answer_key(text: str) -> tuple[int, str | None] | None:
@@ -1332,7 +1356,7 @@ def _infer_untagged_mcq_sections(doc: _Document, findings: list[Finding]) -> Non
             choice_paragraphs[0].insert_paragraph_before("@Choices:@")
         for option, paragraph in enumerate(choice_paragraphs, 1):
             if automatic_numbered_choices:
-                _remove_direct_numbering(paragraph)
+                _remove_choice_list_artifacts(paragraph)
             _write_choice_marker(paragraph, option, option == correct_option)
 
         refreshed = _block_paragraphs(start, next_start)
@@ -2608,6 +2632,7 @@ def _preserve_table_formatting(doc: _Document, findings: list[Finding]) -> None:
 def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
     context = _section_for_paragraphs(doc)
     changed = 0
+    list_artifacts_removed = 0
     for paragraph in body_paragraphs(doc):
         section, question = context.get(paragraph._p, (None, None))
         if section != "@Choices:@":
@@ -2615,6 +2640,8 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
         match = OPTION_RE.fullmatch(paragraph.text.strip())
         if not match:
             continue
+        if _remove_choice_list_artifacts(paragraph):
+            list_artifacts_removed += 1
         digit, letter, rest = match.groups()
         option = int(digit) if digit else ord(letter.upper()) - ord("A") + 1
         if 1 <= option <= 4:
@@ -2624,6 +2651,14 @@ def _normalise_choices(doc: _Document, findings: list[Finding]) -> None:
                 changed += 1
     if changed:
         findings.append(Finding(0, "fixed", f"Normalised {changed} MCQ option marker(s)."))
+    if list_artifacts_removed:
+        findings.append(
+            Finding(
+                0,
+                "fixed",
+                f"Removed residual Word-list numbering or hanging indentation from {list_artifacts_removed} CMS choice paragraph(s).",
+            )
+        )
 
 
 def _normalise_mapping_path(raw: str) -> str | None:

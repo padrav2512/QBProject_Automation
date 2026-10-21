@@ -111,7 +111,7 @@ def test_v12_authoring_rules(tmp_path: Path):
     out = Document(result.output_path)
     texts = [paragraph.text for paragraph in out.paragraphs]
 
-    assert PROCESSOR_BUILD_ID == "2026.10.18-safe-numbering-and-spacing-v14.15"
+    assert PROCESSOR_BUILD_ID == "2026.10.21-word-list-choice-cleanup-v14.16"
     assert len(out.element.xpath(".//m:f")) >= 3
     assert "1/4" not in "\n".join(texts)
     assert "7/12" not in "\n".join(texts)
@@ -414,6 +414,10 @@ def _apply_direct_lower_letter_list(doc, paragraphs):
 
     for paragraph in paragraphs:
         properties = paragraph._p.get_or_add_pPr()
+        indentation = OxmlElement("w:ind")
+        indentation.set(qn("w:left"), "720")
+        indentation.set(qn("w:hanging"), "360")
+        properties.append(indentation)
         numbering = OxmlElement("w:numPr")
         level_ref = OxmlElement("w:ilvl")
         level_ref.set(qn("w:val"), "0")
@@ -463,7 +467,13 @@ def test_word_automatic_a_to_d_numbering_is_structured_as_explicit_mcq(tmp_path:
     assert texts[solution_index - 1] == "@e@"
     assert not any(text.startswith("Answer:") for text in texts)
     for paragraph in choice_paragraphs:
-        assert paragraph._p.find(qn("w:pPr") + "/" + qn("w:numPr")) is None
+        properties = paragraph._p.find(qn("w:pPr"))
+        assert properties.find(qn("w:numPr")) is None
+        indentation = properties.find(qn("w:ind"))
+        assert indentation is None or (
+            indentation.get(qn("w:left")) is None
+            and indentation.get(qn("w:hanging")) is None
+        )
     assert result.structure_counts["all_match"] is True
 
 
