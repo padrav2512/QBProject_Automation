@@ -504,6 +504,90 @@ def test_mapper_posts_with_mapping_page_referer(monkeypatch):
     assert captured["data"]["node_id"] == "10"
 
 
+def test_dynamic_mapping_page_uses_snippet_route(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    mapper._logged_in = True
+    requested = []
+    page = """
+    <html><head><title>Html Mapping-Dynamic 1121</title></head><body>
+    Browse Mapping Content
+    <form action="/curriculum_trees/add_mapping">
+      <input name="authenticity_token" value="curriculum-token">
+    </form>
+    <form action="/heymath_taxonomy/add_mapping">
+      <input name="authenticity_token" value="taxonomy-token">
+    </form>
+    Curriculum Mapping
+    Taxonomy Mapping
+    </body></html>
+    """
+
+    def fake_get(path):
+        requested.append(path)
+        return page
+
+    monkeypatch.setattr(mapper, "_get", fake_get)
+
+    result = mapper.get_mappings(1121, question_type="Dynamic")
+
+    assert requested == ["/snippet/1121/html_curriculum"]
+    assert result["type"] == "Dynamic"
+    assert result["name"] == "Dynamic 1121"
+
+
+def test_dynamic_mapper_posts_as_snippet_with_snippet_referer(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(mapper._session, "post", fake_post)
+    mapper._post_form_for_type(
+        "/curriculum_trees/add_mapping",
+        "token",
+        1121,
+        "node_id",
+        "16138",
+        "Add Mapping Form",
+        "Dynamic",
+    )
+
+    assert captured["headers"] == {
+        "Referer": "https://cms.example/snippet/1121/html_curriculum"
+    }
+    assert captured["data"]["project_type"] == "snippet"
+    assert captured["data"]["project_id"] == "1121"
+
+
+def test_static_and_dynamic_same_numeric_id_are_distinct(monkeypatch):
+    mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
+    calls = []
+
+    def fake_load(snippet_id, question_type="static"):
+        calls.append((snippet_id, question_type))
+        return {
+            "name": f"{question_type}-{snippet_id}",
+            "curriculum": [],
+            "taxonomy": [],
+        }
+
+    monkeypatch.setattr(mapper, "_load_mapping_page", fake_load)
+    mapper._logged_in = True
+
+    static_page = mapper.get_mappings(1121)
+    dynamic_page = mapper.get_mappings(1121, question_type="dynamic")
+
+    assert static_page["name"] == "static-1121"
+    assert dynamic_page["name"] == "dynamic-1121"
+    assert calls == [(1121, "static"), (1121, "dynamic")]
+
+
 def test_connection_is_read_only_and_reports_tree_sizes(monkeypatch):
     mapper = HeyMathCmsMapper("https://cms.example", "shared", "secret")
     calls = []

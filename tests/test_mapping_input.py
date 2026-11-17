@@ -78,18 +78,21 @@ def test_normalizes_wide_project_snippet_taxonomy_curriculum_sheet():
         {
             "Question": "project10433_q71",
             "Snippet ID": "219263",
+            "Snippet Type": "Static",
             "Mapping Type": "Curriculum",
             "Path": "CBSE NCERT >> Class 4 >> Mathematics",
         },
         {
             "Question": "project10433_q71",
             "Snippet ID": "219263",
+            "Snippet Type": "Static",
             "Mapping Type": "Curriculum",
             "Path": "India >> Class 4 >> Mathematics",
         },
         {
             "Question": "project10433_q71",
             "Snippet ID": "219263",
+            "Snippet Type": "Static",
             "Mapping Type": "Taxonomy",
             "Path": "Mathematics >> Measurement >> Measuring Temperature",
         },
@@ -107,6 +110,7 @@ def test_normalizes_wide_sheet_with_snippet_only():
         {
             "Question": "",
             "Snippet ID": "219263",
+            "Snippet Type": "Static",
             "Mapping Type": "Taxonomy",
             "Path": "Mathematics >> Measurement",
         }
@@ -123,6 +127,7 @@ def test_normalizes_wide_sheet_with_project_only_for_cms_resolution():
     assert normalized.iloc[0].to_dict() == {
         "Question": "project10433_q71",
         "Snippet ID": "",
+        "Snippet Type": "Static",
         "Mapping Type": "Taxonomy",
         "Path": "Mathematics >> Measurement",
     }
@@ -143,3 +148,81 @@ def test_normalizes_long_section_alias_and_multiline_paths():
     normalized = normalize_mapping_table(frame)
 
     assert list(normalized["Path"]) == ["India >> Class 6", "CBSE NCERT >> Class 7"]
+
+
+def test_type_defaults_to_static_and_accepts_explicit_dynamic():
+    frame = pd.DataFrame(
+        [
+            {
+                "Snippet ID": "1121",
+                "Snippet Type": "",
+                "Mapping Type": "Curriculum",
+                "Path": "CBSE NCERT >> Class 7",
+            },
+            {
+                "Snippet ID": "1121",
+                "Snippet Type": "dynamic",
+                "Mapping Type": "Curriculum",
+                "Path": "CBSE NCERT >> Class 7",
+            },
+        ]
+    )
+
+    normalized = normalize_mapping_table(frame)
+
+    assert list(normalized["Snippet Type"]) == ["Static", "Dynamic"]
+
+
+def test_original_inventory_aliases_preserve_dynamic_type():
+    frame = pd.DataFrame(
+        [
+            {
+                "Source Snippet ID": "1165",
+                "Static/Dynamic": "Dynamic",
+                "Curriculum": (
+                    "CBSE NCERT >> Class 7 >> Mathematics >> "
+                    "Another Peek Beyond the Point >> Multiplication of Decimals"
+                ),
+            }
+        ]
+    )
+
+    normalized = normalize_mapping_table(frame)
+
+    assert normalized.iloc[0]["Snippet ID"] == "1165"
+    assert normalized.iloc[0]["Snippet Type"] == "Dynamic"
+
+
+def test_legacy_type_heading_remains_supported():
+    frame = pd.DataFrame(
+        [
+            {
+                "Snippet ID": "1165",
+                "Type": "Dynamic",
+                "Curriculum": "CBSE NCERT >> Class 7",
+            }
+        ]
+    )
+
+    normalized = normalize_mapping_table(frame)
+
+    assert normalized.iloc[0]["Snippet Type"] == "Dynamic"
+
+
+def test_invalid_question_kind_is_rejected():
+    frame = pd.DataFrame(
+        [
+            {
+                "Snippet ID": "1165",
+                "Snippet Type": "MCQ",
+                "Curriculum": "CBSE NCERT >> Class 7",
+            }
+        ]
+    )
+
+    try:
+        normalize_mapping_table(frame)
+    except ValueError as exc:
+        assert "Every Snippet Type must be Static or Dynamic" in str(exc)
+    else:
+        raise AssertionError("Invalid question kind should be rejected")

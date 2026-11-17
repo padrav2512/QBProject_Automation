@@ -1821,6 +1821,7 @@ def test_mapping_blocks_are_extracted_per_question_and_removed_from_docx(tmp_pat
     with result.mapping_csv_path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert {row["Snippet ID"] for row in rows} == {"14001"}
+    assert {row["Snippet Type"] for row in rows} == {"Static"}
     assert [row["Mapping Type"] for row in rows] == ["Curriculum", "Curriculum", "Curriculum", "Taxonomy"]
     assert rows[0]["Path"] == "CBSE NCERT >> Class 4 >> Mathematics >> Measuring Length >> Metres and Centimetres"
     assert rows[1]["Path"] == "India >> Class 4 >> Mathematics >> Measurement"

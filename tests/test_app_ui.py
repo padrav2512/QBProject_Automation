@@ -28,6 +28,8 @@ def test_app_renders_five_processing_sections_and_mapping_stage():
         "Question: 3 Case study" in caption.value and "@Question: 3@ Case study" in caption.value
         for caption in app.sidebar.caption
     )
-    assert "Validate and add mappings" in [button.label for button in app.button]
+    button_labels = [button.label for button in app.button]
+    assert "Validate mapping file (read only)" in button_labels
+    assert "Add validated mappings to CMS" in button_labels
     assert "Apply mappings to CMS" in [expander.label for expander in app.expander]
     assert "CMS structure count check" in app_path.read_text(encoding="utf-8")

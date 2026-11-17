@@ -22,7 +22,7 @@ log = logging.getLogger("heymath_cms_mapper")
 SEP = " >> "
 TREE_CACHE_SECONDS = 6 * 60 * 60
 TIMEOUT = 60
-MAPPER_BUILD_ID = "2026.10.12-live-removal-v5"
+MAPPER_BUILD_ID = "2026.11.17-static-dynamic-v1"
 
 
 def norm(path: str) -> str:
@@ -53,9 +53,22 @@ def _contains_path(paths: Iterable[str], path: str) -> bool:
     return any(norm(candidate).casefold() == requested for candidate in paths)
 
 
+def _question_kind(value: str | None) -> str:
+    kind = str(value or "static").strip().casefold()
+    if kind not in {"static", "dynamic"}:
+        raise ValueError("Question type must be Static or Dynamic.")
+    return kind
+
+
+def _mapping_page_path(snippet_id: int, question_type: str = "static") -> str:
+    resource = "question" if _question_kind(question_type) == "static" else "snippet"
+    return f"/{resource}/{int(snippet_id)}/html_curriculum"
+
+
 @dataclass
 class MappingResult:
     snippet_id: int
+    question_type: str = "Static"
     question_name: str | None = None
     added: list[str] = field(default_factory=list)
     already_present: list[str] = field(default_factory=list)
@@ -75,7 +88,10 @@ class MappingResult:
     def summary(self) -> str:
         name = f" ({self.question_name})" if self.question_name else ""
         status = "OK" if self.success else "FAILED: " + "; ".join(self.errors)
-        return f"Snippet {self.snippet_id}{name} {status} | added={self.added} | already={self.already_present}"
+        return (
+            f"{self.question_type} snippet {self.snippet_id}{name} {status} | "
+            f"added={self.added} | already={self.already_present}"
+        )
 
 
 class HeyMathCmsMapper:
@@ -96,16 +112,25 @@ class HeyMathCmsMapper:
     def map_question(
         self, snippet_id: int, curriculum_paths: Iterable[str] | None = None,
         taxonomy_paths: Iterable[str] | None = None, *, action: str = "add",
+        question_type: str = "static",
     ) -> MappingResult:
-        result = MappingResult(int(snippet_id))
+        kind = _question_kind(question_type)
+        result = MappingResult(int(snippet_id), kind.title())
         curriculum_paths, taxonomy_paths = _norm_all(curriculum_paths), _norm_all(taxonomy_paths)
         with self._lock:
             try:
-                return self._map_question(snippet_id, curriculum_paths, taxonomy_paths, action=action, result=result)
+                return self._map_question(
+                    snippet_id,
+                    curriculum_paths,
+                    taxonomy_paths,
+                    action=action,
+                    question_type=kind,
+                    result=result,
+                )
             except Exception as exc:
                 result.errors.append(f"Failed during {result.stage.lower()}: {exc}")
                 try:
-                    current = self._load_mapping_page(snippet_id)
+                    current = self._load_mapping_page_for_type(snippet_id, kind)
                     if current is not None:
                         self._record_current(result, current, curriculum_paths, taxonomy_paths, action)
                     else:
@@ -141,6 +166,7 @@ class HeyMathCmsMapper:
         taxonomy_paths: Iterable[str] | None = None,
         *,
         action: str = "add",
+        question_type: str = "static",
         result: MappingResult,
     ) -> MappingResult:
         if action not in {"add", "replace", "remove"}:
@@ -148,13 +174,15 @@ class HeyMathCmsMapper:
         curriculum_paths = _norm_all(curriculum_paths)
         taxonomy_paths = _norm_all(taxonomy_paths)
         if not curriculum_paths and not taxonomy_paths:
-            return MappingResult(int(snippet_id))
+            return MappingResult(int(snippet_id), _question_kind(question_type).title())
         with self._lock:
             self._ensure_logged_in()
             self._ensure_trees()
-            page = self._load_mapping_page(snippet_id)
+            page = self._load_mapping_page_for_type(snippet_id, question_type)
             if page is None:
-                result.errors.append(f"Question {snippet_id} was not found in CMS.")
+                result.errors.append(
+                    f"{_question_kind(question_type).title()} snippet {snippet_id} was not found in CMS."
+                )
                 return result
 
             result.question_name = page["name"]
@@ -191,7 +219,7 @@ class HeyMathCmsMapper:
                     pending = list(requested)
                     limit = max(20, len(page[key]) * 4 + len(pending))
                     for _ in range(limit):
-                        fresh = self._load_mapping_page(snippet_id)
+                        fresh = self._load_mapping_page_for_type(snippet_id, question_type)
                         if fresh is None:
                             raise RuntimeError("Question could not be reloaded before removal.")
                         self._record_current(result, fresh, curriculum_paths, taxonomy_paths, action)
@@ -206,8 +234,13 @@ class HeyMathCmsMapper:
                             if not _contains_path(fresh[key], path):
                                 result.already_absent.append(f"{label}: {path}")
                                 continue
-                        self._remove_mapping(fresh, key, path, snippet_id)
-                        verified = self._load_mapping_page(snippet_id)
+                        if _question_kind(question_type) == "static":
+                            self._remove_mapping(fresh, key, path, snippet_id)
+                        else:
+                            self._remove_mapping_for_type(
+                                fresh, key, path, snippet_id, question_type
+                            )
+                        verified = self._load_mapping_page_for_type(snippet_id, question_type)
                         if verified is not None:
                             self._record_current(result, verified, curriculum_paths, taxonomy_paths, action)
                         if verified is None or _contains_path(verified[key], path):
@@ -218,7 +251,7 @@ class HeyMathCmsMapper:
                             result.removed.append(entry)
                     else:
                         raise RuntimeError(f"{label} mappings kept changing; stopped before adding sheet entries.")
-                page = self._load_mapping_page(snippet_id)
+                page = self._load_mapping_page_for_type(snippet_id, question_type)
                 if page is None:
                     raise RuntimeError("Question could not be reloaded after removal.")
                 if action == "remove":
@@ -229,7 +262,12 @@ class HeyMathCmsMapper:
 
             result.stage = "Adding sheet mappings" if action != "remove" else "Verifying final mappings"
             if curriculum_ids:
-                self._post_form(
+                post = (
+                    self._post_form
+                    if _question_kind(question_type) == "static"
+                    else lambda *args: self._post_form_for_type(*args, question_type)
+                )
+                post(
                     "/curriculum_trees/add_mapping",
                     page["curriculum_token"],
                     snippet_id,
@@ -238,12 +276,21 @@ class HeyMathCmsMapper:
                     "Add Mapping Form",
                 )
             if taxonomy_ids:
-                fresh = page if not curriculum_ids else self._load_mapping_page(snippet_id)
+                fresh = (
+                    page
+                    if not curriculum_ids
+                    else self._load_mapping_page_for_type(snippet_id, question_type)
+                )
                 if fresh is None:
                     result.errors.append(f"Question {snippet_id} could not be reloaded before taxonomy mapping.")
                     return result
                 self._record_current(result, fresh, curriculum_paths, taxonomy_paths, action)
-                self._post_form(
+                post = (
+                    self._post_form
+                    if _question_kind(question_type) == "static"
+                    else lambda *args: self._post_form_for_type(*args, question_type)
+                )
+                post(
                     "/heymath_taxonomy/add_mapping",
                     fresh["taxonomy_token"],
                     snippet_id,
@@ -253,7 +300,7 @@ class HeyMathCmsMapper:
                 )
 
             result.stage = "Verifying final mappings"
-            after = self._load_mapping_page(snippet_id)
+            after = self._load_mapping_page_for_type(snippet_id, question_type)
             if after is None:
                 result.errors.append(f"Question {snippet_id} could not be verified after mapping.")
                 return result
@@ -298,7 +345,15 @@ class HeyMathCmsMapper:
                             f"(mapping build {MAPPER_BUILD_ID}). No changes were made to this question.")
         return None
 
-    def validate_question_action(self, snippet_id: int, curriculum_paths: Iterable[str], taxonomy_paths: Iterable[str], *, action: str) -> str | None:
+    def validate_question_action(
+        self,
+        snippet_id: int,
+        curriculum_paths: Iterable[str],
+        taxonomy_paths: Iterable[str],
+        *,
+        action: str,
+        question_type: str = "static",
+    ) -> str | None:
         """Read and validate full CMS forms without exposing form tokens to the UI."""
         if action not in {"add", "replace", "remove"}:
             raise ValueError("Mapping action must be add, replace, or remove.")
@@ -306,9 +361,12 @@ class HeyMathCmsMapper:
             return None
         with self._lock:
             self._ensure_logged_in()
-            page = self._load_mapping_page(snippet_id)
+            page = self._load_mapping_page_for_type(snippet_id, question_type)
             if page is None:
-                return f"Question {snippet_id} was not found in CMS."
+                return (
+                    f"{_question_kind(question_type).title()} snippet {snippet_id} "
+                    "was not found in CMS."
+                )
             return self.validate_action(page, curriculum_paths, taxonomy_paths, action=action)
 
     @staticmethod
@@ -317,6 +375,16 @@ class HeyMathCmsMapper:
         return matches[0] if len(matches) == 1 else None
 
     def _remove_mapping(self, page: dict, key: str, path: str, snippet_id: int) -> None:
+        self._remove_mapping_for_type(page, key, path, snippet_id, "static")
+
+    def _remove_mapping_for_type(
+        self,
+        page: dict,
+        key: str,
+        path: str,
+        snippet_id: int,
+        question_type: str,
+    ) -> None:
         control = self._removal_control(page, key, path)
         if control is None:
             raise RuntimeError(f"CMS removal control not found for {key}: {path}")
@@ -324,7 +392,7 @@ class HeyMathCmsMapper:
         if (urlparse(url).scheme, urlparse(url).netloc) != (urlparse(self.base_url).scheme, urlparse(self.base_url).netloc):
             raise RuntimeError("CMS removal control points outside the configured CMS.")
         response = self._session.request(control["method"], url, data=control["data"],
-            headers={"Referer": f"{self.base_url}/question/{int(snippet_id)}/html_curriculum"},
+            headers={"Referer": self.base_url + _mapping_page_path(snippet_id, question_type)},
             timeout=TIMEOUT, allow_redirects=True)
         response.raise_for_status()
         if self._looks_like_login(response):
@@ -384,15 +452,16 @@ class HeyMathCmsMapper:
         ranked.sort(key=lambda item: (-item[0], -item[1], item[2].casefold()))
         return [candidate for _, _, candidate in ranked[:limit]]
 
-    def get_mappings(self, snippet_id: int) -> dict | None:
+    def get_mappings(self, snippet_id: int, *, question_type: str = "static") -> dict | None:
         """Return the current mappings without changing the CMS."""
         with self._lock:
             self._ensure_logged_in()
-            page = self._load_mapping_page(snippet_id)
+            page = self._load_mapping_page_for_type(snippet_id, question_type)
             if page is None:
                 return None
             return {
                 "name": page["name"],
+                "type": _question_kind(question_type).title(),
                 "curriculum": page["curriculum"],
                 "taxonomy": page["taxonomy"],
             }
@@ -461,8 +530,19 @@ class HeyMathCmsMapper:
         """Reload node trees on the next validation or mapping operation."""
         self._trees_loaded_at = 0.0
 
-    def _load_mapping_page(self, snippet_id: int) -> dict | None:
-        text = self._get(f"/question/{int(snippet_id)}/html_curriculum")
+    def _load_mapping_page_for_type(
+        self, snippet_id: int, question_type: str = "static"
+    ) -> dict | None:
+        kind = _question_kind(question_type)
+        if kind == "static":
+            return self._load_mapping_page(snippet_id)
+        return self._load_mapping_page(snippet_id, question_type=kind)
+
+    def _load_mapping_page(
+        self, snippet_id: int, question_type: str = "static"
+    ) -> dict | None:
+        kind = _question_kind(question_type)
+        text = self._get(_mapping_page_path(snippet_id, kind))
         if len(text) < 100 or "Browse Mapping Content" not in text:
             return None
         title = re.search(r"<title[^>]*>\s*Html Mapping-\s*(.*?)\s*</title>", text, re.S | re.I)
@@ -488,6 +568,7 @@ class HeyMathCmsMapper:
                 taxonomy.append(norm(line))
         return {
             "name": _html.unescape(title.group(1)) if title else None,
+            "type": kind.title(),
             "curriculum_token": curriculum_token,
             "taxonomy_token": taxonomy_token,
             "curriculum": curriculum,
@@ -649,14 +730,37 @@ class HeyMathCmsMapper:
                 result.added.append(f"{label}: {path}")
         return ids
 
-    def _post_form(self, action: str, token: str, snippet_id: int, id_field: str, ids: str, button: str) -> None:
-        referer = f"{self.base_url}/question/{int(snippet_id)}/html_curriculum"
+    def _post_form(
+        self,
+        action: str,
+        token: str,
+        snippet_id: int,
+        id_field: str,
+        ids: str,
+        button: str,
+    ) -> None:
+        self._post_form_for_type(
+            action, token, snippet_id, id_field, ids, button, "static"
+        )
+
+    def _post_form_for_type(
+        self,
+        action: str,
+        token: str,
+        snippet_id: int,
+        id_field: str,
+        ids: str,
+        button: str,
+        question_type: str,
+    ) -> None:
+        kind = _question_kind(question_type)
+        referer = self.base_url + _mapping_page_path(snippet_id, kind)
         response = self._session.post(
             self.base_url + action,
             data={
                 "authenticity_token": token,
                 "project_id": str(int(snippet_id)),
-                "project_type": "question",
+                "project_type": "question" if kind == "static" else "snippet",
                 "parent_project_type": "",
                 "parent_project_id": "",
                 id_field: ids,

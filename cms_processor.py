@@ -2759,13 +2759,17 @@ def _extract_mapping_instructions(doc: _Document, findings: list[Finding]) -> li
 def _write_mapping_csv(path: Path, instructions: list[MappingInstruction]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["Question", "Snippet ID", "Mapping Type", "Path"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["Question", "Snippet ID", "Snippet Type", "Mapping Type", "Path"],
+        )
         writer.writeheader()
         for item in instructions:
             writer.writerow(
                 {
                     "Question": item.question,
                     "Snippet ID": item.snippet_id or "",
+                    "Snippet Type": "Static",
                     "Mapping Type": item.mapping_type,
                     "Path": item.path,
                 }

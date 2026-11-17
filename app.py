@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ from mapping_input import normalize_mapping_table, read_mapping_table, xlsx_shee
 
 
 EXPECTED_PROCESSOR_BUILD_ID = "2026.10.21-word-list-choice-cleanup-v14.16"
-EXPECTED_MAPPER_BUILD_ID = "2026.10.12-live-removal-v5"
+EXPECTED_MAPPER_BUILD_ID = "2026.11.17-static-dynamic-v1"
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
     _cms_mapper = importlib.reload(_cms_mapper)
 if getattr(_cms_mapper, "MAPPER_BUILD_ID", None) != EXPECTED_MAPPER_BUILD_ID:
@@ -35,6 +36,131 @@ document_has_complete_snippet_ids = _cms_processor.document_has_complete_snippet
 @st.cache_resource
 def get_cms_mapper(base_url: str, login: str, password: str, build_id: str) -> HeyMathCmsMapper:
     return HeyMathCmsMapper(base_url, login, password)
+
+
+def validate_mapping_plan(
+    mapper: HeyMathCmsMapper,
+    mapping_frame: pd.DataFrame,
+    mapping_action: str,
+) -> tuple[pd.DataFrame, list[str], list[dict[str, object]]]:
+    """Resolve and validate a mapping plan without changing CMS content."""
+    resolved_frame = mapping_frame.copy()
+    validation_errors: list[str] = []
+    preview_rows: list[dict[str, object]] = []
+
+    unresolved_rows = resolved_frame.loc[
+        resolved_frame["Snippet ID"] == "", ["Question", "Snippet Type"]
+    ].drop_duplicates()
+    for _, unresolved in unresolved_rows.iterrows():
+        question_name = unresolved["Question"]
+        question_type = unresolved["Snippet Type"]
+        if question_type == "Dynamic":
+            validation_errors.append(
+                f"Dynamic mapping for {question_name!r} requires a Snippet ID; "
+                "Project-name lookup currently applies only to Static questions."
+            )
+            continue
+        snippet_id, error = mapper.resolve_snippet_id(question_name)
+        if error:
+            validation_errors.append(error)
+        elif snippet_id is not None:
+            resolved_frame.loc[
+                (resolved_frame["Snippet ID"] == "")
+                & (resolved_frame["Question"] == question_name)
+                & (resolved_frame["Snippet Type"] == question_type),
+                "Snippet ID",
+            ] = str(snippet_id)
+
+    snippet_pages: dict[tuple[str, str], dict | None] = {}
+    snippet_targets = resolved_frame.loc[
+        resolved_frame["Snippet ID"] != "", ["Snippet Type", "Snippet ID"]
+    ].drop_duplicates()
+    for _, target in snippet_targets.iterrows():
+        question_type = target["Snippet Type"]
+        snippet_text = target["Snippet ID"]
+        key = (question_type, snippet_text)
+        page = mapper.get_mappings(int(snippet_text), question_type=question_type)
+        snippet_pages[key] = page
+        rows = resolved_frame[
+            (resolved_frame["Snippet ID"] == snippet_text)
+            & (resolved_frame["Snippet Type"] == question_type)
+        ]
+        route_resource = "question" if question_type == "Static" else "snippet"
+        preview_rows.append(
+            {
+                "Snippet Type": question_type,
+                "Snippet ID": snippet_text,
+                "CMS question": str((page or {}).get("name") or ""),
+                "Route": f"/{route_resource}/{snippet_text}/html_curriculum",
+                "Current Curriculum": "\n".join((page or {}).get("curriculum") or []),
+                "Current Taxonomy": "\n".join((page or {}).get("taxonomy") or []),
+                "Requested Curriculum": "\n".join(
+                    rows.loc[rows["Mapping Type"] == "Curriculum", "Path"].tolist()
+                ),
+                "Requested Taxonomy": "\n".join(
+                    rows.loc[rows["Mapping Type"] == "Taxonomy", "Path"].tolist()
+                ),
+                "Target status": "Found" if page is not None else "Not found",
+            }
+        )
+        if page is None:
+            validation_errors.append(
+                f"{question_type} snippet {snippet_text} does not yet exist in CMS."
+            )
+            continue
+        action_error = mapper.validate_question_action(
+            int(snippet_text),
+            rows.loc[rows["Mapping Type"] == "Curriculum", "Path"].tolist(),
+            rows.loc[rows["Mapping Type"] == "Taxonomy", "Path"].tolist(),
+            action=mapping_action,
+            question_type=question_type,
+        )
+        if action_error:
+            validation_errors.append(
+                f"{question_type} snippet {snippet_text}: {action_error}"
+            )
+
+    project_rows = resolved_frame[
+        resolved_frame["Question"].str.match(r"(?i)^project.+_q\d+$")
+    ]
+    for _, row in project_rows[
+        ["Question", "Snippet ID", "Snippet Type"]
+    ].drop_duplicates().iterrows():
+        page = snippet_pages.get((row["Snippet Type"], row["Snippet ID"]))
+        cms_name = str((page or {}).get("name") or "").strip()
+        if page is not None and cms_name.casefold() != row["Question"].strip().casefold():
+            validation_errors.append(
+                f"{row['Snippet Type']} snippet {row['Snippet ID']} is named "
+                f"{cms_name!r} in CMS, not {row['Question']!r}."
+            )
+
+    for (mapping_type, path), affected_rows in resolved_frame.groupby(
+        ["Mapping Type", "Path"], sort=False
+    ):
+        error = mapper.validate_path(path, taxonomy=mapping_type == "Taxonomy")
+        if not error:
+            continue
+        targets: list[str] = []
+        for _, affected in affected_rows.drop_duplicates(
+            ["Question", "Snippet ID", "Snippet Type"]
+        ).iterrows():
+            question_name = str(affected["Question"]).strip()
+            snippet_text = str(affected["Snippet ID"]).strip()
+            if question_name and snippet_text:
+                label = (
+                    f"{question_name} ({affected['Snippet Type']} Snippet ID {snippet_text})"
+                )
+            elif question_name:
+                label = question_name
+            else:
+                label = f"{affected['Snippet Type']} Snippet ID {snippet_text}"
+            if label not in targets:
+                targets.append(label)
+        validation_errors.append(
+            f"{mapping_type} for {', '.join(targets)}: {error}"
+        )
+
+    return resolved_frame, validation_errors, preview_rows
 
 
 st.set_page_config(page_title="CMS DOCX Verification Processor", page_icon="✅", layout="wide")
@@ -465,9 +591,19 @@ with st.expander("Apply mappings to CMS", expanded=True):
     st.caption("Blank cells are ignored. Questions with no Curriculum or Taxonomy entries are skipped.")
     st.caption("Project names, spreadsheet headings and Curriculum/Taxonomy paths are matched without regard to uppercase or lowercase. Spelling and hierarchy must still match. If a path is not found, the pre-check lists up to three closest paths from the corresponding live CMS tree; suggestions are never applied automatically.")
     st.caption(
-        "Accepted layouts: Question/Project + Snippet ID + Mapping Type + Path; or Snippet ID/Project with qno + separate Taxonomy and Curriculum columns. "
-        "Several paths may be placed on separate lines within one cell."
+        "Accepted layouts: Question/Project + Snippet ID + Snippet Type + Mapping Type + Path; or Snippet ID/Project with qno + Snippet Type and separate Taxonomy and Curriculum columns. "
+        "Snippet Type may be Static or Dynamic and defaults to Static when blank or omitted. Several paths may be placed on separate lines within one cell."
     )
+    with st.expander("Example mapping-sheet columns"):
+        st.code(
+            "Snippet ID,Snippet Type,Mapping Type,Path\n"
+            "1121,Static,Curriculum,CBSE NCERT >> Class 7 >> Mathematics\n"
+            "1121,Dynamic,Curriculum,CBSE NCERT >> Class 7 >> Mathematics",
+            language=None,
+        )
+        st.caption(
+            "Static and Dynamic questions may have the same numeric ID; Snippet Type keeps them as separate CMS targets."
+        )
     st.subheader("2. Upload and review your sheet")
     mapping_upload = st.file_uploader("Upload mapping CSV or XLSX", type=["csv", "xlsx"], key="mapping_file_upload")
     mapping_frame = None
@@ -494,7 +630,12 @@ with st.expander("Apply mappings to CMS", expanded=True):
             mapping_problem = f"The mapping file could not be read: {exc}"
         else:
             st.dataframe(mapping_frame, use_container_width=True, hide_index=True)
-            known_snippets = mapping_frame.loc[mapping_frame["Snippet ID"] != "", "Snippet ID"].nunique()
+            known_snippets = len(
+                mapping_frame.loc[
+                    mapping_frame["Snippet ID"] != "", ["Snippet Type", "Snippet ID"]
+                ]
+                .drop_duplicates()
+            )
             project_lookups = mapping_frame.loc[mapping_frame["Snippet ID"] == "", "Question"].nunique()
             summary_parts = [f"{len(mapping_frame)} mapping path(s)"]
             if known_snippets:
@@ -544,100 +685,154 @@ with st.expander("Apply mappings to CMS", expanded=True):
             else:
                 st.error(f"CMS connection test failed: {connection_test['message']}")
 
-    st.subheader("3. Validate and apply")
-    st.caption("Every question and path is checked before CMS changes begin. Results will show the selected action and confirmed changes.")
-    can_apply = mapping_frame is not None and mapping_problem is None and not missing_secret and not mapping_frame.empty
-    action_button = {"add": "Validate and add mappings", "replace": "Validate and replace all mappings"}[mapping_action]
-    if st.button(action_button, type="primary", disabled=not can_apply, use_container_width=True):
+    st.subheader("3. Validate — read only")
+    st.caption(
+        "Checks the exact CMS target, route, existing mappings and requested paths. "
+        "This step never adds, removes or replaces a CMS mapping."
+    )
+    can_validate = (
+        mapping_frame is not None
+        and mapping_problem is None
+        and not missing_secret
+        and not mapping_frame.empty
+    )
+    mapping_plan_key = None
+    if mapping_frame is not None and not mapping_frame.empty:
+        signature_source = (
+            mapping_frame.to_csv(index=False).encode("utf-8")
+            + b"\0"
+            + mapping_action.encode("utf-8")
+        )
+        mapping_plan_key = hashlib.sha256(signature_source).hexdigest()
+
+    if st.button(
+        "Validate mapping file (read only)",
+        disabled=not can_validate,
+        use_container_width=True,
+    ):
         st.session_state.pop("cms_mapping_results", None)
-        mapper = get_cms_mapper(cms_config["base_url"], cms_config["login"], cms_config["password"], EXPECTED_MAPPER_BUILD_ID)
-        validation_errors: list[str] = []
-        resolved_frame = mapping_frame.copy()
-        with st.spinner("Checking CMS snippets and mapping paths before saving anything…"):
-            unresolved_questions = resolved_frame.loc[resolved_frame["Snippet ID"] == "", "Question"].drop_duplicates()
-            for question_name in unresolved_questions:
-                snippet_id, error = mapper.resolve_snippet_id(question_name)
-                if error:
-                    validation_errors.append(error)
-                elif snippet_id is not None:
-                    resolved_frame.loc[
-                        (resolved_frame["Snippet ID"] == "") & (resolved_frame["Question"] == question_name),
-                        "Snippet ID",
-                    ] = str(snippet_id)
+        mapper = get_cms_mapper(
+            cms_config["base_url"],
+            cms_config["login"],
+            cms_config["password"],
+            EXPECTED_MAPPER_BUILD_ID,
+        )
+        with st.spinner("Reading CMS targets and mapping trees without saving anything…"):
+            resolved_frame, validation_errors, preview_rows = validate_mapping_plan(
+                mapper, mapping_frame, mapping_action
+            )
+        st.session_state["cms_mapping_validation"] = {
+            "key": mapping_plan_key,
+            "resolved_frame": resolved_frame,
+            "errors": validation_errors,
+            "preview": preview_rows,
+        }
 
-            snippet_pages: dict[str, dict | None] = {}
-            for snippet_text in resolved_frame.loc[resolved_frame["Snippet ID"] != "", "Snippet ID"].drop_duplicates():
-                page = mapper.get_mappings(int(snippet_text))
-                snippet_pages[snippet_text] = page
-                if page is None:
-                    validation_errors.append(f"Snippet {snippet_text} does not yet exist in CMS.")
-                else:
-                    rows = resolved_frame[resolved_frame["Snippet ID"] == snippet_text]
-                    action_error = mapper.validate_question_action(
-                        int(snippet_text),
-                        rows.loc[rows["Mapping Type"] == "Curriculum", "Path"].tolist(),
-                        rows.loc[rows["Mapping Type"] == "Taxonomy", "Path"].tolist(),
-                        action=mapping_action,
-                    )
-                    if action_error:
-                        validation_errors.append(f"Snippet {snippet_text}: {action_error}")
-
-            project_rows = resolved_frame[resolved_frame["Question"].str.match(r"(?i)^project.+_q\d+$")]
-            for _, row in project_rows[["Question", "Snippet ID"]].drop_duplicates().iterrows():
-                page = snippet_pages.get(row["Snippet ID"])
-                cms_name = str((page or {}).get("name") or "").strip()
-                if page is not None and cms_name.casefold() != row["Question"].strip().casefold():
-                    validation_errors.append(
-                        f"Snippet {row['Snippet ID']} is named {cms_name!r} in CMS, not {row['Question']!r}."
-                    )
-
-            for (mapping_type, path), affected_rows in resolved_frame.groupby(
-                ["Mapping Type", "Path"], sort=False
-            ):
-                error = mapper.validate_path(path, taxonomy=mapping_type == "Taxonomy")
-                if error:
-                    targets: list[str] = []
-                    for _, affected in affected_rows.drop_duplicates(["Question", "Snippet ID"]).iterrows():
-                        question_name = str(affected["Question"]).strip()
-                        snippet_text = str(affected["Snippet ID"]).strip()
-                        if question_name and snippet_text:
-                            target = f"{question_name} (Snippet ID {snippet_text})"
-                        elif question_name:
-                            target = question_name
-                        else:
-                            target = f"Snippet ID {snippet_text}"
-                        if target not in targets:
-                            targets.append(target)
-                    validation_errors.append(
-                        f"{mapping_type} for {', '.join(targets)}: {error}"
-                    )
-
-        if validation_errors:
+    validation = st.session_state.get("cms_mapping_validation")
+    validation_is_current = bool(
+        validation and mapping_plan_key and validation.get("key") == mapping_plan_key
+    )
+    if validation_is_current:
+        if validation["preview"]:
+            st.dataframe(
+                pd.DataFrame(validation["preview"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if validation["errors"]:
             st.error(
-                "No CMS mappings were changed because the pre-check found a problem:\n\n"
+                "Validation found a problem. No CMS mappings were changed:\n\n"
+                + "\n".join(f"- {problem}" for problem in validation["errors"])
+            )
+            st.dataframe(
+                pd.DataFrame({"Problem": validation["errors"]}),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success(
+                "Read-only validation passed. No CMS mappings were changed. "
+                "Review the targets above before applying."
+            )
+    elif validation:
+        st.info("The file or mapping action changed. Run read-only validation again.")
+
+    st.subheader("4. Apply to CMS")
+    st.caption(
+        "Enabled only after the current file and selected action pass read-only validation. "
+        "The app re-checks everything immediately before saving."
+    )
+    can_apply = bool(
+        validation_is_current
+        and not validation["errors"]
+        and can_validate
+    )
+    apply_button = {
+        "add": "Add validated mappings to CMS",
+        "replace": "Replace mappings using validated file",
+    }[mapping_action]
+    if st.button(
+        apply_button,
+        type="primary",
+        disabled=not can_apply,
+        use_container_width=True,
+    ):
+        st.session_state.pop("cms_mapping_results", None)
+        mapper = get_cms_mapper(
+            cms_config["base_url"],
+            cms_config["login"],
+            cms_config["password"],
+            EXPECTED_MAPPER_BUILD_ID,
+        )
+        with st.spinner("Re-checking CMS immediately before saving…"):
+            resolved_frame, validation_errors, preview_rows = validate_mapping_plan(
+                mapper, mapping_frame, mapping_action
+            )
+        if validation_errors:
+            st.session_state["cms_mapping_validation"] = {
+                "key": mapping_plan_key,
+                "resolved_frame": resolved_frame,
+                "errors": validation_errors,
+                "preview": preview_rows,
+            }
+            st.error(
+                "CMS state changed after validation. Nothing was saved:\n\n"
                 + "\n".join(f"- {problem}" for problem in validation_errors)
             )
-            st.dataframe(pd.DataFrame({"Problem": validation_errors}), use_container_width=True, hide_index=True)
         else:
-            mapping_frame = resolved_frame
             result_rows = []
-            grouped = list(mapping_frame.groupby("Snippet ID", sort=False))
+            grouped = list(
+                resolved_frame.groupby(["Snippet Type", "Snippet ID"], sort=False)
+            )
             progress = st.progress(0.0)
-            for index, (snippet_text, rows_for_snippet) in enumerate(grouped, 1):
-                curriculum_paths = rows_for_snippet.loc[rows_for_snippet["Mapping Type"] == "Curriculum", "Path"].tolist()
-                taxonomy_paths = rows_for_snippet.loc[rows_for_snippet["Mapping Type"] == "Taxonomy", "Path"].tolist()
+            for index, ((question_type, snippet_text), rows_for_snippet) in enumerate(
+                grouped, 1
+            ):
+                curriculum_paths = rows_for_snippet.loc[
+                    rows_for_snippet["Mapping Type"] == "Curriculum", "Path"
+                ].tolist()
+                taxonomy_paths = rows_for_snippet.loc[
+                    rows_for_snippet["Mapping Type"] == "Taxonomy", "Path"
+                ].tolist()
                 try:
-                    mapping_result = mapper.map_question(int(snippet_text), curriculum_paths, taxonomy_paths, action=mapping_action)
+                    mapping_result = mapper.map_question(
+                        int(snippet_text),
+                        curriculum_paths,
+                        taxonomy_paths,
+                        action=mapping_action,
+                        question_type=question_type,
+                    )
                     status = "Done" if mapping_result.success else "Problem"
                     details = "; ".join(
                         mapping_result.errors
-                        + ([f"Added — {p}" for p in mapping_result.added]
-                              + [f"Removed — {p}" for p in mapping_result.removed]
-                              + [f"Already present — {p}" for p in mapping_result.already_present]
-                              + [f"Already absent — {p}" for p in mapping_result.already_absent])
+                        + [f"Added — {p}" for p in mapping_result.added]
+                        + [f"Removed — {p}" for p in mapping_result.removed]
+                        + [f"Already present — {p}" for p in mapping_result.already_present]
+                        + [f"Already absent — {p}" for p in mapping_result.already_absent]
                     )
                     result_rows.append(
                         {
+                            "Snippet Type": question_type,
                             "Snippet ID": snippet_text,
                             "Question": mapping_result.question_name or "",
                             "Status": status,
@@ -653,6 +848,7 @@ with st.expander("Apply mappings to CMS", expanded=True):
                 except Exception as exc:
                     result_rows.append(
                         {
+                            "Snippet Type": question_type,
                             "Snippet ID": snippet_text,
                             "Question": "",
                             "Status": "Problem",
@@ -662,7 +858,10 @@ with st.expander("Apply mappings to CMS", expanded=True):
                             "Removed": None,
                             "Already absent": 0,
                             "Already present": 0,
-                            "Details": f"{exc} Changes may be partially applied; inspect current CMS mappings before retrying.",
+                            "Details": (
+                                f"{exc} Changes may be partially applied; inspect current "
+                                "CMS mappings before retrying."
+                            ),
                         }
                     )
                 progress.progress(index / len(grouped))

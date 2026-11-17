@@ -7,7 +7,7 @@ import pandas as pd
 
 
 SUPPORTED_MAPPING_EXTENSIONS = {".csv", ".xlsx"}
-CANONICAL_MAPPING_COLUMNS = ["Question", "Snippet ID", "Mapping Type", "Path"]
+CANONICAL_MAPPING_COLUMNS = ["Question", "Snippet ID", "Snippet Type", "Mapping Type", "Path"]
 
 
 def _header_key(value: object) -> str:
@@ -33,7 +33,22 @@ def normalize_mapping_table(frame: pd.DataFrame) -> pd.DataFrame:
     frame.columns = [str(column).strip() for column in frame.columns]
 
     question_column = _find_column(frame, "Question", "Project", "Project with qno", "Project with question number")
-    snippet_column = _find_column(frame, "Snippet ID", "Snippet id", "Snippet IDs", "Snippet ids")
+    snippet_column = _find_column(
+        frame,
+        "Snippet ID",
+        "Snippet id",
+        "Snippet IDs",
+        "Snippet ids",
+        "Source Snippet ID",
+    )
+    question_kind_column = _find_column(
+        frame,
+        "Snippet Type",
+        "Type",
+        "Question Kind",
+        "Static/Dynamic",
+        "Static or Dynamic",
+    )
     type_column = _find_column(frame, "Mapping Type", "Section")
     path_column = _find_column(frame, "Path", "Mapping Path", "Additional mapping path")
     curriculum_column = _find_column(frame, "Curriculum", "Curriculum mapping", "Curriculum mappings")
@@ -47,21 +62,35 @@ def normalize_mapping_table(frame: pd.DataFrame) -> pd.DataFrame:
         for _, row in frame.iterrows():
             question = str(row[question_column]).strip() if question_column else ""
             snippet = str(row[snippet_column]).strip() if snippet_column else ""
+            question_kind = str(row[question_kind_column]).strip() if question_kind_column else "Static"
             mapping_type = str(row[type_column]).strip().title()
             for path in _paths(row[path_column]):
                 records.append(
-                    {"Question": question, "Snippet ID": snippet, "Mapping Type": mapping_type, "Path": path}
+                    {
+                        "Question": question,
+                        "Snippet ID": snippet,
+                        "Snippet Type": question_kind or "Static",
+                        "Mapping Type": mapping_type,
+                        "Path": path,
+                    }
                 )
     elif curriculum_column is not None or taxonomy_column is not None:
         for _, row in frame.iterrows():
             question = str(row[question_column]).strip() if question_column else ""
             snippet = str(row[snippet_column]).strip() if snippet_column else ""
+            question_kind = str(row[question_kind_column]).strip() if question_kind_column else "Static"
             for mapping_type, column in (("Curriculum", curriculum_column), ("Taxonomy", taxonomy_column)):
                 if column is None:
                     continue
                 for path in _paths(row[column]):
                     records.append(
-                        {"Question": question, "Snippet ID": snippet, "Mapping Type": mapping_type, "Path": path}
+                        {
+                            "Question": question,
+                            "Snippet ID": snippet,
+                            "Snippet Type": question_kind or "Static",
+                            "Mapping Type": mapping_type,
+                            "Path": path,
+                        }
                     )
     else:
         raise ValueError(
@@ -73,16 +102,27 @@ def normalize_mapping_table(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("The selected worksheet contains no Curriculum or Taxonomy paths.")
     normalized["Question"] = normalized["Question"].astype(str).str.strip()
     normalized["Snippet ID"] = normalized["Snippet ID"].astype(str).str.strip()
+    normalized["Snippet Type"] = (
+        normalized["Snippet Type"].astype(str).str.strip().replace("", "Static").str.title()
+    )
     normalized["Mapping Type"] = normalized["Mapping Type"].astype(str).str.strip().str.title()
     normalized["Path"] = normalized["Path"].astype(str).str.strip()
 
     invalid_types = normalized[~normalized["Mapping Type"].isin(["Curriculum", "Taxonomy"])]
+    invalid_question_kinds = normalized[
+        ~normalized["Snippet Type"].isin(["Static", "Dynamic"])
+    ]
     invalid_snippets = normalized[
         (normalized["Snippet ID"] != "") & ~normalized["Snippet ID"].str.fullmatch(r"[1-9]\d*")
     ]
     missing_identifiers = normalized[(normalized["Snippet ID"] == "") & (normalized["Question"] == "")]
     if not invalid_types.empty:
         raise ValueError("Every Mapping Type must be Curriculum or Taxonomy.")
+    if not invalid_question_kinds.empty:
+        values = ", ".join(sorted(set(invalid_question_kinds["Snippet Type"])))
+        raise ValueError(
+            f"Every Snippet Type must be Static or Dynamic. Invalid value(s): {values}."
+        )
     if not invalid_snippets.empty:
         raise ValueError("Every supplied Snippet ID must be a positive whole number.")
     if not missing_identifiers.empty:
